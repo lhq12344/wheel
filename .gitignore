@@ -1,0 +1,22 @@
+# Unity
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+.vs/
+.vscode/
+[Dd]evelop/
+[Ll]ocalBuild/
+[Rr]emote/
+
+# Visual Studio
+.vsconfig
+*.csproj
+*.sln
+
+# Project Settings
+ProjectSettings/
+
+# Packages
+Packages/
