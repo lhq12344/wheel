@@ -21,7 +21,7 @@ This is a Unity-based robotics simulation project for a differential drive robot
 - Handles mouse click navigation and keyboard yaw control
 - Applies motion via Rigidbody.MovePosition/MoveRotation for physics integration
 
-**control.cs** (OneJointTrapezoidController) - Single joint trajectory controller
+**OneJointTrapezoidController.cs** - Single joint trajectory controller
 - Implements trapezoidal velocity profile for ArticulationBody joints
 - Uses position + velocity feedforward control via xDrive
 - Configurable velocity/acceleration limits and PD gains (stiffness, damping)
@@ -84,7 +84,7 @@ wheelAngularVelocity = linearVelocity / wheelRadius
 ```
 /
 ├── DiffDriveTwinController.cs    # Mobile base controller
-├── control.cs                     # Joint trajectory controller
+├── OneJointTrapezoidController.cs # Joint trajectory controller
 ├── Link.cs                        # Arm-chassis binding
 ├── Scenes/                        # Unity scenes
 │   └── SampleScene.unity

@@ -9,7 +9,14 @@ namespace RobotSimulation
 	public sealed class PlannerPhysicsQueries
 	{
 		private static readonly HashSet<int> UnsupportedClosestPointWarnings = new HashSet<int>();
+		private struct BaseRadiusCacheEntry
+		{
+			public int colliderCount;
+			public float radius;
+		}
+
 		private readonly Collider[] _overlapBuffer = new Collider[128];
+		private readonly Dictionary<int, BaseRadiusCacheEntry> _baseRadiusCache = new Dictionary<int, BaseRadiusCacheEntry>();
 
 		public float baseHalfHeight = 0.35f;
 		public float sampleSpacing = 0.25f;
@@ -42,6 +49,13 @@ namespace RobotSimulation
 			float maxRadius = 0.45f;
 			Transform root = controller.rb != null ? controller.rb.transform : controller.transform;
 			Collider[] colliders = root.GetComponentsInChildren<Collider>(true);
+			int cacheKey = root != null ? root.GetInstanceID() : controller.GetInstanceID();
+			if (_baseRadiusCache.TryGetValue(cacheKey, out BaseRadiusCacheEntry cachedEntry)
+				&& cachedEntry.colliderCount == colliders.Length)
+			{
+				return cachedEntry.radius;
+			}
+
 			Vector3 center = root.position;
 			for (int i = 0; i < colliders.Length; i++)
 			{
@@ -69,7 +83,13 @@ namespace RobotSimulation
 				}
 			}
 
-			return Mathf.Max(0.25f, maxRadius);
+			float resolvedRadius = Mathf.Max(0.25f, maxRadius);
+			_baseRadiusCache[cacheKey] = new BaseRadiusCacheEntry
+			{
+				colliderCount = colliders.Length,
+				radius = resolvedRadius
+			};
+			return resolvedRadius;
 		}
 
 		public bool IsBasePoseCollisionFree(Vector3 position, float radius, IReadOnlyList<Collider> obstacles, out Collider hitCollider)

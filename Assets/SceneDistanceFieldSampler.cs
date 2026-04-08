@@ -9,14 +9,15 @@ namespace RobotSimulation
 	public sealed class SceneDistanceFieldSampler
 	{
 		private static readonly HashSet<int> UnsupportedClosestPointWarnings = new HashSet<int>();
+		private static readonly IReadOnlyList<Collider> EmptyObstacles = System.Array.Empty<Collider>();
 
 		private Vector3 _origin;
 		private float _cellSize = 0.5f;
 		private int _width;
 		private int _height;
 		private float _sampleHeight;
-		private float[] _distances = new float[0];
-		private List<Collider> _obstacles = new List<Collider>();
+		private float[] _distances = System.Array.Empty<float>();
+		private IReadOnlyList<Collider> _obstacles = EmptyObstacles;
 
 		public Bounds Bounds { get; private set; }
 		public float CellSize => _cellSize;
@@ -26,7 +27,7 @@ namespace RobotSimulation
 		{
 			_cellSize = Mathf.Max(0.1f, cellSize);
 			_sampleHeight = Mathf.Lerp(start.y, goal.y, 0.5f);
-			_obstacles = obstacles != null ? new List<Collider>(obstacles) : new List<Collider>();
+			_obstacles = obstacles ?? EmptyObstacles;
 
 			Vector3 min = Vector3.Min(start, goal);
 			Vector3 max = Vector3.Max(start, goal);
@@ -55,7 +56,11 @@ namespace RobotSimulation
 			Bounds = new Bounds(
 				new Vector3(min.x + (sizeX * 0.5f), _sampleHeight, min.z + (sizeZ * 0.5f)),
 				new Vector3(sizeX, 1f, sizeZ));
-			_distances = new float[_width * _height];
+			int requiredSamples = _width * _height;
+			if (_distances == null || _distances.Length != requiredSamples)
+			{
+				_distances = new float[requiredSamples];
+			}
 
 			for (int z = 0; z < _height; z++)
 			{

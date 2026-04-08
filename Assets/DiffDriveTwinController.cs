@@ -172,7 +172,6 @@ public class DiffDriveTwinController : MonoBehaviour
 	private bool useVelocityCommandOverride = false;
 	private float overrideLinearVelocityTarget = 0f;
 	private float overrideAngularVelocityTarget = 0f;
-	private int arrivalStableFrames = 0;
 	[SerializeField] private PointGoalPhase pointGoalPhase = PointGoalPhase.Idle;
 
 	void Reset()
@@ -315,26 +314,9 @@ public class DiffDriveTwinController : MonoBehaviour
 
 		if (dist <= arrivalDistance)
 		{
-			if (CurrentPlanarSpeedMeasured <= 0.03f && CurrentYawRateMeasured <= yawRateStopTolerance)
-			{
-				arrivalStableFrames++;
-				if (arrivalStableFrames >= 3)
-				{
-					FinishPointGoal(out vTarget, out wTarget);
-					return;
-				}
-			}
-			else
-			{
-				arrivalStableFrames = 0;
-			}
-
-			pointGoalPhase = PointGoalPhase.Brake;
-			vTarget = 0f;
-			wTarget = preserveArrivalHeading ? 0f : Mathf.Clamp(kYaw * eYaw, -wMax, wMax);
+			FinishPointGoal(out vTarget, out wTarget);
 			return;
 		}
-		arrivalStableFrames = 0;
 
 		UpdatePointGoalPhase(dist, arrivalDistance, yawErrorDeg);
 		wTarget = Mathf.Clamp(kYaw * eYaw, -wMax, wMax);
@@ -538,7 +520,6 @@ public class DiffDriveTwinController : MonoBehaviour
 		useVelocityCommandOverride = false;
 		overrideLinearVelocityTarget = 0f;
 		overrideAngularVelocityTarget = 0f;
-		arrivalStableFrames = 0;
 		pointGoalPhase = PointGoalPhase.Idle;
 		mode = ControlMode.TargetPoint;
 	}
@@ -556,7 +537,6 @@ public class DiffDriveTwinController : MonoBehaviour
 		overrideAngularVelocityTarget = Mathf.Clamp(angularVelocityTarget, -wMax, wMax);
 		goalReachedLatched = false;
 		finalYawAlignmentActive = false;
-		arrivalStableFrames = 0;
 		pointGoalPhase = PointGoalPhase.Idle;
 		mode = ControlMode.TargetPoint;
 		if (trackingGoalPoint.HasValue)
@@ -636,7 +616,6 @@ public class DiffDriveTwinController : MonoBehaviour
 		useVelocityCommandOverride = false;
 		overrideLinearVelocityTarget = 0f;
 		overrideAngularVelocityTarget = 0f;
-		arrivalStableFrames = 0;
 		pointGoalPhase = PointGoalPhase.Idle;
 		mode = ControlMode.TargetYaw;
 	}

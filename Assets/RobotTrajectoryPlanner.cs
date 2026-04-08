@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
@@ -34,10 +34,21 @@ namespace RobotSimulation
 		private const float BasePositionToleranceMeters = 0.02f;
 		private const float BaseStopAcceptanceMeters = 0.025f;
 		private const float BaseSettlingNearGoalAcceptanceMeters = 0.035f;
+		private const float BaseSettlingToleranceEpsilonMeters = 0.003f;
 		private const float BaseLinearSpeedToleranceMetersPerSecond = 0.03f;
 		private const float BaseAngularSpeedToleranceRadPerSecond = 0.05f;
 		private const int BaseStableFixedFramesRequired = 3;
 		private const float ArmWorldTargetToleranceMeters = 0.03f;
+		private const float ArmPlanningFallbackToleranceMeters = 0.04f;
+		private const float ArmPlanningFallbackToleranceSlackMeters = 0.012f;
+		private const int MaxPostSettleCorrectionAttempts = 1;
+
+		private sealed class ArmStagePreparationState
+		{
+			public Vector3 ResolvedBaseGoal;
+			public float ResolvedBaseYaw;
+			public float[] PreferredArmSolveSeed;
+		}
 
 		private ExecutionSafetyFilter _safetyFilter;
 		private Coroutine _planningRoutine;
@@ -182,8 +193,12 @@ namespace RobotSimulation
 			float baseRadius = _physicsQueries.EstimateBaseRadius(manager.diffDriveController);
 			Vector3 currentBasePosition = manager.diffDriveController.rb.position;
 			float currentBaseYaw = manager.diffDriveController.rb.rotation.eulerAngles.y;
-			Vector3 resolvedBaseGoal = currentBasePosition;
-			float resolvedBaseYaw = currentBaseYaw;
+			ArmStagePreparationState armStageState = new ArmStagePreparationState
+			{
+				ResolvedBaseGoal = currentBasePosition,
+				ResolvedBaseYaw = currentBaseYaw,
+				PreferredArmSolveSeed = null
+			};
 			result.resolvedBaseStopWorldPosition = currentBasePosition;
 			result.resolvedBaseStopYawDeg = currentBaseYaw;
 
@@ -268,21 +283,21 @@ namespace RobotSimulation
 			result.dockingPoseFound = resolution.dockingPoseFound;
 			result.baseMoveRequired = resolution.baseMoveRequired;
 			result.armReachableFromCurrentBase = resolution.armReachableFromCurrentBase;
-			result.resolvedBaseStopWorldPosition = resolution.resolvedBaseStopWorldPosition;
-			result.resolvedBaseStopYawDeg = resolution.resolvedBaseStopYawDeg;
 			result.dockingSummary = resolution.dockingSummary;
-			resolvedBaseGoal = resolution.resolvedBaseStopWorldPosition;
-			resolvedBaseYaw = resolution.resolvedBaseStopYawDeg;
-			resolvedBaseGoal.y = currentBasePosition.y;
-			AppendSummary(summaryParts, resolution.dockingSummary);
-			float[] preferredArmSolveSeed = resolution.hasPreferredArmSolveSeed
+			armStageState.ResolvedBaseGoal = resolution.resolvedBaseStopWorldPosition;
+			armStageState.ResolvedBaseYaw = resolution.resolvedBaseStopYawDeg;
+			armStageState.ResolvedBaseGoal.y = currentBasePosition.y;
+			armStageState.PreferredArmSolveSeed = resolution.hasPreferredArmSolveSeed
 				? CloneAngles(resolution.preferredArmSolveSeedAnglesDeg)
 				: null;
+			result.resolvedBaseStopWorldPosition = armStageState.ResolvedBaseGoal;
+			result.resolvedBaseStopYawDeg = armStageState.ResolvedBaseYaw;
+			AppendSummary(summaryParts, resolution.dockingSummary);
 
 			bool shouldMoveBase =
 				request.requireBaseMove &&
 				result.baseMoveRequired &&
-				Vector3.Distance(ProjectXZ(currentBasePosition), ProjectXZ(resolvedBaseGoal)) > BasePositionToleranceMeters;
+				Vector3.Distance(ProjectXZ(currentBasePosition), ProjectXZ(armStageState.ResolvedBaseGoal)) > BasePositionToleranceMeters;
 			if (shouldMoveBase)
 			{
 				float basePlanningDeadline = Time.realtimeSinceStartup + basePlanningBudgetSeconds;
@@ -293,9 +308,9 @@ namespace RobotSimulation
 				}
 
 				currentStage = RobotPlanningStage.BasePlanning;
-				Debug.Log($"[RobotTrajectoryPlanner] Base planning: start={currentBasePosition}, goal={resolvedBaseGoal}, yaw={resolvedBaseYaw:F1}, radius={baseRadius:F3}");
-				_distanceFieldSampler.Build(currentBasePosition, resolvedBaseGoal, obstacles, distanceFieldResolution, basePlanningMargin);
-				if (!_basePlanner.TryPlan(currentBasePosition, currentBaseYaw, resolvedBaseGoal, resolvedBaseYaw, baseRadius, _distanceFieldSampler, _physicsQueries, obstacles, out List<Vector3> baseWaypoints, out string baseFailure))
+				Debug.Log($"[RobotTrajectoryPlanner] Base planning: start={currentBasePosition}, goal={armStageState.ResolvedBaseGoal}, yaw={armStageState.ResolvedBaseYaw:F1}, radius={baseRadius:F3}");
+				_distanceFieldSampler.Build(currentBasePosition, armStageState.ResolvedBaseGoal, obstacles, distanceFieldResolution, basePlanningMargin);
+				if (!_basePlanner.TryPlan(currentBasePosition, currentBaseYaw, armStageState.ResolvedBaseGoal, armStageState.ResolvedBaseYaw, baseRadius, _distanceFieldSampler, _physicsQueries, obstacles, out List<Vector3> baseWaypoints, out string baseFailure))
 				{
 					CompleteFailure(result, RobotPlanningStage.BasePlanning, baseFailure, onComplete);
 					yield break;
@@ -303,8 +318,8 @@ namespace RobotSimulation
 
 				result.baseWaypoints = baseWaypoints;
 				AppendSummary(summaryParts, L(
-					$"底盘已在统一世界坐标系下规划到 ({resolvedBaseGoal.x:F2}, {resolvedBaseGoal.y:F2}, {resolvedBaseGoal.z:F2})。",
-					$"Base planned toward ({resolvedBaseGoal.x:F2}, {resolvedBaseGoal.y:F2}, {resolvedBaseGoal.z:F2}) in the shared world frame."));
+					$"底盘已在统一世界坐标系下规划到 ({armStageState.ResolvedBaseGoal.x:F2}, {armStageState.ResolvedBaseGoal.y:F2}, {armStageState.ResolvedBaseGoal.z:F2})。",
+					$"Base planned toward ({armStageState.ResolvedBaseGoal.x:F2}, {armStageState.ResolvedBaseGoal.y:F2}, {armStageState.ResolvedBaseGoal.z:F2}) in the shared world frame."));
 
 				currentStage = RobotPlanningStage.BaseShadowValidation;
 				Debug.Log($"[RobotTrajectoryPlanner] Base shadow validation: waypoints={baseWaypoints.Count}");
@@ -321,7 +336,7 @@ namespace RobotSimulation
 					currentStage = RobotPlanningStage.BaseExecution;
 					Debug.Log("[RobotTrajectoryPlanner] Base execution started.");
 					float baseExecutionDeadline = Time.realtimeSinceStartup + baseExecutionBudgetSeconds;
-					yield return ExecuteBasePath(result, request, resolvedBaseGoal, resolvedBaseYaw, baseRadius, obstacles, baseExecutionDeadline);
+					yield return ExecuteBasePath(result, request, armStageState.ResolvedBaseGoal, armStageState.ResolvedBaseYaw, baseRadius, obstacles, baseExecutionDeadline);
 					if (!string.IsNullOrEmpty(result.failureReason))
 					{
 						CompleteFailure(result, result.failedAtStage, result.failureReason, onComplete);
@@ -342,18 +357,32 @@ namespace RobotSimulation
 			{
 				currentStage = RobotPlanningStage.BaseSettling;
 				float baseSettlingDeadline = Time.realtimeSinceStartup + Mathf.Max(2f, baseExecutionBudgetSeconds * 0.5f);
-				yield return WaitForBaseSettled(result, resolvedBaseGoal, baseSettlingDeadline);
+				yield return WaitForBaseSettled(result, armStageState.ResolvedBaseGoal, baseSettlingDeadline);
 				if (!string.IsNullOrEmpty(result.failureReason))
 				{
 					CompleteFailure(result, result.failedAtStage, result.failureReason, onComplete);
 					yield break;
 				}
 
-				manager.diffDriveController.CompletePointGoal(resolvedBaseGoal);
+				manager.diffDriveController.CompletePointGoal(armStageState.ResolvedBaseGoal);
 				manager.SyncArmToCurrentBasePoseImmediate();
 				manager.arm6DOFFKController?.RefreshRuntimeState();
 				yield return new WaitForFixedUpdate();
 				AppendSummary(summaryParts, L("底盘已稳定停稳，随后开始机械臂阶段。", "Base settled cleanly before the arm stage started."));
+
+				yield return EnsureSettledBaseSupportsArmTarget(
+					request,
+					result,
+					summaryParts,
+					obstacles,
+					baseRadius,
+					baseExecutionBudgetSeconds,
+					armStageState);
+				if (!string.IsNullOrEmpty(result.failureReason))
+				{
+					CompleteFailure(result, result.failedAtStage, result.failureReason, onComplete);
+					yield break;
+				}
 			}
 
 			if (request.requireArmMove)
@@ -385,16 +414,39 @@ namespace RobotSimulation
 					Vector3 armStart = manager.arm6DOFFKController.EndEffectorWorldPosition;
 					Debug.Log($"[RobotTrajectoryPlanner] Arm planning: start={armStart}, goal={request.armTargetWorldPosition}");
 					_distanceFieldSampler.Build(armStart, request.armTargetWorldPosition, obstacles, Mathf.Max(0.2f, distanceFieldResolution), 2.5f);
+					bool usedFallbackTolerance = false;
+					float planningToleranceMeters = eeToleranceMeters;
 					if (!_armMotionPlanner.TryPlanToWorldPosition(
 						manager.arm6DOFFKController,
 						request.armTargetWorldPosition,
 						_distanceFieldSampler,
 						out List<RobotPlanJointSample> armSamples,
 						out string armFailure,
-						preferredArmSolveSeed))
+						armStageState.PreferredArmSolveSeed,
+						planningToleranceMeters))
 					{
-						CompleteFailure(result, RobotPlanningStage.ArmPlanning, armFailure, onComplete);
-						yield break;
+						if (IsSoftArmPlanningFailure(armFailure)
+							&& TryGetRelaxedArmPlanningTolerance(eeToleranceMeters, out float relaxedToleranceMeters)
+							&& _armMotionPlanner.TryPlanToWorldPosition(
+								manager.arm6DOFFKController,
+								request.armTargetWorldPosition,
+								_distanceFieldSampler,
+								out armSamples,
+								out armFailure,
+								armStageState.PreferredArmSolveSeed,
+								relaxedToleranceMeters))
+						{
+							usedFallbackTolerance = true;
+							planningToleranceMeters = relaxedToleranceMeters;
+							AppendSummary(summaryParts, L(
+								$"机械臂在严格容差 {eeToleranceMeters:F3}m 下未直接收敛，已自动切换到回退容差 {relaxedToleranceMeters:F3}m 继续规划。",
+								$"Arm planning did not converge under the strict tolerance {eeToleranceMeters:F3}m, so planning automatically retried with fallback tolerance {relaxedToleranceMeters:F3}m."));
+						}
+						else
+						{
+							CompleteFailure(result, RobotPlanningStage.ArmPlanning, armFailure, onComplete);
+							yield break;
+						}
 					}
 
 					result.armTrajectorySamples = armSamples;
@@ -415,6 +467,12 @@ namespace RobotSimulation
 					AppendSummary(summaryParts, _planOnly
 						? L("机械臂轨迹已规划到所请求的末端世界目标。", "Arm trajectory planned toward the requested end-effector world target.")
 						: L("机械臂轨迹已验证，可执行到所请求的末端世界目标。", "Arm trajectory validated for the requested end-effector world target."));
+					if (usedFallbackTolerance)
+					{
+						AppendSummary(summaryParts, L(
+							$"本次机械臂规划使用了 {planningToleranceMeters:F3}m 的回退末端容差。",
+							$"This arm plan used a fallback end-effector tolerance of {planningToleranceMeters:F3}m."));
+					}
 
 					if (!_planOnly)
 					{
@@ -434,6 +492,175 @@ namespace RobotSimulation
 			}
 
 			CompleteSuccess(result, summaryParts, onComplete);
+		}
+
+		private IEnumerator EnsureSettledBaseSupportsArmTarget(
+			RobotPlanRequest request,
+			RobotPlanResult result,
+			List<string> summaryParts,
+			List<Collider> obstacles,
+			float baseRadius,
+			float baseExecutionBudgetSeconds,
+			ArmStagePreparationState state)
+		{
+			if (_planOnly || request == null || !request.requireArmMove)
+			{
+				yield break;
+			}
+
+			currentStage = RobotPlanningStage.CurrentBaseReachabilityCheck;
+			yield return null;
+
+			CoordinatedTaskResolution evaluation = _coordinatedTaskPlanner.EvaluateCurrentBaseExecution(
+				request,
+				manager.diffDriveController,
+				manager.arm6DOFFKController);
+			result.armReachableFromCurrentBase = evaluation.armReachableFromCurrentBase;
+			if (evaluation.armReachableFromCurrentBase)
+			{
+				if (evaluation.hasPreferredArmSolveSeed)
+				{
+					state.PreferredArmSolveSeed = CloneAngles(evaluation.preferredArmSolveSeedAnglesDeg);
+				}
+
+				yield break;
+			}
+
+			string lastFailureReason = string.IsNullOrEmpty(evaluation.failureReason)
+				? L("底盘实际停稳后，当前真实位姿仍然无法安全支持机械臂目标。", "After the base settled, the real base pose still cannot safely support the arm target.")
+				: evaluation.failureReason;
+			if (IsSoftArmPlanningFailure(lastFailureReason))
+			{
+				AppendSummary(summaryParts, L(
+					"底盘停稳后的快速可达性检查未能直接收敛，转交正式机械臂规划阶段继续求解。",
+					"Post-settle reachability check did not converge directly, so control is being handed off to the full arm-planning stage."));
+				yield break;
+			}
+
+			if (!request.requireBaseMove || !request.allowReplan)
+			{
+				result.failedAtStage = RobotPlanningStage.CurrentBaseReachabilityCheck;
+				result.failureReason = lastFailureReason;
+				yield break;
+			}
+
+			Vector3 currentSettledBasePosition = manager.diffDriveController.rb.position;
+			float driftFromPlannedDocking = Vector3.Distance(ProjectXZ(currentSettledBasePosition), ProjectXZ(state.ResolvedBaseGoal));
+			if (driftFromPlannedDocking <= BasePositionToleranceMeters)
+			{
+				result.failedAtStage = RobotPlanningStage.CurrentBaseReachabilityCheck;
+				result.failureReason = lastFailureReason;
+				yield break;
+			}
+
+			int correctionAttemptBudget = Mathf.Min(maxLocalReplans, MaxPostSettleCorrectionAttempts);
+			for (int correctiveAttempt = 1; correctiveAttempt <= correctionAttemptBudget; correctiveAttempt++)
+			{
+				Vector3 currentBasePosition = manager.diffDriveController.rb.position;
+				Vector3 correctionGoal = state.ResolvedBaseGoal;
+				correctionGoal.y = currentBasePosition.y;
+				float correctionDistance = Vector3.Distance(ProjectXZ(currentBasePosition), ProjectXZ(correctionGoal));
+				if (correctionDistance <= BasePositionToleranceMeters)
+				{
+					result.failedAtStage = RobotPlanningStage.CurrentBaseReachabilityCheck;
+					result.failureReason = lastFailureReason;
+					yield break;
+				}
+
+				result.replanCount++;
+				AppendSummary(summaryParts, L(
+					$"底盘实际停靠位偏离了原计划停靠位，开始第 {correctiveAttempt} 次短距离回停修正。",
+					$"The real settled base pose drifted from the planned docking pose, so return-to-docking correction {correctiveAttempt} is starting."));
+
+				currentStage = RobotPlanningStage.LocalReplan;
+				yield return null;
+
+				_distanceFieldSampler.Build(currentBasePosition, state.ResolvedBaseGoal, obstacles, distanceFieldResolution, basePlanningMargin);
+				if (!_basePlanner.TryPlan(
+					currentBasePosition,
+					manager.diffDriveController.rb.rotation.eulerAngles.y,
+					state.ResolvedBaseGoal,
+					state.ResolvedBaseYaw,
+					baseRadius,
+					_distanceFieldSampler,
+					_physicsQueries,
+					obstacles,
+					out List<Vector3> correctionWaypoints,
+					out string correctionFailure))
+				{
+					result.failedAtStage = RobotPlanningStage.LocalReplan;
+					result.failureReason = correctionFailure;
+					yield break;
+				}
+
+				result.baseWaypoints = correctionWaypoints;
+				currentStage = RobotPlanningStage.BaseShadowValidation;
+				yield return null;
+
+				lastShadowValidationResult = _shadowGate.ValidateBasePath(correctionWaypoints, baseRadius, _physicsQueries, _distanceFieldSampler, obstacles);
+				if (!lastShadowValidationResult.passed)
+				{
+					result.failedAtStage = RobotPlanningStage.BaseShadowValidation;
+					result.failureReason = lastShadowValidationResult.message;
+					yield break;
+				}
+
+				currentStage = RobotPlanningStage.BaseExecution;
+				float correctionExecutionDeadline = Time.realtimeSinceStartup + Mathf.Max(4f, baseExecutionBudgetSeconds * 0.5f);
+				yield return ExecuteBasePath(result, request, state.ResolvedBaseGoal, state.ResolvedBaseYaw, baseRadius, obstacles, correctionExecutionDeadline);
+				if (!string.IsNullOrEmpty(result.failureReason))
+				{
+					yield break;
+				}
+
+				currentStage = RobotPlanningStage.BaseSettling;
+				float correctionSettlingDeadline = Time.realtimeSinceStartup + Mathf.Max(2f, baseExecutionBudgetSeconds * 0.25f);
+				yield return WaitForBaseSettled(result, state.ResolvedBaseGoal, correctionSettlingDeadline);
+				if (!string.IsNullOrEmpty(result.failureReason))
+				{
+					yield break;
+				}
+
+				manager.diffDriveController.CompletePointGoal(state.ResolvedBaseGoal);
+				manager.SyncArmToCurrentBasePoseImmediate();
+				manager.arm6DOFFKController?.RefreshRuntimeState();
+				yield return new WaitForFixedUpdate();
+
+				currentStage = RobotPlanningStage.CurrentBaseReachabilityCheck;
+				yield return null;
+
+				evaluation = _coordinatedTaskPlanner.EvaluateCurrentBaseExecution(
+					request,
+					manager.diffDriveController,
+					manager.arm6DOFFKController);
+				result.armReachableFromCurrentBase = evaluation.armReachableFromCurrentBase;
+				if (evaluation.armReachableFromCurrentBase)
+				{
+					if (evaluation.hasPreferredArmSolveSeed)
+					{
+						state.PreferredArmSolveSeed = CloneAngles(evaluation.preferredArmSolveSeedAnglesDeg);
+					}
+
+					AppendSummary(summaryParts, L(
+						"底盘修正停靠后，当前真实底盘位姿已经支持机械臂目标。",
+						"After the corrective docking move, the current real base pose supports the arm target."));
+					yield break;
+				}
+
+				lastFailureReason = string.IsNullOrEmpty(evaluation.failureReason)
+					? lastFailureReason
+					: evaluation.failureReason;
+				if (IsSoftArmPlanningFailure(lastFailureReason))
+				{
+					AppendSummary(summaryParts, L(
+						"底盘回停修正后仍未在快速检查阶段直接收敛，转交正式机械臂规划阶段继续求解。",
+						"Return-to-docking correction still did not converge during the fast reachability check, so control is being handed off to the full arm-planning stage."));
+					yield break;
+				}
+			}
+
+			result.failedAtStage = RobotPlanningStage.CurrentBaseReachabilityCheck;
+			result.failureReason = lastFailureReason;
 		}
 
 		private IEnumerator PlanAndExecuteSafeCoroutine(RobotPlanRequest request, Action<RobotPlanResult> onComplete)
@@ -753,6 +980,8 @@ namespace RobotSimulation
 		private IEnumerator WaitForBaseSettled(RobotPlanResult result, Vector3 goalWorldPosition, float deadline)
 		{
 			int stableFrames = 0;
+			float effectiveNearGoalTolerance = BaseSettlingNearGoalAcceptanceMeters + BaseSettlingToleranceEpsilonMeters;
+			float effectiveStopTolerance = BaseStopAcceptanceMeters + BaseSettlingToleranceEpsilonMeters;
 			while (Time.realtimeSinceStartup <= deadline)
 			{
 				if (_stopRequested)
@@ -771,17 +1000,17 @@ namespace RobotSimulation
 
 				DiffDriveTwinController controller = manager.diffDriveController;
 				float positionError = Vector3.Distance(ProjectXZ(controller.rb.position), ProjectXZ(goalWorldPosition));
-				if (positionError <= BaseSettlingNearGoalAcceptanceMeters)
+				if (positionError <= effectiveNearGoalTolerance)
 				{
 					controller.CompletePointGoal(goalWorldPosition);
 				}
 
 				float linearSpeed = controller.CurrentPlanarSpeedMeasured;
 				float angularSpeed = controller.CurrentYawRateMeasured;
-				bool strictSettled = positionError <= BaseStopAcceptanceMeters
+				bool strictSettled = positionError <= effectiveStopTolerance
 					&& linearSpeed <= BaseLinearSpeedToleranceMetersPerSecond
 					&& angularSpeed <= BaseAngularSpeedToleranceRadPerSecond;
-				bool nearGoalSettled = positionError <= BaseSettlingNearGoalAcceptanceMeters
+				bool nearGoalSettled = positionError <= effectiveNearGoalTolerance
 					&& linearSpeed <= BaseLinearSpeedToleranceMetersPerSecond
 					&& angularSpeed <= BaseAngularSpeedToleranceRadPerSecond;
 				if (strictSettled || nearGoalSettled)
@@ -806,6 +1035,14 @@ namespace RobotSimulation
 				float finalPositionError = Vector3.Distance(ProjectXZ(manager.diffDriveController.rb.position), ProjectXZ(goalWorldPosition));
 				float finalLinearSpeed = manager.diffDriveController.CurrentPlanarSpeedMeasured;
 				float finalAngularSpeed = manager.diffDriveController.CurrentYawRateMeasured;
+				if (finalPositionError <= effectiveNearGoalTolerance
+					&& finalLinearSpeed <= BaseLinearSpeedToleranceMetersPerSecond
+					&& finalAngularSpeed <= BaseAngularSpeedToleranceRadPerSecond)
+				{
+					manager.diffDriveController.CompletePointGoal(goalWorldPosition);
+					yield break;
+				}
+
 				result.failureReason = L(
 					$"等待底盘在请求的世界参考点稳定停稳时超时。误差={finalPositionError:F3}m，线速度={finalLinearSpeed:F3}m/s，角速度={finalAngularSpeed:F3}rad/s。",
 					$"Timed out while waiting for the base to settle at the requested world-reference point. Error={finalPositionError:F3}m, linear speed={finalLinearSpeed:F3}m/s, angular speed={finalAngularSpeed:F3}rad/s.");
@@ -999,6 +1236,24 @@ namespace RobotSimulation
 		private static Vector3 ProjectXZ(Vector3 value)
 		{
 			return new Vector3(value.x, 0f, value.z);
+		}
+
+		private static bool TryGetRelaxedArmPlanningTolerance(float strictToleranceMeters, out float relaxedToleranceMeters)
+		{
+			float strictTolerance = Mathf.Max(0.001f, strictToleranceMeters);
+			relaxedToleranceMeters = Mathf.Max(ArmPlanningFallbackToleranceMeters, strictTolerance + ArmPlanningFallbackToleranceSlackMeters);
+			return relaxedToleranceMeters > strictTolerance + 1e-4f;
+		}
+
+		private static bool IsSoftArmPlanningFailure(string reason)
+		{
+			if (string.IsNullOrWhiteSpace(reason))
+			{
+				return false;
+			}
+
+			return reason.IndexOf("机械臂规划未收敛", StringComparison.OrdinalIgnoreCase) >= 0
+				|| reason.IndexOf("Arm planner did not converge", StringComparison.OrdinalIgnoreCase) >= 0;
 		}
 
 		private static string L(string chinese, string english)

@@ -357,6 +357,13 @@ namespace RobotSimulation
 		private const float NearGoalDockingSpeed = 0.10f;
 		private const float StallTimeoutSeconds = 2.5f;
 
+		private sealed class PreparedPath
+		{
+			public readonly List<Vector3> points = new List<Vector3>();
+			public float[] cumulativeDistances = Array.Empty<float>();
+			public float totalLength;
+		}
+
 		public IEnumerator FollowWaypoints(
 			DiffDriveTwinController controller,
 			IReadOnlyList<Vector3> waypoints,
@@ -377,19 +384,19 @@ namespace RobotSimulation
 				yield break;
 			}
 
-			List<Vector3> path = BuildPath(controller.rb.position, waypoints);
-			if (path.Count == 0)
+			PreparedPath path = BuildPath(controller.rb.position, waypoints);
+			if (path.points.Count <= 1 || path.totalLength <= 1e-4f)
 			{
 				controller.ClearVelocityCommand(true);
 				onComplete?.Invoke(true, "Base path is empty, so no base motion is required.");
 				yield break;
 			}
 
-			float timeout = EstimatePathTimeout(controller, path);
+			float timeout = EstimatePathTimeout(controller, path.totalLength);
 			float elapsed = 0f;
 			float stallElapsed = 0f;
-			float bestRemaining = ComputeTotalLength(path);
-			Vector3 finalGoal = path[path.Count - 1];
+			float bestRemaining = path.totalLength;
+			Vector3 finalGoal = path.points[path.points.Count - 1];
 
 			while (elapsed < timeout)
 			{
@@ -420,24 +427,28 @@ namespace RobotSimulation
 				}
 
 				if (planarGoalError <= HandoffTolerance
-					&& remaining <= DockingDistance
-					&& controller.CurrentPlanarSpeedMeasured <= HandoffSpeedTolerance
-					&& controller.CurrentYawRateMeasured <= HandoffYawRateTolerance)
+					&& remaining <= DockingDistance)
 				{
 					controller.CompletePointGoal(finalGoal);
 					onComplete?.Invoke(true, "Base path tracking completed with a terminal stop.");
 					yield break;
 				}
 
+				if (planarGoalError <= NearGoalStallGraceTolerance
+					&& remaining <= DockingDistance
+					&& controller.CurrentPlanarSpeedMeasured <= RelaxedSpeedTolerance
+					&& controller.CurrentYawRateMeasured <= RelaxedYawRateTolerance)
+				{
+					controller.CompletePointGoal(finalGoal);
+					onComplete?.Invoke(true, "Base path tracking accepted near-goal settling and stopped.");
+					yield break;
+				}
+
 				if (planarGoalError <= PositionTolerance)
 				{
 					controller.CompletePointGoal(finalGoal);
-					if (controller.CurrentPlanarSpeedMeasured <= RelaxedSpeedTolerance
-						&& controller.CurrentYawRateMeasured <= RelaxedYawRateTolerance)
-					{
-						onComplete?.Invoke(true, "Base path tracking reached the terminal docking zone and stopped.");
-						yield break;
-					}
+					onComplete?.Invoke(true, "Base path tracking reached the terminal docking zone and stopped.");
+					yield break;
 				}
 				else if (stallElapsed > StallTimeoutSeconds)
 				{
@@ -468,6 +479,13 @@ namespace RobotSimulation
 
 			controller.ClearVelocityCommand(true);
 			float finalError = Vector3.Distance(ProjectXZ(controller.rb.position), ProjectXZ(finalGoal));
+			if (finalError <= NearGoalStallGraceTolerance)
+			{
+				controller.CompletePointGoal(finalGoal);
+				onComplete?.Invoke(true, $"Base path tracking accepted near-goal completion on timeout. Remaining planar distance={finalError:F3}m.");
+				yield break;
+			}
+
 			onComplete?.Invoke(false, $"Timed out while tracking the base path. Remaining planar distance={finalError:F3}m.");
 		}
 
@@ -535,13 +553,14 @@ namespace RobotSimulation
 				maxYawRate);
 		}
 
-		private static List<Vector3> BuildPath(Vector3 start, IReadOnlyList<Vector3> waypoints)
+		private static PreparedPath BuildPath(Vector3 start, IReadOnlyList<Vector3> waypoints)
 		{
-			List<Vector3> path = new List<Vector3>();
+			PreparedPath path = new PreparedPath();
 			Vector3 normalizedStart = start;
-			path.Add(normalizedStart);
+			path.points.Add(normalizedStart);
 			if (waypoints == null)
 			{
+				UpdatePathMetrics(path);
 				return path;
 			}
 
@@ -549,54 +568,60 @@ namespace RobotSimulation
 			{
 				Vector3 waypoint = waypoints[i];
 				waypoint.y = normalizedStart.y;
-				if (path.Count == 0 || Vector3.Distance(ProjectXZ(path[path.Count - 1]), ProjectXZ(waypoint)) > 0.01f)
+				if (path.points.Count == 0 || Vector3.Distance(ProjectXZ(path.points[path.points.Count - 1]), ProjectXZ(waypoint)) > 0.01f)
 				{
-					path.Add(waypoint);
+					path.points.Add(waypoint);
 				}
 			}
 
+			UpdatePathMetrics(path);
 			return path;
 		}
 
-		private static float EstimatePathTimeout(DiffDriveTwinController controller, IReadOnlyList<Vector3> path)
+		private static void UpdatePathMetrics(PreparedPath path)
 		{
-			float totalLength = ComputeTotalLength(path);
+			if (path == null)
+			{
+				return;
+			}
+
+			int pointCount = path.points.Count;
+			if (path.cumulativeDistances == null || path.cumulativeDistances.Length != pointCount)
+			{
+				path.cumulativeDistances = pointCount > 0 ? new float[pointCount] : Array.Empty<float>();
+			}
+
+			float cumulative = 0f;
+			for (int i = 1; i < pointCount; i++)
+			{
+				cumulative += Vector3.Distance(ProjectXZ(path.points[i - 1]), ProjectXZ(path.points[i]));
+				path.cumulativeDistances[i] = cumulative;
+			}
+
+			path.totalLength = cumulative;
+		}
+
+		private static float EstimatePathTimeout(DiffDriveTwinController controller, float totalLength)
+		{
 			float driveSeconds = totalLength / Mathf.Max(0.15f, controller.vMax * 0.7f);
 			return Mathf.Max(5f, (driveSeconds * 4f) + 2.5f);
 		}
 
-		private static float ComputeTotalLength(IReadOnlyList<Vector3> path)
-		{
-			if (path == null || path.Count < 2)
-			{
-				return 0f;
-			}
-
-			float total = 0f;
-			for (int i = 0; i < path.Count - 1; i++)
-			{
-				total += Vector3.Distance(ProjectXZ(path[i]), ProjectXZ(path[i + 1]));
-			}
-
-			return total;
-		}
-
-		private static float FindProgressAlongPath(Vector3 position, IReadOnlyList<Vector3> path, out int segmentIndex, out Vector3 projectedPoint)
+		private static float FindProgressAlongPath(Vector3 position, PreparedPath path, out int segmentIndex, out Vector3 projectedPoint)
 		{
 			segmentIndex = 0;
-			projectedPoint = path != null && path.Count > 0 ? path[0] : position;
-			if (path == null || path.Count < 2)
+			projectedPoint = path != null && path.points.Count > 0 ? path.points[0] : position;
+			if (path == null || path.points.Count < 2)
 			{
 				return 0f;
 			}
 
 			float bestDistanceSqr = float.MaxValue;
 			float bestProgress = 0f;
-			float cumulative = 0f;
-			for (int i = 0; i < path.Count - 1; i++)
+			for (int i = 0; i < path.points.Count - 1; i++)
 			{
-				Vector3 a = ProjectXZ(path[i]);
-				Vector3 b = ProjectXZ(path[i + 1]);
+				Vector3 a = ProjectXZ(path.points[i]);
+				Vector3 b = ProjectXZ(path.points[i + 1]);
 				Vector3 segment = b - a;
 				float segmentLength = segment.magnitude;
 				if (segmentLength <= 1e-5f)
@@ -610,56 +635,52 @@ namespace RobotSimulation
 				if (distanceSqr < bestDistanceSqr)
 				{
 					bestDistanceSqr = distanceSqr;
-					bestProgress = cumulative + (segmentLength * t);
+					bestProgress = path.cumulativeDistances[i] + (segmentLength * t);
 					segmentIndex = i;
-					projectedPoint = new Vector3(projected.x, path[i].y, projected.z);
+					projectedPoint = new Vector3(projected.x, path.points[i].y, projected.z);
 				}
-
-				cumulative += segmentLength;
 			}
 
 			return bestProgress;
 		}
 
-		private static float ComputeRemainingDistance(IReadOnlyList<Vector3> path, float progress)
+		private static float ComputeRemainingDistance(PreparedPath path, float progress)
 		{
-			return Mathf.Max(0f, ComputeTotalLength(path) - progress);
+			return path == null ? 0f : Mathf.Max(0f, path.totalLength - progress);
 		}
 
-		private static Vector3 SamplePathPointAtDistance(IReadOnlyList<Vector3> path, float distanceAlongPath)
+		private static Vector3 SamplePathPointAtDistance(PreparedPath path, float distanceAlongPath)
 		{
-			if (path == null || path.Count == 0)
+			if (path == null || path.points.Count == 0)
 			{
 				return Vector3.zero;
 			}
 
-			if (path.Count == 1)
+			if (path.points.Count == 1)
 			{
-				return path[0];
+				return path.points[0];
 			}
 
-			float targetDistance = Mathf.Clamp(distanceAlongPath, 0f, ComputeTotalLength(path));
-			float cumulative = 0f;
-			for (int i = 0; i < path.Count - 1; i++)
+			float targetDistance = Mathf.Clamp(distanceAlongPath, 0f, path.totalLength);
+			for (int i = 0; i < path.points.Count - 1; i++)
 			{
-				Vector3 from = path[i];
-				Vector3 to = path[i + 1];
+				Vector3 from = path.points[i];
+				Vector3 to = path.points[i + 1];
 				float segmentLength = Vector3.Distance(ProjectXZ(from), ProjectXZ(to));
 				if (segmentLength <= 1e-5f)
 				{
 					continue;
 				}
 
-				if (cumulative + segmentLength >= targetDistance)
+				float segmentStartDistance = path.cumulativeDistances[i];
+				if (segmentStartDistance + segmentLength >= targetDistance)
 				{
-					float t = (targetDistance - cumulative) / segmentLength;
+					float t = (targetDistance - segmentStartDistance) / segmentLength;
 					return Vector3.Lerp(from, to, t);
 				}
-
-				cumulative += segmentLength;
 			}
 
-			return path[path.Count - 1];
+			return path.points[path.points.Count - 1];
 		}
 
 		private static Vector3 ProjectXZ(Vector3 value)

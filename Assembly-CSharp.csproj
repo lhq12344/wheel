@@ -71,10 +71,9 @@
     <Compile Include="Assets\ConfigManager.cs" />
     <Compile Include="Assets\ShadowSimulationGate.cs" />
     <Compile Include="Assets\InteractiveControlPanel.cs" />
+    <Compile Include="Assets\OneJointTrapezoidController.cs" />
     <Compile Include="Assets\RobotTrajectoryPlanner.cs" />
     <Compile Include="Assets\RobotSimulationLocalization.cs" />
-    <Compile Include="Assets\ArmTestController.cs" />
-    <Compile Include="Assets\control.cs" />
     <Compile Include="Assets\RobotSimulationManager.cs" />
     <Compile Include="Assets\SquareObstacleTestSceneBuilder.cs" />
     <Compile Include="Assets\RobotModelResidualTracker.cs" />

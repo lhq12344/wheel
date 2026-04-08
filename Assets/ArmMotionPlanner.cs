@@ -6,15 +6,17 @@ namespace RobotSimulation
 	[System.Serializable]
 	public sealed class ArmMotionPlannerSettings
 	{
-		public int maxIterations = 120;
+		public int maxIterations = 180;
 		public float toleranceMeters = 0.02f;
 		public float dlsLambda = 0.02f;
 		public float maxDeltaDegPerIteration = 6f;
+		public float compoundNudgeDeg = 10f;
 		public float sampleSpacingDeg = 4f;
 		public float sampleTimeStepSeconds = 0.08f;
 		public float preferredTrajectorySingularityPenalty = 42f;
 		public float trajectorySingularityPenaltyWeight = 0.75f;
 		public float finalSingularityPenaltyWeight = 0.25f;
+		public float nearbyTargetProbeFactor = 0.75f;
 	}
 
 	public sealed class ArmMotionPlanner
@@ -27,11 +29,13 @@ namespace RobotSimulation
 			SceneDistanceFieldSampler sampler,
 			out List<RobotPlanJointSample> samples,
 			out string failureReason,
-			float[] preferredSolveSeedAnglesDeg = null)
+			float[] preferredSolveSeedAnglesDeg = null,
+			float targetToleranceMeters = -1f)
 		{
 			samples = new List<RobotPlanJointSample>();
 			failureReason = string.Empty;
 			float singularityPenalty;
+			float solveToleranceMeters = ResolveSolveTolerance(targetToleranceMeters);
 
 			if (armController == null || !armController.IsInitialized || !armController.KinematicsReady)
 			{
@@ -41,16 +45,26 @@ namespace RobotSimulation
 
 			float[] startAngles = armController.CaptureMeasuredJointAngles();
 			Vector3 targetBasePosition = armController.WorldToBasePosition(targetWorldPosition);
-			if (!TrySolveToBasePosition(
-				armController,
-				targetBasePosition,
-				out float[] workingAngles,
-				out singularityPenalty,
-				out failureReason,
-				preferredSolveSeedAnglesDeg ?? startAngles,
-				startAngles))
+			float[] workingAngles = ClampAnglesToJointLimits(armController, preferredSolveSeedAnglesDeg);
+			bool preferredSeedIsUsable = workingAngles != null
+				&& workingAngles.Length >= 6
+				&& ComputeResidualToBaseTarget(armController, workingAngles, targetBasePosition) <= solveToleranceMeters;
+			if (!preferredSeedIsUsable
+				&& !TrySolveToBasePosition(
+					armController,
+					targetBasePosition,
+					out workingAngles,
+					out singularityPenalty,
+					out failureReason,
+					preferredSolveSeedAnglesDeg ?? startAngles,
+					startAngles,
+					solveToleranceMeters))
 			{
 				return false;
+			}
+			else if (preferredSeedIsUsable)
+			{
+				singularityPenalty = ComputeSingularityPenalty(armController.ComputeGeometricJacobian(workingAngles));
 			}
 
 			int sampleCount = EstimateSampleCountInternal(startAngles, workingAngles);
@@ -95,11 +109,13 @@ namespace RobotSimulation
 			out float singularityPenalty,
 			out string failureReason,
 			float[] startAnglesDeg = null,
-			float[] trajectoryStartAnglesDeg = null)
+			float[] trajectoryStartAnglesDeg = null,
+			float targetToleranceMeters = -1f)
 		{
 			solvedAnglesDeg = new float[6];
 			singularityPenalty = float.PositiveInfinity;
 			failureReason = string.Empty;
+			float solveToleranceMeters = ResolveSolveTolerance(targetToleranceMeters);
 
 			if (armController == null || !armController.IsInitialized || !armController.KinematicsReady)
 			{
@@ -107,7 +123,7 @@ namespace RobotSimulation
 				return false;
 			}
 
-			if (!armController.IsBasePositionReachable(targetBasePosition, settings.toleranceMeters))
+			if (!armController.IsBasePositionReachable(targetBasePosition, solveToleranceMeters))
 			{
 				failureReason = L("机械臂目标超出了保守可达包络。", "Arm target is outside the conservative reach envelope.");
 				return false;
@@ -133,7 +149,8 @@ namespace RobotSimulation
 					out float[] candidateAngles,
 					out float candidateResidual,
 					out float candidateSingularityPenalty,
-					out bool converged))
+					out bool converged,
+					solveToleranceMeters))
 				{
 					continue;
 				}
@@ -168,9 +185,26 @@ namespace RobotSimulation
 
 			if (!foundConvergedSolution || bestAngles == null)
 			{
+				if (bestAngles != null
+					&& TrySolveNearbyTargetOffsets(
+						armController,
+						targetBasePosition,
+						solveToleranceMeters,
+						bestAngles,
+						evaluationStartAngles,
+						out float[] nearbySolvedAngles,
+						out float nearbyResidual,
+						out float nearbySingularityPenalty,
+						out float nearbyTrajectoryPeakSingularity))
+				{
+					solvedAnglesDeg = nearbySolvedAngles;
+					singularityPenalty = nearbySingularityPenalty;
+					return true;
+				}
+
 				failureReason = L(
 					$"机械臂规划未收敛，最佳残差为 {bestResidual:F4}m。",
-					$"Arm planner did not converge. Best residual={bestResidual:F4}m.");
+					$"Arm planner did not converge. Best residual={bestResidual:F4}m, tolerance={solveToleranceMeters:F4}m.");
 				return false;
 			}
 
@@ -186,7 +220,8 @@ namespace RobotSimulation
 			out float[] solvedAnglesDeg,
 			out float residualMeters,
 			out float singularityPenalty,
-			out bool converged)
+			out bool converged,
+			float solveToleranceMeters)
 		{
 			solvedAnglesDeg = ClampAnglesToJointLimits(armController, seedAnglesDeg);
 			singularityPenalty = float.PositiveInfinity;
@@ -215,7 +250,7 @@ namespace RobotSimulation
 					bestAngles = (float[])workingAngles.Clone();
 				}
 
-				if (currentResidual <= settings.toleranceMeters)
+				if (currentResidual <= solveToleranceMeters)
 				{
 					converged = true;
 					bestResidual = currentResidual;
@@ -260,11 +295,29 @@ namespace RobotSimulation
 
 				if (!acceptedStep || acceptedAngles == null)
 				{
-					break;
+				if (!TryFindNudgeStep(
+						armController,
+						targetBasePosition,
+						workingAngles,
+						currentResidual,
+						out acceptedAngles,
+						out acceptedResidual))
+					{
+						if (!TryFindCompoundNudgeStep(
+							armController,
+							targetBasePosition,
+							workingAngles,
+							currentResidual,
+							out acceptedAngles,
+							out acceptedResidual))
+						{
+							break;
+						}
+					}
 				}
 
 				workingAngles = acceptedAngles;
-				if (acceptedResidual <= settings.toleranceMeters)
+				if (acceptedResidual <= solveToleranceMeters)
 				{
 					converged = true;
 					bestResidual = acceptedResidual;
@@ -277,6 +330,117 @@ namespace RobotSimulation
 			residualMeters = bestResidual;
 			singularityPenalty = ComputeSingularityPenalty(armController.ComputeGeometricJacobian(bestAngles));
 			return true;
+		}
+
+		private bool TrySolveNearbyTargetOffsets(
+			Arm6DOFFKController armController,
+			Vector3 originalTargetBasePosition,
+			float solveToleranceMeters,
+			float[] primarySeedAnglesDeg,
+			float[] secondarySeedAnglesDeg,
+			out float[] solvedAnglesDeg,
+			out float residualMeters,
+			out float singularityPenalty,
+			out float trajectoryPeakSingularity)
+		{
+			solvedAnglesDeg = null;
+			residualMeters = float.PositiveInfinity;
+			singularityPenalty = float.PositiveInfinity;
+			trajectoryPeakSingularity = float.PositiveInfinity;
+			if (armController == null || primarySeedAnglesDeg == null || primarySeedAnglesDeg.Length < 6)
+			{
+				return false;
+			}
+
+			List<float[]> probeSeeds = new List<float[]>();
+			AddSolveSeed(probeSeeds, ClampAnglesToJointLimits(armController, primarySeedAnglesDeg));
+			AddSolveSeed(probeSeeds, ClampAnglesToJointLimits(armController, secondarySeedAnglesDeg));
+			AddSolveSeed(probeSeeds, ClampAnglesToJointLimits(armController, armController.CaptureMeasuredJointAngles()));
+			AddSolveSeed(probeSeeds, ClampAnglesToJointLimits(armController, armController.configuredHomeJointAnglesDeg));
+
+			float probeDistance = Mathf.Max(0.002f, solveToleranceMeters * Mathf.Max(0.25f, settings.nearbyTargetProbeFactor));
+			float[] probeScales = { 0.5f, 1f };
+			Vector3[] probeDirections =
+			{
+				Vector3.right,
+				Vector3.left,
+				Vector3.up,
+				Vector3.down,
+				Vector3.forward,
+				Vector3.back,
+				new Vector3(1f, 0f, 1f).normalized,
+				new Vector3(-1f, 0f, 1f).normalized,
+				new Vector3(1f, 0f, -1f).normalized,
+				new Vector3(-1f, 0f, -1f).normalized
+			};
+
+			float bestScore = float.PositiveInfinity;
+			for (int scaleIndex = 0; scaleIndex < probeScales.Length; scaleIndex++)
+			{
+				float offsetDistance = probeDistance * probeScales[scaleIndex];
+				for (int directionIndex = 0; directionIndex < probeDirections.Length; directionIndex++)
+				{
+					Vector3 nearbyTarget = originalTargetBasePosition + (probeDirections[directionIndex] * offsetDistance);
+					if (!armController.IsBasePositionReachable(nearbyTarget, solveToleranceMeters))
+					{
+						continue;
+					}
+
+					for (int seedIndex = 0; seedIndex < probeSeeds.Count; seedIndex++)
+					{
+						float[] probeSeed = probeSeeds[seedIndex];
+						if (probeSeed == null || probeSeed.Length < 6)
+						{
+							continue;
+						}
+
+						if (!TrySolveSingleSeed(
+							armController,
+							nearbyTarget,
+							probeSeed,
+							out float[] candidateAngles,
+							out float candidateResidualToNearbyTarget,
+							out float candidateSingularityPenalty,
+							out bool converged,
+							solveToleranceMeters))
+						{
+							continue;
+						}
+
+						if (!converged || candidateAngles == null)
+						{
+							continue;
+						}
+
+						float actualResidualToOriginal = ComputeResidualToBaseTarget(armController, candidateAngles, originalTargetBasePosition);
+						if (actualResidualToOriginal > solveToleranceMeters)
+						{
+							continue;
+						}
+
+						float candidateTrajectoryPeakSingularity = EstimateTrajectoryPeakSingularity(
+							armController,
+							probeSeed,
+							candidateAngles);
+						float candidateScore = ComputeCandidateScore(
+							actualResidualToOriginal,
+							candidateSingularityPenalty,
+							candidateTrajectoryPeakSingularity);
+						if (candidateScore + 1e-4f >= bestScore)
+						{
+							continue;
+						}
+
+						bestScore = candidateScore;
+						solvedAnglesDeg = candidateAngles;
+						residualMeters = actualResidualToOriginal;
+						singularityPenalty = candidateSingularityPenalty;
+						trajectoryPeakSingularity = candidateTrajectoryPeakSingularity;
+					}
+				}
+			}
+
+			return solvedAnglesDeg != null;
 		}
 
 		private List<float[]> BuildSolveSeeds(Arm6DOFFKController armController, float[] primarySeedAnglesDeg)
@@ -315,6 +479,7 @@ namespace RobotSimulation
 			float[] clampedSeed = ClampAnglesToJointLimits(armController, baseSeed);
 			AddSolveSeed(seeds, clampedSeed);
 			AddWristBiasSeeds(seeds, armController, clampedSeed);
+			AddShoulderElbowBiasSeeds(seeds, armController, clampedSeed);
 		}
 
 		private void AddWristBiasSeeds(List<float[]> seeds, Arm6DOFFKController armController, float[] baseSeed)
@@ -358,6 +523,35 @@ namespace RobotSimulation
 				negativeBias[4] = -45f;
 				negativeBias[5] += 60f;
 				AddSolveSeed(seeds, ClampAnglesToJointLimits(armController, negativeBias));
+			}
+		}
+
+		private void AddShoulderElbowBiasSeeds(List<float[]> seeds, Arm6DOFFKController armController, float[] baseSeed)
+		{
+			if (seeds == null || armController == null || baseSeed == null || baseSeed.Length < 6)
+			{
+				return;
+			}
+
+			float[][] reachOffsets =
+			{
+				new[] { 0f, 25f, -35f, 15f, 0f, 0f },
+				new[] { 0f, -25f, 35f, -15f, 0f, 0f },
+				new[] { 20f, 18f, -28f, 10f, 0f, 0f },
+				new[] { -20f, -18f, 28f, -10f, 0f, 0f },
+				new[] { 35f, 0f, 0f, 0f, 0f, 0f },
+				new[] { -35f, 0f, 0f, 0f, 0f, 0f }
+			};
+
+			for (int variantIndex = 0; variantIndex < reachOffsets.Length; variantIndex++)
+			{
+				float[] variant = (float[])baseSeed.Clone();
+				for (int jointIndex = 0; jointIndex < 6; jointIndex++)
+				{
+					variant[jointIndex] += reachOffsets[variantIndex][jointIndex];
+				}
+
+				AddSolveSeed(seeds, ClampAnglesToJointLimits(armController, variant));
 			}
 		}
 
@@ -422,6 +616,127 @@ namespace RobotSimulation
 			return changed ? nextAngles : null;
 		}
 
+		private bool TryFindNudgeStep(
+			Arm6DOFFKController armController,
+			Vector3 targetBasePosition,
+			float[] workingAnglesDeg,
+			float currentResidual,
+			out float[] acceptedAngles,
+			out float acceptedResidual)
+		{
+			acceptedAngles = null;
+			acceptedResidual = currentResidual;
+			if (armController == null || workingAnglesDeg == null || workingAnglesDeg.Length < 6)
+			{
+				return false;
+			}
+
+			int[] jointPriority = { 2, 1, 3, 0, 4, 5 };
+			float[] nudgeMagnitudes = { settings.maxDeltaDegPerIteration, settings.maxDeltaDegPerIteration * 0.5f };
+			float bestResidual = currentResidual;
+			float[] bestAngles = null;
+			for (int magnitudeIndex = 0; magnitudeIndex < nudgeMagnitudes.Length; magnitudeIndex++)
+			{
+				float nudgeMagnitude = Mathf.Max(1f, nudgeMagnitudes[magnitudeIndex]);
+				for (int priorityIndex = 0; priorityIndex < jointPriority.Length; priorityIndex++)
+				{
+					int jointIndex = jointPriority[priorityIndex];
+					for (int signIndex = 0; signIndex < 2; signIndex++)
+					{
+						float sign = signIndex == 0 ? -1f : 1f;
+						float[] candidateAngles = (float[])workingAnglesDeg.Clone();
+						Vector2 limits = armController.GetJointLimits(jointIndex);
+						candidateAngles[jointIndex] = Mathf.Clamp(candidateAngles[jointIndex] + sign * nudgeMagnitude, limits.x, limits.y);
+						float candidateResidual = ComputeResidualToBaseTarget(armController, candidateAngles, targetBasePosition);
+						if (candidateResidual + 1e-5f < bestResidual)
+						{
+							bestResidual = candidateResidual;
+							bestAngles = candidateAngles;
+						}
+					}
+				}
+			}
+
+			if (bestAngles == null)
+			{
+				return false;
+			}
+
+			acceptedAngles = bestAngles;
+			acceptedResidual = bestResidual;
+			return true;
+		}
+
+		private bool TryFindCompoundNudgeStep(
+			Arm6DOFFKController armController,
+			Vector3 targetBasePosition,
+			float[] workingAnglesDeg,
+			float currentResidual,
+			out float[] acceptedAngles,
+			out float acceptedResidual)
+		{
+			acceptedAngles = null;
+			acceptedResidual = currentResidual;
+			if (armController == null || workingAnglesDeg == null || workingAnglesDeg.Length < 6)
+			{
+				return false;
+			}
+
+			int[,] jointPairs =
+			{
+				{ 1, 2 },
+				{ 1, 3 },
+				{ 2, 3 },
+				{ 0, 1 },
+				{ 2, 4 },
+				{ 3, 4 }
+			};
+			float[] nudgeMagnitudes =
+			{
+				Mathf.Max(1f, settings.compoundNudgeDeg),
+				Mathf.Max(0.5f, settings.compoundNudgeDeg * 0.5f)
+			};
+			float bestResidual = currentResidual;
+			float[] bestAngles = null;
+			for (int magnitudeIndex = 0; magnitudeIndex < nudgeMagnitudes.Length; magnitudeIndex++)
+			{
+				float magnitude = nudgeMagnitudes[magnitudeIndex];
+				for (int pairIndex = 0; pairIndex < jointPairs.GetLength(0); pairIndex++)
+				{
+					int firstJoint = jointPairs[pairIndex, 0];
+					int secondJoint = jointPairs[pairIndex, 1];
+					for (int firstSignIndex = 0; firstSignIndex < 2; firstSignIndex++)
+					{
+						float firstSign = firstSignIndex == 0 ? -1f : 1f;
+						for (int secondSignIndex = 0; secondSignIndex < 2; secondSignIndex++)
+						{
+							float secondSign = secondSignIndex == 0 ? -1f : 1f;
+							float[] candidateAngles = (float[])workingAnglesDeg.Clone();
+							Vector2 firstLimits = armController.GetJointLimits(firstJoint);
+							Vector2 secondLimits = armController.GetJointLimits(secondJoint);
+							candidateAngles[firstJoint] = Mathf.Clamp(candidateAngles[firstJoint] + firstSign * magnitude, firstLimits.x, firstLimits.y);
+							candidateAngles[secondJoint] = Mathf.Clamp(candidateAngles[secondJoint] + secondSign * magnitude, secondLimits.x, secondLimits.y);
+							float candidateResidual = ComputeResidualToBaseTarget(armController, candidateAngles, targetBasePosition);
+							if (candidateResidual + 1e-5f < bestResidual)
+							{
+								bestResidual = candidateResidual;
+								bestAngles = candidateAngles;
+							}
+						}
+					}
+				}
+			}
+
+			if (bestAngles == null)
+			{
+				return false;
+			}
+
+			acceptedAngles = bestAngles;
+			acceptedResidual = bestResidual;
+			return true;
+		}
+
 		private float[] ClampAnglesToJointLimits(Arm6DOFFKController armController, float[] sourceAnglesDeg)
 		{
 			if (armController == null)
@@ -484,6 +799,21 @@ namespace RobotSimulation
 				+ (trajectoryPeakSingularity * settings.trajectorySingularityPenaltyWeight)
 				+ (finalSingularityPenalty * settings.finalSingularityPenaltyWeight)
 				+ (softExcessPenalty * 4f);
+		}
+
+		private float ResolveSolveTolerance(float targetToleranceMeters)
+		{
+			return Mathf.Max(0.001f, targetToleranceMeters > 0f ? targetToleranceMeters : settings.toleranceMeters);
+		}
+
+		private float ComputeResidualToBaseTarget(Arm6DOFFKController armController, float[] jointAnglesDeg, Vector3 targetBasePosition)
+		{
+			if (armController == null || jointAnglesDeg == null || jointAnglesDeg.Length < 6)
+			{
+				return float.PositiveInfinity;
+			}
+
+			return Vector3.Distance(armController.ForwardPoe(jointAnglesDeg).position, targetBasePosition);
 		}
 
 		private static float[] CalculateDampedLeastSquaresStep(float[,] jacobian, Vector3 positionError, float lambda)

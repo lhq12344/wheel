@@ -28,6 +28,7 @@ namespace RobotSimulation
 			public Vector3 baseWorldPosition;
 			public float baseYawDeg;
 			public float radius;
+			public float shellMargin;
 			public float preferredBandPenalty;
 			public float travelDistance;
 			public float clearance;
@@ -37,12 +38,19 @@ namespace RobotSimulation
 		private readonly BaseRrtStarPlanner _basePlanner = new BaseRrtStarPlanner();
 		private readonly SceneDistanceFieldSampler _distanceFieldSampler = new SceneDistanceFieldSampler();
 		private readonly ArmMotionPlanner _armMotionPlanner = new ArmMotionPlanner();
+		private bool _hasCachedArmBaseLocalOffset;
+		private int _cachedBaseRootId;
+		private int _cachedArmBaseTransformId;
+		private Vector3 _cachedArmBaseLocalPosition;
+		private Quaternion _cachedArmBaseLocalRotation = Quaternion.identity;
 
 		public int dockingAngularSamples = 24;
 		public int preferredBandRadiusSamples = 4;
 		public int fallbackBandRadiusSamples = 3;
 		public float dockingDistanceFieldResolution = 0.35f;
 		public float dockingPlanningMargin = 3.5f;
+		public bool allowProvisionalDockingWhenIkSoftFails = true;
+		public int provisionalDockingPathCheckBudget = 6;
 
 		public CoordinatedTaskPlanner()
 		{
@@ -52,7 +60,7 @@ namespace RobotSimulation
 			_basePlanner.settings.rewireRadius = 1.2f;
 			_basePlanner.settings.goalBias = 0.25f;
 			_armMotionPlanner.settings.toleranceMeters = 0.02f;
-			_armMotionPlanner.settings.maxIterations = 120;
+			_armMotionPlanner.settings.maxIterations = 180;
 		}
 
 		public CoordinatedTaskResolution EvaluateCurrentBaseExecution(
@@ -95,7 +103,8 @@ namespace RobotSimulation
 				request.armTargetWorldPosition,
 				out float[] solvedAngles,
 				out _,
-				out string currentBaseFailure))
+				out string currentBaseFailure,
+				request != null ? request.eePositionToleranceMeters : -1f))
 			{
 				resolution.accepted = true;
 				resolution.dockingPoseFound = true;
@@ -161,11 +170,18 @@ namespace RobotSimulation
 			float preferredMin = Mathf.Clamp(maxReach * 0.4f, minReach + 0.01f, maxReach);
 			float preferredMax = Mathf.Clamp(maxReach * 0.8f, preferredMin, maxReach);
 			float[] startAngles = armController.CaptureMeasuredJointAngles();
+			if (!TryGetCachedArmBaseLocalOffset(baseRoot, armController, out Vector3 armBaseLocalPosition, out _))
+			{
+				resolution.failureReason = L("无法解析机械臂安装位相对底盘的局部偏移。", "Could not resolve the arm mounting offset relative to the base.");
+				resolution.dockingSummary = resolution.failureReason;
+				return false;
+			}
+
+			PrepareDockingDistanceField(currentBasePosition, request.armTargetWorldPosition, obstacles, maxReach, baseRadius, armBaseLocalPosition);
 			List<DockingCandidate> candidates = BuildDockingCandidates(
 				request.armTargetWorldPosition,
-				baseRoot,
-				armController,
 				currentBasePosition,
+				armBaseLocalPosition,
 				minReach,
 				maxReach,
 				preferredMin,
@@ -189,12 +205,21 @@ namespace RobotSimulation
 			string lastArmFailure = string.Empty;
 			string lastPathFailure = string.Empty;
 			DockingCandidate bestCandidate = null;
+			DockingCandidate bestProvisionalCandidate = null;
 			float[] bestSolvedAngles = null;
 			float bestCost = float.MaxValue;
+			float bestProvisionalCost = float.MaxValue;
+			string bestProvisionalReason = string.Empty;
+			int provisionalPathChecksUsed = 0;
 
 			for (int i = 0; i < candidates.Count; i++)
 			{
 				DockingCandidate candidate = candidates[i];
+				if (bestCandidate != null && candidate.heuristicCost >= bestCost)
+				{
+					break;
+				}
+
 				Quaternion candidateRotation = Quaternion.Euler(0f, candidate.baseYawDeg, 0f);
 				if (!TryGetTargetInFutureArmBase(
 					baseRoot,
@@ -207,7 +232,7 @@ namespace RobotSimulation
 					continue;
 				}
 
-				if (!armController.IsBasePositionReachable(targetInFutureArmBase, _armMotionPlanner.settings.toleranceMeters))
+				if (!armController.IsBasePositionReachable(targetInFutureArmBase, request != null ? Mathf.Max(0.001f, request.eePositionToleranceMeters) : _armMotionPlanner.settings.toleranceMeters))
 				{
 					continue;
 				}
@@ -219,9 +244,39 @@ namespace RobotSimulation
 					out float[] solvedAngles,
 					out float singularityPenalty,
 					out string ikFailure,
-					startAngles))
+					startAngles,
+					null,
+					request != null ? request.eePositionToleranceMeters : -1f))
 				{
 					lastArmFailure = ikFailure;
+					if (allowProvisionalDockingWhenIkSoftFails
+						&& IsSoftArmPlanningFailure(ikFailure)
+						&& provisionalPathChecksUsed < Mathf.Max(0, provisionalDockingPathCheckBudget))
+					{
+						provisionalPathChecksUsed++;
+						if (HasBasePathToCandidate(
+							currentBasePosition,
+							currentBaseYaw,
+							candidate.baseWorldPosition,
+							candidate.baseYawDeg,
+							baseRadius,
+							physicsQueries,
+							obstacles,
+							out string provisionalPathFailure))
+						{
+							if (candidate.heuristicCost < bestProvisionalCost)
+							{
+								bestProvisionalCost = candidate.heuristicCost;
+								bestProvisionalCandidate = candidate;
+								bestProvisionalReason = ikFailure;
+							}
+						}
+						else if (!string.IsNullOrEmpty(provisionalPathFailure))
+						{
+							lastPathFailure = provisionalPathFailure;
+						}
+					}
+
 					continue;
 				}
 
@@ -267,6 +322,22 @@ namespace RobotSimulation
 
 			if (bestCandidate == null)
 			{
+				if (bestProvisionalCandidate != null)
+				{
+					resolution.accepted = true;
+					resolution.dockingPoseFound = true;
+					resolution.baseMoveRequired = PlanarDistance(currentBasePosition, bestProvisionalCandidate.baseWorldPosition) > BasePositionToleranceMeters;
+					resolution.armReachableFromCurrentBase = false;
+					resolution.hasPreferredArmSolveSeed = false;
+					resolution.preferredArmSolveSeedAnglesDeg = null;
+					resolution.resolvedBaseStopWorldPosition = bestProvisionalCandidate.baseWorldPosition;
+					resolution.resolvedBaseStopYawDeg = bestProvisionalCandidate.baseYawDeg;
+					resolution.dockingSummary = L(
+						$"停靠位搜索阶段未获得直接收敛的机械臂解（{bestProvisionalReason}），将先执行保守停靠位 ({bestProvisionalCandidate.baseWorldPosition.x:F2}, {bestProvisionalCandidate.baseWorldPosition.y:F2}, {bestProvisionalCandidate.baseWorldPosition.z:F2})，再在机械臂规划阶段继续求解。",
+						$"Docking search did not find a directly converged arm IK solution ({bestProvisionalReason}), so execution will first move to a conservative docking pose ({bestProvisionalCandidate.baseWorldPosition.x:F2}, {bestProvisionalCandidate.baseWorldPosition.y:F2}, {bestProvisionalCandidate.baseWorldPosition.z:F2}) and continue solving during the arm-planning stage.");
+					return true;
+				}
+
 				resolution.failureReason = BuildDockingFailureReason(
 					anyWorkspaceShellCandidate,
 					anyIkCandidate,
@@ -351,7 +422,8 @@ namespace RobotSimulation
 					request.armTargetWorldPosition,
 					out float[] solvedAngles,
 					out _,
-					out string explicitBaseFailure))
+					out string explicitBaseFailure,
+					request != null ? request.eePositionToleranceMeters : -1f))
 				{
 					resolution.failureReason = string.IsNullOrEmpty(explicitBaseFailure)
 						? L("显式底盘目标无法支持所请求的末端世界目标。", "The explicit base target cannot support the requested end-effector world target.")
@@ -414,9 +486,8 @@ namespace RobotSimulation
 
 		private List<DockingCandidate> BuildDockingCandidates(
 			Vector3 armTargetWorldPosition,
-			Transform baseRoot,
-			Arm6DOFFKController armController,
 			Vector3 currentBasePosition,
+			Vector3 armBaseLocalPosition,
 			float minReach,
 			float maxReach,
 			float preferredMin,
@@ -427,11 +498,6 @@ namespace RobotSimulation
 		{
 			List<DockingCandidate> candidates = new List<DockingCandidate>();
 			List<float> radii = BuildDockingRadii(minReach, maxReach, preferredMin, preferredMax);
-
-			if (!TryGetArmBaseLocalOffset(baseRoot, armController, out Vector3 armBaseLocalPosition, out _))
-			{
-				return candidates;
-			}
 
 			int angularSamples = Mathf.Max(8, dockingAngularSamples);
 			for (int radiusIndex = 0; radiusIndex < radii.Count; radiusIndex++)
@@ -455,10 +521,13 @@ namespace RobotSimulation
 					}
 
 					float travelDistance = PlanarDistance(currentBasePosition, candidateBasePosition);
-					float clearance = physicsQueries.ComputeClearance(candidateBasePosition, obstacles, baseRadius);
+					float shellMargin = Mathf.Max(0f, Mathf.Min(radius - minReach, maxReach - radius));
+					float shellMarginPenalty = Mathf.Max(0f, 0.12f - shellMargin) * 8f;
+					float clearance = Mathf.Max(0f, _distanceFieldSampler.SampleDistance(candidateBasePosition) - baseRadius);
 					float preferredBandPenalty = ComputePreferredBandPenalty(radius, preferredMin, preferredMax);
 					float heuristicCost =
 						(preferredBandPenalty * 10f) +
+						shellMarginPenalty +
 						travelDistance -
 						Mathf.Min(clearance, 3f) * 0.25f;
 
@@ -467,6 +536,7 @@ namespace RobotSimulation
 						baseWorldPosition = candidateBasePosition,
 						baseYawDeg = candidateYaw,
 						radius = radius,
+						shellMargin = shellMargin,
 						preferredBandPenalty = preferredBandPenalty,
 						travelDistance = travelDistance,
 						clearance = clearance,
@@ -544,7 +614,8 @@ namespace RobotSimulation
 			Vector3 armTargetWorldPosition,
 			out float[] solvedAnglesDeg,
 			out float singularityPenalty,
-			out string failureReason)
+			out string failureReason,
+			float targetToleranceMeters = -1f)
 		{
 			solvedAnglesDeg = null;
 			singularityPenalty = float.PositiveInfinity;
@@ -562,7 +633,8 @@ namespace RobotSimulation
 				return false;
 			}
 
-			if (!armController.IsBasePositionReachable(targetInFutureArmBase, _armMotionPlanner.settings.toleranceMeters))
+			float solveToleranceMeters = targetToleranceMeters > 0f ? Mathf.Max(0.001f, targetToleranceMeters) : _armMotionPlanner.settings.toleranceMeters;
+			if (!armController.IsBasePositionReachable(targetInFutureArmBase, solveToleranceMeters))
 			{
 				failureReason = L("该底盘位姿下，目标点落在 Zu5 工作空间球壳之外。", "Target point is outside the Zu5 workspace shell for this base pose.");
 				return false;
@@ -575,7 +647,9 @@ namespace RobotSimulation
 				out float[] solvedAngles,
 				out singularityPenalty,
 				out string ikFailure,
-				startAngles))
+				startAngles,
+				null,
+				solveToleranceMeters))
 			{
 				failureReason = ikFailure;
 				return false;
@@ -635,6 +709,13 @@ namespace RobotSimulation
 				Mathf.CeilToInt(maxDelta / Mathf.Max(0.5f, collisionMonitor.previewStepDegrees)),
 				1,
 				Mathf.Max(1, collisionMonitor.maxPreviewSamples));
+			bool hasFutureArmBasePose = TryGetFutureArmBasePose(
+				baseRoot,
+				baseWorldPosition,
+				baseWorldRotation,
+				armController,
+				out Vector3 futureArmBasePosition,
+				out Quaternion futureArmBaseRotation);
 			float[] sampleAngles = new float[6];
 			for (int sampleIndex = 1; sampleIndex <= sampleCount; sampleIndex++)
 			{
@@ -644,7 +725,7 @@ namespace RobotSimulation
 					sampleAngles[jointIndex] = Mathf.Lerp(safeStart[jointIndex], safeTarget[jointIndex], t);
 				}
 
-				Pose[] futureLinkWorldPoses = ComputeFutureLinkWorldPoses(baseRoot, baseWorldPosition, baseWorldRotation, armController, sampleAngles);
+				Pose[] futureLinkWorldPoses = ComputeFutureLinkWorldPoses(armController, sampleAngles, hasFutureArmBasePose, futureArmBasePosition, futureArmBaseRotation);
 				if (collisionMonitor.EvaluatePredictedCollision(futureLinkWorldPoses, out result))
 				{
 					result.sampleIndex = sampleIndex;
@@ -656,14 +737,14 @@ namespace RobotSimulation
 		}
 
 		private Pose[] ComputeFutureLinkWorldPoses(
-			Transform baseRoot,
-			Vector3 baseWorldPosition,
-			Quaternion baseWorldRotation,
 			Arm6DOFFKController armController,
-			float[] jointAnglesDeg)
+			float[] jointAnglesDeg,
+			bool hasFutureArmBasePose,
+			Vector3 futureArmBasePosition,
+			Quaternion futureArmBaseRotation)
 		{
 			Pose[] baseLinkPoses = armController.ComputeLinkPosesBase(jointAnglesDeg);
-			if (!TryGetFutureArmBasePose(baseRoot, baseWorldPosition, baseWorldRotation, armController, out Vector3 futureArmBasePosition, out Quaternion futureArmBaseRotation))
+			if (!hasFutureArmBasePose)
 			{
 				return baseLinkPoses;
 			}
@@ -698,12 +779,6 @@ namespace RobotSimulation
 				return true;
 			}
 
-			_distanceFieldSampler.Build(
-				startWorldPosition,
-				goalWorldPosition,
-				obstacles,
-				Mathf.Max(0.1f, dockingDistanceFieldResolution),
-				Mathf.Max(2f, dockingPlanningMargin));
 			if (_basePlanner.TryPlan(
 				startWorldPosition,
 				startYawDeg,
@@ -727,6 +802,62 @@ namespace RobotSimulation
 			return false;
 		}
 
+		private void PrepareDockingDistanceField(
+			Vector3 startWorldPosition,
+			Vector3 armTargetWorldPosition,
+			IReadOnlyList<Collider> obstacles,
+			float maxReach,
+			float baseRadius,
+			Vector3 armBaseLocalPosition)
+		{
+			float searchMargin = Mathf.Max(
+				2f,
+				dockingPlanningMargin + maxReach + armBaseLocalPosition.magnitude + Mathf.Max(0.25f, baseRadius));
+			_distanceFieldSampler.Build(
+				startWorldPosition,
+				armTargetWorldPosition,
+				obstacles,
+				Mathf.Max(0.1f, dockingDistanceFieldResolution),
+				searchMargin);
+		}
+
+		private bool TryGetCachedArmBaseLocalOffset(
+			Transform baseRoot,
+			Arm6DOFFKController armController,
+			out Vector3 armBaseLocalPosition,
+			out Quaternion armBaseLocalRotation)
+		{
+			armBaseLocalPosition = Vector3.zero;
+			armBaseLocalRotation = Quaternion.identity;
+			if (baseRoot == null || armController == null || armController.BaseFrameTransform == null)
+			{
+				return false;
+			}
+
+			int baseRootId = baseRoot.GetInstanceID();
+			int armBaseId = armController.BaseFrameTransform.GetInstanceID();
+			if (_hasCachedArmBaseLocalOffset
+				&& _cachedBaseRootId == baseRootId
+				&& _cachedArmBaseTransformId == armBaseId)
+			{
+				armBaseLocalPosition = _cachedArmBaseLocalPosition;
+				armBaseLocalRotation = _cachedArmBaseLocalRotation;
+				return true;
+			}
+
+			if (!TryGetArmBaseLocalOffset(baseRoot, armController, out armBaseLocalPosition, out armBaseLocalRotation))
+			{
+				return false;
+			}
+
+			_hasCachedArmBaseLocalOffset = true;
+			_cachedBaseRootId = baseRootId;
+			_cachedArmBaseTransformId = armBaseId;
+			_cachedArmBaseLocalPosition = armBaseLocalPosition;
+			_cachedArmBaseLocalRotation = armBaseLocalRotation;
+			return true;
+		}
+
 		private static bool TryGetArmBaseLocalOffset(
 			Transform baseRoot,
 			Arm6DOFFKController armController,
@@ -746,7 +877,7 @@ namespace RobotSimulation
 			return true;
 		}
 
-		private static bool TryGetFutureArmBasePose(
+		private bool TryGetFutureArmBasePose(
 			Transform baseRoot,
 			Vector3 baseWorldPosition,
 			Quaternion baseWorldRotation,
@@ -756,7 +887,7 @@ namespace RobotSimulation
 		{
 			futureArmBasePosition = baseWorldPosition;
 			futureArmBaseRotation = baseWorldRotation;
-			if (!TryGetArmBaseLocalOffset(baseRoot, armController, out Vector3 armBaseLocalPosition, out Quaternion armBaseLocalRotation))
+			if (!TryGetCachedArmBaseLocalOffset(baseRoot, armController, out Vector3 armBaseLocalPosition, out Quaternion armBaseLocalRotation))
 			{
 				return false;
 			}
@@ -766,7 +897,7 @@ namespace RobotSimulation
 			return true;
 		}
 
-		private static bool TryGetTargetInFutureArmBase(
+		private bool TryGetTargetInFutureArmBase(
 			Transform baseRoot,
 			Vector3 baseWorldPosition,
 			Quaternion baseWorldRotation,
@@ -852,6 +983,17 @@ namespace RobotSimulation
 		private static float PlanarDistance(Vector3 a, Vector3 b)
 		{
 			return Vector3.Distance(new Vector3(a.x, 0f, a.z), new Vector3(b.x, 0f, b.z));
+		}
+
+		private static bool IsSoftArmPlanningFailure(string reason)
+		{
+			if (string.IsNullOrWhiteSpace(reason))
+			{
+				return false;
+			}
+
+			return reason.IndexOf("机械臂规划未收敛", System.StringComparison.OrdinalIgnoreCase) >= 0
+				|| reason.IndexOf("Arm planner did not converge", System.StringComparison.OrdinalIgnoreCase) >= 0;
 		}
 
 		private static bool HasExplicitBaseGoal(RobotPlanRequest request, DiffDriveTwinController diffDriveController)
