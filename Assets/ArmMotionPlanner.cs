@@ -123,12 +123,6 @@ namespace RobotSimulation
 				return false;
 			}
 
-			if (!armController.IsBasePositionReachable(targetBasePosition, solveToleranceMeters))
-			{
-				failureReason = L("机械臂目标超出了保守可达包络。", "Arm target is outside the conservative reach envelope.");
-				return false;
-			}
-
 			List<float[]> solveSeeds = BuildSolveSeeds(armController, startAnglesDeg);
 			float[] evaluationStartAngles = trajectoryStartAnglesDeg != null && trajectoryStartAnglesDeg.Length >= 6
 				? ClampAnglesToJointLimits(armController, trajectoryStartAnglesDeg)
@@ -381,11 +375,6 @@ namespace RobotSimulation
 				for (int directionIndex = 0; directionIndex < probeDirections.Length; directionIndex++)
 				{
 					Vector3 nearbyTarget = originalTargetBasePosition + (probeDirections[directionIndex] * offsetDistance);
-					if (!armController.IsBasePositionReachable(nearbyTarget, solveToleranceMeters))
-					{
-						continue;
-					}
-
 					for (int seedIndex = 0; seedIndex < probeSeeds.Count; seedIndex++)
 					{
 						float[] probeSeed = probeSeeds[seedIndex];

@@ -12,6 +12,9 @@ namespace RobotSimulation
 		private struct BaseRadiusCacheEntry
 		{
 			public int colliderCount;
+			public bool usedDriveGeometry;
+			public float trackWidth;
+			public float wheelRadius;
 			public float radius;
 		}
 
@@ -43,15 +46,23 @@ namespace RobotSimulation
 		{
 			if (controller == null)
 			{
-				return 0.45f;
+				return 0.32f;
 			}
 
-			float maxRadius = 0.45f;
+			controller.EnsureDriveGeometryReady();
+			float maxRadius = 0.30f;
 			Transform root = controller.rb != null ? controller.rb.transform : controller.transform;
 			Collider[] colliders = root.GetComponentsInChildren<Collider>(true);
 			int cacheKey = root != null ? root.GetInstanceID() : controller.GetInstanceID();
+			bool usingDriveGeometry = controller.HasValidDriveGeometry;
+			float trackWidth = usingDriveGeometry ? controller.TrackWidth : 0f;
+			float wheelRadius = usingDriveGeometry ? controller.WheelRadius : 0f;
 			if (_baseRadiusCache.TryGetValue(cacheKey, out BaseRadiusCacheEntry cachedEntry)
-				&& cachedEntry.colliderCount == colliders.Length)
+				&& cachedEntry.colliderCount == colliders.Length
+				&& cachedEntry.usedDriveGeometry == usingDriveGeometry
+				&& (!usingDriveGeometry
+					|| (Mathf.Abs(cachedEntry.trackWidth - trackWidth) <= 1e-4f
+						&& Mathf.Abs(cachedEntry.wheelRadius - wheelRadius) <= 1e-4f)))
 			{
 				return cachedEntry.radius;
 			}
@@ -60,7 +71,7 @@ namespace RobotSimulation
 			for (int i = 0; i < colliders.Length; i++)
 			{
 				Collider collider = colliders[i];
-				if (collider == null || !collider.enabled || collider.isTrigger)
+				if (!IsRelevantBaseCollider(collider, center.y))
 				{
 					continue;
 				}
@@ -83,13 +94,64 @@ namespace RobotSimulation
 				}
 			}
 
-			float resolvedRadius = Mathf.Max(0.25f, maxRadius);
+			float resolvedRadius = Mathf.Max(0.22f, maxRadius);
+			if (usingDriveGeometry)
+			{
+				float geometryRadius = Mathf.Max(0.2f, (trackWidth * 0.5f) + wheelRadius + 0.05f);
+				float cappedRadius = Mathf.Min(resolvedRadius, geometryRadius + 0.08f);
+				if (cappedRadius < resolvedRadius - 1e-4f)
+				{
+					Debug.Log($"[PlannerPhysicsQueries] Base radius capped by drive geometry. colliderRadius={resolvedRadius:F3}, geometryRadius={geometryRadius:F3}, cappedRadius={cappedRadius:F3}");
+					resolvedRadius = cappedRadius;
+				}
+			}
+
 			_baseRadiusCache[cacheKey] = new BaseRadiusCacheEntry
 			{
 				colliderCount = colliders.Length,
+				usedDriveGeometry = usingDriveGeometry,
+				trackWidth = trackWidth,
+				wheelRadius = wheelRadius,
 				radius = resolvedRadius
 			};
 			return resolvedRadius;
+		}
+
+		private static bool IsRelevantBaseCollider(Collider collider, float baseCenterY)
+		{
+			if (collider == null || !collider.enabled || collider.isTrigger)
+			{
+				return false;
+			}
+
+			if (IsInternalRobotOrPreviewCollider(collider) || IsSupportSurface(collider))
+			{
+				return false;
+			}
+
+			Transform transform = collider.transform;
+			if (HierarchyContainsToken(transform, "ArmCollisionPreview")
+				|| HierarchyContainsToken(transform, "arm")
+				|| HierarchyContainsToken(transform, "joint")
+				|| HierarchyContainsToken(transform, "wrist"))
+			{
+				return false;
+			}
+
+			ArticulationBody ownerBody = collider.GetComponentInParent<ArticulationBody>();
+			if (ownerBody != null)
+			{
+				return false;
+			}
+
+			Bounds bounds = collider.bounds;
+			float colliderCenterOffsetY = Mathf.Abs(bounds.center.y - baseCenterY);
+			if (colliderCenterOffsetY > 0.75f && bounds.extents.y < 0.5f)
+			{
+				return false;
+			}
+
+			return true;
 		}
 
 		public bool IsBasePoseCollisionFree(Vector3 position, float radius, IReadOnlyList<Collider> obstacles, out Collider hitCollider)

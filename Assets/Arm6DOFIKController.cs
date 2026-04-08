@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace RobotSimulation
@@ -44,6 +45,7 @@ namespace RobotSimulation
 		private ArmCollisionMonitor _collisionMonitor;
 		private ArmCollisionGuardResult _lastCollisionGuardResult = new ArmCollisionGuardResult();
 		private bool _solveBlockedByCollisionGuard;
+		private readonly ArmMotionPlanner _motionPlanner = new ArmMotionPlanner();
 
 		public bool IsSolving => _isSolving;
 		public bool IsMoveInProgress => _isMoveInProgress;
@@ -80,7 +82,15 @@ namespace RobotSimulation
 		public bool MoveToPosition(Vector3 targetWorldPosition, Quaternion targetRotation, bool withRotation = false)
 		{
 			StopActiveCoroutines();
-			return TryBeginSolve(targetWorldPosition, out _);
+			ArmMoveRequest request = new ArmMoveRequest
+			{
+				worldPosition = targetWorldPosition,
+				positionToleranceMeters = tolerance,
+				stableFixedFrames = 1,
+				timeoutSeconds = Mathf.Max(1f, maxIterations * Time.fixedDeltaTime * 2f),
+				speedScale = 1f
+			};
+			return MoveToWorldPositionAndWait(request, null) != null;
 		}
 
 		public Coroutine MoveToWorldPositionAndWait(ArmMoveRequest request, Action<ArmMoveResult> onComplete = null)
@@ -223,6 +233,84 @@ namespace RobotSimulation
 			return true;
 		}
 
+		private bool TryBeginPlannedMove(
+			Vector3 targetWorldPosition,
+			out ArmMoveResult immediateResult,
+			out List<RobotPlanJointSample> plannedSamples)
+		{
+			immediateResult = new ArmMoveResult
+			{
+				targetWorldPosition = targetWorldPosition
+			};
+			plannedSamples = null;
+
+			RefreshReferences();
+			RefreshCollisionMonitor();
+			if (armController == null || !armController.IsInitialized || !armController.KinematicsReady)
+			{
+				immediateResult.summary = "Arm controller is not initialized.";
+				_lastMoveResult = immediateResult;
+				_lastSolveSuccess = false;
+				_lastSolveError = float.MaxValue;
+				return false;
+			}
+
+			_targetWorldPosition = targetWorldPosition;
+			_targetBasePosition = armController.WorldToBasePosition(targetWorldPosition);
+			_jointLimits = armController.jointLimits;
+			_lastSolveIterations = 0;
+			_lastSolveSuccess = false;
+			_solveBlockedByCollisionGuard = false;
+			_lastCollisionGuardResult = new ArmCollisionGuardResult { allowed = true };
+			ConfigureMotionPlannerFromIkSettings();
+
+			if (!_motionPlanner.TryPlanToWorldPosition(
+				armController,
+				targetWorldPosition,
+				null,
+				out plannedSamples,
+				out string failureReason,
+				null,
+				tolerance))
+			{
+				Vector3 currentWorld = GetCurrentWorldEndEffectorPosition();
+				immediateResult.accepted = false;
+				immediateResult.success = false;
+				immediateResult.unreachable = failureReason != null
+					&& (failureReason.IndexOf("outside", StringComparison.OrdinalIgnoreCase) >= 0
+						|| failureReason.IndexOf("dead zone", StringComparison.OrdinalIgnoreCase) >= 0
+						|| failureReason.IndexOf("工作空间", StringComparison.OrdinalIgnoreCase) >= 0);
+				immediateResult.blockedByCollisionGuard = failureReason != null
+					&& (failureReason.IndexOf("collision guard", StringComparison.OrdinalIgnoreCase) >= 0
+						|| failureReason.IndexOf("碰撞守卫", StringComparison.OrdinalIgnoreCase) >= 0
+						|| failureReason.IndexOf("forbidden", StringComparison.OrdinalIgnoreCase) >= 0);
+				immediateResult.finalWorldPosition = currentWorld;
+				immediateResult.finalPositionError = Vector3.Distance(currentWorld, targetWorldPosition);
+				immediateResult.summary = string.IsNullOrEmpty(failureReason)
+					? "Arm planner failed to produce a valid trajectory."
+					: failureReason;
+				_lastMoveResult = immediateResult;
+				_lastSolveError = immediateResult.finalPositionError;
+				return false;
+			}
+
+			_lastSolveIterations = plannedSamples != null ? plannedSamples.Count : 0;
+			_lastSolveError = Vector3.Distance(armController.EndEffectorWorldPosition, targetWorldPosition);
+			_isSolving = false;
+			immediateResult.accepted = true;
+			immediateResult.summary = "Arm motion plan generated.";
+			return true;
+		}
+
+		private void ConfigureMotionPlannerFromIkSettings()
+		{
+			_motionPlanner.settings.maxIterations = Mathf.Max(16, maxIterations);
+			_motionPlanner.settings.toleranceMeters = Mathf.Max(0.001f, tolerance);
+			_motionPlanner.settings.dlsLambda = Mathf.Max(1e-4f, dlsLambda);
+			_motionPlanner.settings.maxDeltaDegPerIteration = Mathf.Max(0.5f, maxDeltaDegPerIteration);
+			_motionPlanner.settings.sampleTimeStepSeconds = Mathf.Max(0.02f, 0.08f / Mathf.Max(0.1f, _activeMoveSpeedScale));
+		}
+
 		private void StartSolveRoutine()
 		{
 			if (_solveRoutine != null)
@@ -336,11 +424,14 @@ namespace RobotSimulation
 
 			_isMoveInProgress = true;
 			StopSolveRoutine();
-			if (!TryBeginSolve(safeRequest.worldPosition, out ArmMoveResult startResult))
+			if (!TryBeginPlannedMove(safeRequest.worldPosition, out ArmMoveResult startResult, out List<RobotPlanJointSample> plannedSamples))
 			{
 				_isMoveInProgress = false;
 				startResult.timedOut = false;
 				startResult.success = false;
+				_moveWaitRoutine = null;
+				_activeMoveSpeedScale = 1f;
+				_lastMoveResult = startResult;
 				onComplete?.Invoke(startResult);
 				yield break;
 			}
@@ -348,6 +439,9 @@ namespace RobotSimulation
 			int stableFrames = 0;
 			float elapsed = 0f;
 			bool arrivalLockActive = false;
+			float trajectoryElapsed = 0f;
+			int sampleIndex = 0;
+			float[] lastCommandedAngles = armController != null ? armController.CaptureMeasuredJointAngles() : null;
 			ArmMoveResult result = new ArmMoveResult
 			{
 				accepted = true,
@@ -358,12 +452,39 @@ namespace RobotSimulation
 			{
 				yield return new WaitForFixedUpdate();
 				elapsed += Time.fixedDeltaTime;
+				trajectoryElapsed += Time.fixedDeltaTime * Mathf.Max(0.1f, safeRequest.speedScale);
+
+				if (armController != null && plannedSamples != null)
+				{
+					while (sampleIndex < plannedSamples.Count && trajectoryElapsed + 1e-4f >= plannedSamples[sampleIndex].timeSeconds)
+					{
+						float[] nextAngles = plannedSamples[sampleIndex].jointAnglesDeg;
+						if (armController.EvaluateMotionCollision(lastCommandedAngles, nextAngles, out ArmCollisionGuardResult guardResult))
+						{
+							_lastCollisionGuardResult = guardResult;
+							_solveBlockedByCollisionGuard = true;
+							result.success = false;
+							result.blockedByCollisionGuard = true;
+							result.collisionGuardResult = guardResult;
+							result.finalWorldPosition = GetCurrentWorldEndEffectorPosition();
+							result.finalPositionError = Vector3.Distance(result.finalWorldPosition, safeRequest.worldPosition);
+							result.iterations = sampleIndex + 1;
+							result.summary = string.IsNullOrEmpty(guardResult?.message)
+								? "Arm motion blocked by forbidden collision guard."
+								: guardResult.message;
+							armController.HoldCurrentPose();
+							break;
+						}
+
+						armController.ApplyAllJointTargetsRaw(nextAngles);
+						lastCommandedAngles = (float[])nextAngles.Clone();
+						_lastSolveIterations = sampleIndex + 1;
+						sampleIndex++;
+					}
+				}
 
 				Vector3 currentWorldPosition = GetCurrentWorldEndEffectorPosition();
 				float error = Vector3.Distance(currentWorldPosition, safeRequest.worldPosition);
-				float restartThreshold = arrivalLockActive
-					? safeRequest.positionToleranceMeters * 2f
-					: safeRequest.positionToleranceMeters;
 				if (_collisionMonitor != null && _collisionMonitor.EvaluateCollisionState())
 				{
 					result.collided = true;
@@ -392,12 +513,6 @@ namespace RobotSimulation
 					break;
 				}
 
-				if (!_isSolving && !_solveBlockedByCollisionGuard && error > restartThreshold)
-				{
-					arrivalLockActive = false;
-					StartSolveRoutine();
-				}
-
 				if (error <= safeRequest.positionToleranceMeters)
 				{
 					if (!arrivalLockActive && armController != null)
@@ -412,8 +527,10 @@ namespace RobotSimulation
 						result.success = true;
 						result.finalWorldPosition = currentWorldPosition;
 						result.finalPositionError = error;
-						result.iterations = _lastSolveIterations;
+						result.iterations = Mathf.Max(_lastSolveIterations, plannedSamples != null ? plannedSamples.Count : 0);
 						result.summary = $"Reached target in {elapsed:F2}s.";
+						_lastSolveSuccess = true;
+						_lastSolveError = error;
 						if (armController != null)
 						{
 							armController.HoldCurrentPose();
@@ -429,17 +546,20 @@ namespace RobotSimulation
 
 			if (!result.success)
 			{
+				_lastSolveSuccess = false;
 				if (!result.collided)
 				{
 					if (!result.blockedByCollisionGuard)
 					{
 						result.finalWorldPosition = GetCurrentWorldEndEffectorPosition();
 						result.finalPositionError = Vector3.Distance(result.finalWorldPosition, safeRequest.worldPosition);
-						result.iterations = _lastSolveIterations;
+						result.iterations = Mathf.Max(_lastSolveIterations, plannedSamples != null ? plannedSamples.Count : 0);
 						result.timedOut = true;
 						result.summary = "Timed out while waiting for the end effector to settle at the target position.";
 					}
 				}
+
+				_lastSolveError = result.finalPositionError;
 			}
 
 			StopSolveRoutine();

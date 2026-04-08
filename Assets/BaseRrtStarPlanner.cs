@@ -348,6 +348,7 @@ namespace RobotSimulation
 		private const float PositionTolerance = 0.02f;
 		private const float HandoffTolerance = 0.025f;
 		private const float NearGoalStallGraceTolerance = 0.035f;
+		private const float NearGoalTimeoutAcceptanceTolerance = 0.04f;
 		private const float RelaxedSpeedTolerance = 0.06f;
 		private const float RelaxedYawRateTolerance = 0.10f;
 		private const float HandoffSpeedTolerance = 0.10f;
@@ -434,12 +435,12 @@ namespace RobotSimulation
 					yield break;
 				}
 
-				if (planarGoalError <= NearGoalStallGraceTolerance
-					&& remaining <= DockingDistance
-					&& controller.CurrentPlanarSpeedMeasured <= RelaxedSpeedTolerance
-					&& controller.CurrentYawRateMeasured <= RelaxedYawRateTolerance)
-				{
-					controller.CompletePointGoal(finalGoal);
+			if (planarGoalError <= NearGoalTimeoutAcceptanceTolerance
+				&& remaining <= DockingDistance
+				&& controller.CurrentPlanarSpeedMeasured <= RelaxedSpeedTolerance
+				&& controller.CurrentYawRateMeasured <= RelaxedYawRateTolerance)
+			{
+				controller.CompletePointGoal(finalGoal);
 					onComplete?.Invoke(true, "Base path tracking accepted near-goal settling and stopped.");
 					yield break;
 				}
@@ -479,7 +480,9 @@ namespace RobotSimulation
 
 			controller.ClearVelocityCommand(true);
 			float finalError = Vector3.Distance(ProjectXZ(controller.rb.position), ProjectXZ(finalGoal));
-			if (finalError <= NearGoalStallGraceTolerance)
+			if (finalError <= NearGoalTimeoutAcceptanceTolerance
+				&& controller.CurrentPlanarSpeedMeasured <= RelaxedSpeedTolerance
+				&& controller.CurrentYawRateMeasured <= RelaxedYawRateTolerance)
 			{
 				controller.CompletePointGoal(finalGoal);
 				onComplete?.Invoke(true, $"Base path tracking accepted near-goal completion on timeout. Remaining planar distance={finalError:F3}m.");

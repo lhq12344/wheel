@@ -44,6 +44,7 @@ namespace RobotSimulation
 		[SerializeField] private int _armColliderCount;
 		[SerializeField] private int _forbiddenColliderCount;
 		[SerializeField] private string _lastRefreshSummary = string.Empty;
+		[SerializeField] private string _lastLoggedRefreshSummary = string.Empty;
 
 		private readonly List<Collider> _armColliders = new List<Collider>();
 		private readonly List<Collider> _forbiddenColliders = new List<Collider>();
@@ -78,8 +79,15 @@ namespace RobotSimulation
 
 		public void Configure(Transform newArmRoot, Transform newForbiddenRoot)
 		{
+			bool rootsChanged = armRoot != newArmRoot || forbiddenRoot != newForbiddenRoot;
 			armRoot = newArmRoot;
 			forbiddenRoot = newForbiddenRoot;
+			if (!rootsChanged && _armColliderCount > 0 && _forbiddenColliderCount > 0)
+			{
+				EvaluateCollisionState();
+				return;
+			}
+
 			RefreshColliders();
 			EvaluateCollisionState();
 		}
@@ -104,7 +112,11 @@ namespace RobotSimulation
 			_armColliderCount = CountUsableArmColliders();
 			_forbiddenColliderCount = CountUsableForbiddenColliders();
 			_lastRefreshSummary = $"armRoot={(armRoot != null ? armRoot.name : "null")}, forbiddenRoot={(forbiddenRoot != null ? forbiddenRoot.name : "null")}, armColliders={_armColliderCount}, forbiddenColliders={_forbiddenColliderCount}";
-			Debug.Log($"[ArmCollision] Monitor configured: {_lastRefreshSummary}");
+			if (_lastLoggedRefreshSummary != _lastRefreshSummary)
+			{
+				_lastLoggedRefreshSummary = _lastRefreshSummary;
+				Debug.Log($"[ArmCollision] Monitor configured: {_lastRefreshSummary}");
+			}
 			if (_armColliderCount == 0 || _forbiddenColliderCount == 0)
 			{
 				Debug.LogWarning("[ArmCollision] Collision monitor collected zero usable arm colliders or forbidden colliders. Collision guard will not be effective until this is fixed.");

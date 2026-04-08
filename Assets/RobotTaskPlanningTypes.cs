@@ -64,6 +64,12 @@ namespace RobotSimulation
 		public bool dockingPoseFound;
 		public bool baseMoveRequired;
 		public bool armReachableFromCurrentBase;
+		public bool armReachabilityIsLoosePrecheck;
+		public int coarseCandidateCount;
+		public int fineCandidateCount;
+		public int ikSolveCount;
+		public int basePathCheckCount;
+		public string dockingFailureCategory = string.Empty;
 		public RobotPlanningStage failedAtStage = RobotPlanningStage.None;
 		public string failureReason = string.Empty;
 		public List<Vector3> baseWaypoints = new List<Vector3>();
