@@ -60,17 +60,31 @@
     <Analyzer Include="D:\Software\unity\2022.3.52f1c1\Editor\Data\Tools\Unity.SourceGenerators\Unity.Properties.SourceGenerator.dll" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Assets\RobotTaskPlanningTypes.cs" />
+    <Compile Include="Assets\CoordinatedTaskPlanner.cs" />
     <Compile Include="Assets\Arm6DOFIKController.cs" />
     <Compile Include="Assets\RobotSimulationEditorWindow.cs" />
+    <Compile Include="Assets\Arm6DOFKinematicsModel.cs" />
     <Compile Include="Assets\Arm6DOFFKController.cs" />
+    <Compile Include="Assets\ArmCollisionMonitor.cs" />
+    <Compile Include="Assets\SceneDistanceFieldSampler.cs" />
     <Compile Include="Assets\ConfigManager.cs" />
+    <Compile Include="Assets\ShadowSimulationGate.cs" />
     <Compile Include="Assets\InteractiveControlPanel.cs" />
+    <Compile Include="Assets\RobotTrajectoryPlanner.cs" />
+    <Compile Include="Assets\RobotSimulationLocalization.cs" />
     <Compile Include="Assets\ArmTestController.cs" />
     <Compile Include="Assets\control.cs" />
     <Compile Include="Assets\RobotSimulationManager.cs" />
+    <Compile Include="Assets\SquareObstacleTestSceneBuilder.cs" />
+    <Compile Include="Assets\RobotModelResidualTracker.cs" />
     <Compile Include="Assets\StatusDisplayPanel.cs" />
     <Compile Include="Assets\Link.cs" />
+    <Compile Include="Assets\BaseRrtStarPlanner.cs" />
     <Compile Include="Assets\DiffDriveTwinController.cs" />
+    <Compile Include="Assets\ArmMoveTypes.cs" />
+    <Compile Include="Assets\PlannerPhysicsQueries.cs" />
+    <Compile Include="Assets\ArmMotionPlanner.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Assets\Zu5_LDASM\package.xml" />
@@ -415,6 +429,10 @@
     </Reference>
     <Reference Include="Unity.VisualScripting.Antlr3.Runtime">
       <HintPath>Library\PackageCache\com.unity.visualscripting@1.9.4\Runtime\VisualScripting.Flow\Dependencies\NCalc\Unity.VisualScripting.Antlr3.Runtime.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>Library\PackageCache\com.unity.nuget.newtonsoft-json@3.2.1\Runtime\Newtonsoft.Json.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="AssimpNet">
@@ -1027,6 +1045,10 @@
     </Reference>
     <Reference Include="Unity.TextMeshPro.Editor">
       <HintPath>Library\ScriptAssemblies\Unity.TextMeshPro.Editor.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnitySkills.Editor">
+      <HintPath>Library\ScriptAssemblies\UnitySkills.Editor.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="Unity.VisualScripting.State">

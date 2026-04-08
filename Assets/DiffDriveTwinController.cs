@@ -4,6 +4,15 @@ using UnityEngine;
 
 public class DiffDriveTwinController : MonoBehaviour
 {
+	enum PointGoalPhase
+	{
+		Idle,
+		RotateInPlace,
+		Cruise,
+		Brake,
+		Arrived
+	}
+
 	public enum ControlMode
 	{
 		TargetPoint,   // 点到点
@@ -37,6 +46,7 @@ public class DiffDriveTwinController : MonoBehaviour
 
 	public float TrackWidth => trackWidth_b;
 	public float WheelRadius => wheelRadius_r;
+	public bool HasValidDriveGeometry => trackWidth_b > 1e-4f && wheelRadius_r > 1e-4f;
 
 	[Header("Control Mode")]
 	public ControlMode mode = ControlMode.TargetPoint;
@@ -74,7 +84,13 @@ public class DiffDriveTwinController : MonoBehaviour
 	public float rotateInPlaceAngleDeg = 25f;
 
 	[Tooltip("接近目标点时的停止距离阈值（米）")]
-	public float posTolerance = 0.05f;
+	public float posTolerance = 0.03f;
+
+	[Tooltip("进入该距离后直接判定到位，并把底盘吸附到目标点，避免最后几厘米缓慢蹭行")]
+	public float arrivalSnapDistance = 0.03f;
+
+	[Tooltip("Brake phase starts when remaining distance falls below the current stopping distance plus this padding.")]
+	public float brakingDistancePadding = 0.04f;
 
 	[Tooltip("到点后小角速度直接清零阈值（rad/s）")]
 	public float yawRateStopTolerance = 0.05f;
@@ -94,6 +110,37 @@ public class DiffDriveTwinController : MonoBehaviour
 	[Tooltip("到达目标点后是否允许继续原地转向；关闭时会强制轮速为0")]
 	public bool rotateAtGoal = false;
 
+	[Tooltip("点到点到位后保持当前行进方向，不再额外转向对齐")]
+	public bool preserveArrivalHeading = true;
+
+	[Tooltip("点到点到位后把底盘 XZ 位置直接收敛到目标点，消除残余距离误差")]
+	public bool snapPositionToGoalOnArrival = true;
+
+	[Tooltip("Rotate-in-place exits when yaw error falls below this angle, avoiding chatter near the threshold.")]
+	public float rotateExitAngleDeg = 10f;
+
+	[Tooltip("Cruise phase keeps at least this heading scale, so the chassis advances decisively instead of crawling.")]
+	public float cruiseHeadingFloor = 0.55f;
+
+	[Tooltip("Brake phase keeps at least this heading scale while still correcting yaw.")]
+	public float brakeHeadingFloor = 0.40f;
+
+	[Tooltip("Brake phase keeps at least this speed until the chassis is very close to the goal.")]
+	public float brakeMinSpeed = 0.12f;
+
+	[Header("Final Yaw Alignment")]
+	[Tooltip("到点后的最终对齐阶段使用更强的偏航增益，减少慢吞吞地挪角度")]
+	public float finalYawGain = 7.5f;
+
+	[Tooltip("到点后的最终对齐阶段允许的最小角速度（rad/s），避免快到位时轮子慢速空转")]
+	public float finalYawMinRate = 0.35f;
+
+	[Tooltip("到点后的最终对齐阶段角加速度放大倍数")]
+	public float finalYawAccelerationScale = 2.0f;
+
+	[Tooltip("偏航误差进入容差后，直接把车体朝向收敛到目标角，避免剩余角速度拖尾")]
+	public bool snapYawToTargetWhenAligned = true;
+
 	[Header("Twin Visuals")]
 	public bool animateWheelRoll = true;
 
@@ -112,6 +159,8 @@ public class DiffDriveTwinController : MonoBehaviour
 
 	public float CurrentLinearVelocity => vCmd;
 	public float CurrentAngularVelocity => wCmd;
+	public float CurrentPlanarSpeedMeasured => rb != null ? new Vector3(rb.velocity.x, 0f, rb.velocity.z).magnitude : Mathf.Abs(vCmd);
+	public float CurrentYawRateMeasured => rb != null ? Mathf.Abs(rb.angularVelocity.y) : Mathf.Abs(wCmd);
 
 	private float lastVLeft = 0f;
 	private float lastVRight = 0f;
@@ -119,6 +168,12 @@ public class DiffDriveTwinController : MonoBehaviour
 	// wheel roll accumulators (visual)
 	private float rollLF, rollLR, rollRF, rollRR;
 	private bool goalReachedLatched = false;
+	private bool finalYawAlignmentActive = false;
+	private bool useVelocityCommandOverride = false;
+	private float overrideLinearVelocityTarget = 0f;
+	private float overrideAngularVelocityTarget = 0f;
+	private int arrivalStableFrames = 0;
+	[SerializeField] private PointGoalPhase pointGoalPhase = PointGoalPhase.Idle;
 
 	void Reset()
 	{
@@ -149,18 +204,14 @@ public class DiffDriveTwinController : MonoBehaviour
 		{
 			if (TryPickGroundPoint(out Vector3 p))
 			{
-				targetPointWorld = p;
-				hasTargetPoint = true;
-				goalReachedLatched = false;
-				mode = ControlMode.TargetPoint;
+				SetTargetPointGoal(p);
 			}
 		}
 
 		// 按键应用目标Yaw
 		if (enableKeyToApplyTargetYaw && Input.GetKeyDown(applyYawKey))
 		{
-			mode = ControlMode.TargetYaw;
-			// targetYawDeg 直接用 Inspector 中的值
+			SetTargetYawGoal(targetYawDeg);
 		}
 	}
 
@@ -182,11 +233,18 @@ public class DiffDriveTwinController : MonoBehaviour
 		float vTarget = 0f;
 		float wTarget = 0f;
 
-		if (mode == ControlMode.TargetPoint)
+		if (useVelocityCommandOverride)
+		{
+			vTarget = Mathf.Clamp(overrideLinearVelocityTarget, -vMax, vMax);
+			wTarget = Mathf.Clamp(overrideAngularVelocityTarget, -wMax, wMax);
+			finalYawAlignmentActive = false;
+		}
+		else if (mode == ControlMode.TargetPoint)
 		{
 			if (!hasTargetPoint)
 			{
 				// No goal: force-stop to avoid micro oscillation near final point.
+				pointGoalPhase = goalReachedLatched ? PointGoalPhase.Arrived : PointGoalPhase.Idle;
 				HardStopAtGoal();
 				UpdateWheelOutputs(0f, 0f, dt);
 				return;
@@ -203,7 +261,10 @@ public class DiffDriveTwinController : MonoBehaviour
 
 		// 2) 速度/角速度做加速度限制（斜坡）
 		vCmd = Ramp(vCmd, vTarget, aMax, dt);
-		wCmd = Ramp(wCmd, wTarget, alphaMax, dt);
+		float angularAccelerationLimit = finalYawAlignmentActive
+			? alphaMax * Mathf.Max(1f, finalYawAccelerationScale)
+			: alphaMax;
+		wCmd = Ramp(wCmd, wTarget, angularAccelerationLimit, dt);
 
 		// 3) 由 (vCmd, wCmd) 解算左右轮线速度，再映射到四轮
 		vLeft = vCmd - wCmd * (trackWidth_b * 0.5f);
@@ -233,81 +294,159 @@ public class DiffDriveTwinController : MonoBehaviour
 		toGoal.y = 0f;
 
 		float dist = toGoal.magnitude;
+		float arrivalDistance = Mathf.Max(posTolerance, arrivalSnapDistance);
+		float desiredYaw = Mathf.Atan2(toGoal.x, toGoal.z);
+		float yaw = CurrentYawRad();
+		float eYaw = WrapPi(desiredYaw - yaw);
+		float yawErrorDeg = Mathf.Abs(eYaw) * Mathf.Rad2Deg;
 
 		// Arrival hysteresis: once reached, keep stop unless target is clearly far again.
-		if (goalReachedLatched && dist <= Mathf.Max(goalReleaseDistance, posTolerance))
+		if (goalReachedLatched && dist <= Mathf.Max(goalReleaseDistance, arrivalDistance))
 		{
+			pointGoalPhase = PointGoalPhase.Arrived;
 			vTarget = 0f;
 			wTarget = 0f;
 			return;
 		}
-		if (goalReachedLatched && dist > Mathf.Max(goalReleaseDistance, posTolerance))
+		if (goalReachedLatched && dist > Mathf.Max(goalReleaseDistance, arrivalDistance))
 		{
 			goalReachedLatched = false;
 		}
 
-		// 到点停止
-		if (dist <= posTolerance)
+		if (dist <= arrivalDistance)
 		{
-			goalReachedLatched = true;
-			hasTargetPoint = false;
-
-			if (alignYawAtGoal && rotateAtGoal)
+			if (CurrentPlanarSpeedMeasured <= 0.03f && CurrentYawRateMeasured <= yawRateStopTolerance)
 			{
-				// 到点后对准 targetYawDeg
-				mode = ControlMode.TargetYaw;
-				vTarget = 0f;
-
-				if (useTargetDirectionAtGoal)
+				arrivalStableFrames++;
+				if (arrivalStableFrames >= 3)
 				{
-					targetYawDeg = DirectionToYawDeg(targetDirectionWorld);
+					FinishPointGoal(out vTarget, out wTarget);
+					return;
 				}
-
-				wTarget = ComputeYawRateToTargetYaw(targetYawDeg);
-				wTarget = Mathf.Clamp(wTarget, -wMax, wMax);
-				return;
+			}
+			else
+			{
+				arrivalStableFrames = 0;
 			}
 
-			mode = ControlMode.TargetPoint;
-			HardStopAtGoal();
-
+			pointGoalPhase = PointGoalPhase.Brake;
 			vTarget = 0f;
-			wTarget = 0f;
+			wTarget = preserveArrivalHeading ? 0f : Mathf.Clamp(kYaw * eYaw, -wMax, wMax);
+			return;
+		}
+		arrivalStableFrames = 0;
+
+		UpdatePointGoalPhase(dist, arrivalDistance, yawErrorDeg);
+		wTarget = Mathf.Clamp(kYaw * eYaw, -wMax, wMax);
+
+		switch (pointGoalPhase)
+		{
+			case PointGoalPhase.RotateInPlace:
+				vTarget = 0f;
+				break;
+
+			case PointGoalPhase.Cruise:
+			{
+				float headingScale = Mathf.Max(cruiseHeadingFloor, Mathf.Clamp01(Mathf.Cos(eYaw)));
+				vTarget = vMax * headingScale;
+				break;
+			}
+
+			case PointGoalPhase.Brake:
+			{
+				float remainingForBrake = Mathf.Max(0f, dist - arrivalDistance);
+				float brakeEnvelope = Mathf.Sqrt(Mathf.Max(0f, 2f * aMax * remainingForBrake));
+				float headingScale = Mathf.Max(brakeHeadingFloor, Mathf.Clamp01(Mathf.Cos(eYaw)));
+				vTarget = Mathf.Min(vMax, brakeEnvelope) * headingScale;
+				if (remainingForBrake > 0.15f && headingScale > 0.25f)
+				{
+					vTarget = Mathf.Max(vTarget, brakeMinSpeed);
+				}
+				break;
+			}
+
+			case PointGoalPhase.Arrived:
+				FinishPointGoal(out vTarget, out wTarget);
+				return;
+
+			default:
+				vTarget = 0f;
+				break;
+		}
+	}
+
+	void UpdatePointGoalPhase(float dist, float arrivalDistance, float yawErrorDeg)
+	{
+		float rotateEnter = Mathf.Max(rotateInPlaceAngleDeg, rotateExitAngleDeg);
+		float rotateExit = Mathf.Min(rotateEnter - 1f, rotateExitAngleDeg);
+		float stopDistance = (vCmd * vCmd) / (2f * Mathf.Max(aMax, 1e-4f));
+		float brakeDistance = Mathf.Max(arrivalDistance + brakingDistancePadding, stopDistance + brakingDistancePadding);
+
+		switch (pointGoalPhase)
+		{
+			case PointGoalPhase.Idle:
+				pointGoalPhase = yawErrorDeg > rotateEnter ? PointGoalPhase.RotateInPlace : PointGoalPhase.Cruise;
+				break;
+
+			case PointGoalPhase.RotateInPlace:
+				if (yawErrorDeg <= rotateExit)
+				{
+					pointGoalPhase = PointGoalPhase.Cruise;
+				}
+				break;
+
+			case PointGoalPhase.Cruise:
+				if (yawErrorDeg > rotateEnter)
+				{
+					pointGoalPhase = PointGoalPhase.RotateInPlace;
+				}
+				else if (dist <= brakeDistance)
+				{
+					pointGoalPhase = PointGoalPhase.Brake;
+				}
+				break;
+
+			case PointGoalPhase.Brake:
+				if (dist <= arrivalDistance)
+				{
+					pointGoalPhase = PointGoalPhase.Arrived;
+				}
+				break;
+
+			case PointGoalPhase.Arrived:
+				if (dist > Mathf.Max(goalReleaseDistance, arrivalDistance))
+				{
+					pointGoalPhase = PointGoalPhase.Idle;
+				}
+				break;
+		}
+	}
+
+	void FinishPointGoal(out float vTarget, out float wTarget)
+	{
+		goalReachedLatched = true;
+		pointGoalPhase = PointGoalPhase.Arrived;
+		hasTargetPoint = false;
+		mode = ControlMode.TargetPoint;
+		finalYawAlignmentActive = false;
+		if (!preserveArrivalHeading && alignYawAtGoal && rotateAtGoal)
+		{
+			mode = ControlMode.TargetYaw;
+			finalYawAlignmentActive = true;
+			vTarget = 0f;
+
+			if (useTargetDirectionAtGoal)
+			{
+				targetYawDeg = DirectionToYawDeg(targetDirectionWorld);
+			}
+
+			wTarget = Mathf.Clamp(ComputeYawRateToTargetYaw(targetYawDeg), -wMax, wMax);
 			return;
 		}
 
-		// 目标航向：朝向目标点
-		float desiredYaw = Mathf.Atan2(toGoal.x, toGoal.z); // Unity: yaw around Y, forward is +Z
-		float yaw = CurrentYawRad();
-
-		float eYaw = WrapPi(desiredYaw - yaw);
-
-		// 角速度：P 控制 + 限幅
-		wTarget = Mathf.Clamp(kYaw * eYaw, -wMax, wMax);
-
-		// Near goal, decay yaw command to avoid in-place slip/spin on threshold boundary.
-		float nearGoalScale = Mathf.Clamp01(dist / Mathf.Max(2f * posTolerance, 1e-3f));
-		wTarget *= nearGoalScale;
-
-		// 线速度：距离比例 + 限幅 + 近点刹车约束（避免冲过头）
-		float vRaw = Mathf.Clamp(kDist * dist, 0f, vMax);
-
-		// “能停住”的速度上限：v <= sqrt(2*aMax*dist)
-		float vStop = Mathf.Sqrt(Mathf.Max(0f, 2f * aMax * dist));
-		vRaw = Mathf.Min(vRaw, vStop);
-
-		// 大角度误差先原地转向
-		float rotateDeg = Mathf.Abs(eYaw) * Mathf.Rad2Deg;
-		if (rotateDeg > rotateInPlaceAngleDeg)
-		{
-			vTarget = 0f;
-		}
-		else
-		{
-			// 航向误差越大，前进越慢（避免画大弧线）
-			float headingScale = Mathf.Clamp01(Mathf.Cos(eYaw));
-			vTarget = vRaw * headingScale;
-		}
+		HardStopAtGoal();
+		vTarget = 0f;
+		wTarget = 0f;
 	}
 
 	// -------------------------
@@ -316,13 +455,26 @@ public class DiffDriveTwinController : MonoBehaviour
 	void ComputeYawOnlyTargets(out float vTarget, out float wTarget)
 	{
 		vTarget = 0f;
-		wTarget = Mathf.Clamp(ComputeYawRateToTargetYaw(targetYawDeg), -wMax, wMax);
-
-		// 接近目标角度就停
-		float yawErrDeg = Mathf.Abs(WrapPi(TargetYawRad(targetYawDeg) - CurrentYawRad())) * Mathf.Rad2Deg;
+		float yawErrorRad = WrapPi(TargetYawRad(targetYawDeg) - CurrentYawRad());
+		float yawErrDeg = Mathf.Abs(yawErrorRad) * Mathf.Rad2Deg;
 		if (yawErrDeg <= yawToleranceDeg)
 		{
+			if (snapYawToTargetWhenAligned)
+			{
+				SnapYawToTarget(targetYawDeg);
+			}
+
+			finalYawAlignmentActive = false;
+			HardStopAtGoal();
 			wTarget = 0f;
+			return;
+		}
+
+		float yawGain = finalYawAlignmentActive ? Mathf.Max(kYaw, finalYawGain) : kYaw;
+		wTarget = Mathf.Clamp(yawGain * yawErrorRad, -wMax, wMax);
+		if (finalYawAlignmentActive && Mathf.Abs(wTarget) < finalYawMinRate)
+		{
+			wTarget = finalYawMinRate * Mathf.Sign(yawErrorRad);
 		}
 	}
 
@@ -377,8 +529,123 @@ public class DiffDriveTwinController : MonoBehaviour
 		rb.MoveRotation(newRot);
 	}
 
+	public void SetTargetPointGoal(Vector3 point)
+	{
+		targetPointWorld = point;
+		hasTargetPoint = true;
+		goalReachedLatched = false;
+		finalYawAlignmentActive = false;
+		useVelocityCommandOverride = false;
+		overrideLinearVelocityTarget = 0f;
+		overrideAngularVelocityTarget = 0f;
+		arrivalStableFrames = 0;
+		pointGoalPhase = PointGoalPhase.Idle;
+		mode = ControlMode.TargetPoint;
+	}
+
+	public void UpdateTrackingGoal(Vector3 point, bool keepGoalActive = true)
+	{
+		targetPointWorld = point;
+		hasTargetPoint = keepGoalActive;
+	}
+
+	public void SetVelocityCommand(float linearVelocityTarget, float angularVelocityTarget, Vector3? trackingGoalPoint = null)
+	{
+		useVelocityCommandOverride = true;
+		overrideLinearVelocityTarget = Mathf.Clamp(linearVelocityTarget, -vMax, vMax);
+		overrideAngularVelocityTarget = Mathf.Clamp(angularVelocityTarget, -wMax, wMax);
+		goalReachedLatched = false;
+		finalYawAlignmentActive = false;
+		arrivalStableFrames = 0;
+		pointGoalPhase = PointGoalPhase.Idle;
+		mode = ControlMode.TargetPoint;
+		if (trackingGoalPoint.HasValue)
+		{
+			targetPointWorld = trackingGoalPoint.Value;
+			hasTargetPoint = true;
+		}
+	}
+
+	public void ClearVelocityCommand(bool stopImmediately)
+	{
+		useVelocityCommandOverride = false;
+		overrideLinearVelocityTarget = 0f;
+		overrideAngularVelocityTarget = 0f;
+		if (stopImmediately)
+		{
+			HardStopAtGoal();
+		}
+	}
+
+	public void CompletePointGoal(Vector3 point)
+	{
+		targetPointWorld = point;
+		hasTargetPoint = false;
+		goalReachedLatched = true;
+		finalYawAlignmentActive = false;
+		pointGoalPhase = PointGoalPhase.Arrived;
+		ClearVelocityCommand(true);
+	}
+
+	public bool TrySnapPositionToPoint(Vector3 point, float maxPlanarCorrectionMeters)
+	{
+		if (rb == null)
+		{
+			return false;
+		}
+
+		Vector3 current = rb.position;
+		Vector3 delta = point - current;
+		delta.y = 0f;
+		float maxCorrection = Mathf.Max(0.001f, maxPlanarCorrectionMeters);
+		if (delta.sqrMagnitude > maxCorrection * maxCorrection)
+		{
+			return false;
+		}
+
+		if (delta.sqrMagnitude <= 1e-8f)
+		{
+			return true;
+		}
+
+		Vector3 snappedPosition = current;
+		snappedPosition.x = point.x;
+		snappedPosition.z = point.z;
+		rb.MovePosition(snappedPosition);
+		Physics.SyncTransforms();
+		return true;
+	}
+
+	public bool EnsureDriveGeometryReady()
+	{
+		if (HasValidDriveGeometry)
+		{
+			return true;
+		}
+
+		DetectGeometry();
+		return HasValidDriveGeometry;
+	}
+
+	public void SetTargetYawGoal(float yawDegrees)
+	{
+		targetYawDeg = yawDegrees;
+		hasTargetPoint = false;
+		goalReachedLatched = false;
+		finalYawAlignmentActive = false;
+		useVelocityCommandOverride = false;
+		overrideLinearVelocityTarget = 0f;
+		overrideAngularVelocityTarget = 0f;
+		arrivalStableFrames = 0;
+		pointGoalPhase = PointGoalPhase.Idle;
+		mode = ControlMode.TargetYaw;
+	}
+
 	public void HardStopAtGoal()
 	{
+		useVelocityCommandOverride = false;
+		overrideLinearVelocityTarget = 0f;
+		overrideAngularVelocityTarget = 0f;
 		vCmd = 0f;
 		wCmd = 0f;
 		vLeft = 0f;
@@ -387,6 +654,14 @@ public class DiffDriveTwinController : MonoBehaviour
 		aRight = 0f;
 		lastVLeft = 0f;
 		lastVRight = 0f;
+		alphaLF = 0f;
+		alphaLR = 0f;
+		alphaRF = 0f;
+		alphaRR = 0f;
+		wLF = 0f;
+		wLR = 0f;
+		wRF = 0f;
+		wRR = 0f;
 
 		if (rb == null) return;
 
@@ -395,12 +670,39 @@ public class DiffDriveTwinController : MonoBehaviour
 		vel.z = 0f;
 		rb.velocity = vel;
 
-		Vector3 w = rb.angularVelocity;
-		if (Mathf.Abs(w.y) <= yawRateStopTolerance)
+		Vector3 angular = rb.angularVelocity;
+		angular.y = 0f;
+		rb.angularVelocity = angular;
+	}
+
+	void SnapYawToTarget(float yawDeg)
+	{
+		if (rb == null)
 		{
-			w.y = 0f;
-			rb.angularVelocity = w;
+			return;
 		}
+
+		float snappedYawDeg = yawDeg - headingOffsetDeg;
+		Quaternion targetRotation = Quaternion.Euler(0f, snappedYawDeg, 0f);
+		rb.MoveRotation(targetRotation);
+	}
+
+	void SnapPositionToTargetPoint()
+	{
+		if (rb == null)
+		{
+			return;
+		}
+
+		Vector3 snappedPosition = rb.position;
+		snappedPosition.x = targetPointWorld.x;
+		snappedPosition.z = targetPointWorld.z;
+		rb.MovePosition(snappedPosition);
+	}
+
+	private static Vector3 ProjectXZ(Vector3 value)
+	{
+		return new Vector3(value.x, 0f, value.z);
 	}
 
 	// -------------------------

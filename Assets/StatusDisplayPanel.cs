@@ -1,7 +1,8 @@
+using System.Collections;
+using System.Text;
+using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
-using TMPro;
-using System.Text;
 
 namespace RobotSimulation
 {
@@ -16,13 +17,13 @@ namespace RobotSimulation
         [Header("Position Display")]
         public TextMeshProUGUI positionText;
         public TextMeshProUGUI rotationText;
-        public RectTransform positionIndicator; // Visual indicator on mini-map
+        public RectTransform positionIndicator;
 
         [Header("Velocity Display")]
         public TextMeshProUGUI linearVelocityText;
         public TextMeshProUGUI angularVelocityText;
-        public Image velocityBar; // Linear velocity progress bar
-        public Image angularVelocityBar; // Angular velocity progress bar
+        public Image velocityBar;
+        public Image angularVelocityBar;
 
         [Header("Wheel Display")]
         public TextMeshProUGUI leftWheelText;
@@ -60,7 +61,7 @@ namespace RobotSimulation
         private float _lastFpsUpdate;
         private int _frameCount;
         private float _currentFps;
-        private StringBuilder _sb = new StringBuilder();
+        private readonly StringBuilder _sb = new StringBuilder();
 
         void Start()
         {
@@ -72,6 +73,11 @@ namespace RobotSimulation
 
         void Update()
         {
+            if (manager != null)
+            {
+                RobotSimulationLocalization.SetLanguage(manager.displayLanguage);
+            }
+
             UpdateFPS();
             UpdateDisplay();
         }
@@ -95,7 +101,6 @@ namespace RobotSimulation
 
             var state = manager.RobotState;
 
-            // Position & Rotation
             if (positionText != null)
             {
                 positionText.text = $"X: {state.position.x:F2}  Z: {state.position.z:F2}";
@@ -103,20 +108,19 @@ namespace RobotSimulation
 
             if (rotationText != null)
             {
-                rotationText.text = $"Yaw: {state.rotation:F1}°";
+                rotationText.text = $"{RobotSimulationLocalization.Text("偏航", "Yaw")}: {state.rotation:F1}deg";
             }
 
-            // Velocity
             if (linearVelocityText != null)
             {
-                linearVelocityText.text = $"V: {state.linearVelocity:F3} m/s";
-            }
-            if (angularVelocityText != null)
-            {
-                angularVelocityText.text = $"ω: {state.angularVelocity:F3} rad/s";
+                linearVelocityText.text = $"{RobotSimulationLocalization.Text("线速度", "V")}: {state.linearVelocity:F3} m/s";
             }
 
-            // Velocity bars
+            if (angularVelocityText != null)
+            {
+                angularVelocityText.text = $"{RobotSimulationLocalization.Text("角速度", "W")}: {state.angularVelocity:F3} rad/s";
+            }
+
             if (velocityBar != null)
             {
                 velocityBar.fillAmount = Mathf.Abs(state.linearVelocity) / maxLinearVelocity;
@@ -129,14 +133,14 @@ namespace RobotSimulation
                 angularVelocityBar.color = GetVelocityColor(Mathf.Abs(state.angularVelocity), maxAngularVelocity);
             }
 
-            // Wheels
             if (leftWheelText != null)
             {
-                leftWheelText.text = $"L: {state.leftWheelVelocity:F3} m/s";
+                leftWheelText.text = $"{RobotSimulationLocalization.Text("左轮", "L")}: {state.leftWheelVelocity:F3} m/s";
             }
+
             if (rightWheelText != null)
             {
-                rightWheelText.text = $"R: {state.rightWheelVelocity:F3} m/s";
+                rightWheelText.text = $"{RobotSimulationLocalization.Text("右轮", "R")}: {state.rightWheelVelocity:F3} m/s";
             }
 
             if (leftWheelBar != null)
@@ -149,54 +153,52 @@ namespace RobotSimulation
                 rightWheelBar.fillAmount = Mathf.Abs(state.rightWheelVelocity) / maxWheelVelocity;
             }
 
-            // Target info
             if (targetInfoText != null)
             {
                 if (state.hasTargetPoint)
                 {
                     float dist = Vector3.Distance(state.position, state.targetPoint);
-                    targetInfoText.text = $"Target: {dist:F2}m away";
+                    targetInfoText.text = RobotSimulationLocalization.Text($"目标距离: {dist:F2}m", $"Target: {dist:F2}m away");
                     targetInfoText.color = normalColor;
                 }
                 else
                 {
-                    targetInfoText.text = "Target: None";
+                    targetInfoText.text = RobotSimulationLocalization.Text("目标: 无", "Target: None");
                     targetInfoText.color = warningColor;
                 }
             }
 
-            // Target direction indicator
             if (targetDirectionIndicator != null && state.hasTargetPoint)
             {
                 Vector3 dir = state.targetPoint - state.position;
-                dir.y = 0;
+                dir.y = 0f;
                 float angle = Vector3.SignedAngle(Vector3.forward, dir, Vector3.up);
-                targetDirectionIndicator.localRotation = Quaternion.Euler(0, 0, -angle);
+                targetDirectionIndicator.localRotation = Quaternion.Euler(0f, 0f, -angle);
             }
 
-            // Joint status
             if (jointStatusTexts != null && state.jointAngles != null)
             {
                 for (int i = 0; i < Mathf.Min(state.jointAngles.Length, jointStatusTexts.Length); i++)
                 {
-                    if (jointStatusTexts[i] != null)
+                    if (jointStatusTexts[i] == null)
                     {
-                        float angle = state.jointAngles[i];
-                        float range = i < jointDisplayRanges.Length ? jointDisplayRanges[i] : 180f;
-                        jointStatusTexts[i].text = $"J{i}: {angle:F1}°";
+                        continue;
+                    }
 
-                        if (jointProgressBars != null && i < jointProgressBars.Length && jointProgressBars[i] != null)
-                        {
-                            jointProgressBars[i].fillAmount = Mathf.Abs(angle) / range;
-                        }
+                    float angle = state.jointAngles[i];
+                    float range = i < jointDisplayRanges.Length ? jointDisplayRanges[i] : 180f;
+                    jointStatusTexts[i].text = $"{RobotSimulationLocalization.Text("关节", "J")}{i}: {angle:F1}deg";
+
+                    if (jointProgressBars != null && i < jointProgressBars.Length && jointProgressBars[i] != null)
+                    {
+                        jointProgressBars[i].fillAmount = Mathf.Abs(angle) / range;
                     }
                 }
             }
 
-            // Simulation info
             if (simulationTimeText != null)
             {
-                simulationTimeText.text = $"Time: {state.simulationTime:F1}s";
+                simulationTimeText.text = $"{RobotSimulationLocalization.Text("时间", "Time")}: {state.simulationTime:F1}s";
             }
 
             if (fpsText != null)
@@ -207,7 +209,7 @@ namespace RobotSimulation
 
             if (controlModeText != null)
             {
-                controlModeText.text = $"Mode: {state.controlMode}";
+                controlModeText.text = $"{RobotSimulationLocalization.Text("模式", "Mode")}: {RobotSimulationLocalization.ControlMode(state.controlMode)}";
             }
         }
 
@@ -219,9 +221,6 @@ namespace RobotSimulation
             return errorColor;
         }
 
-        /// <summary>
-        /// Show an alert message
-        /// </summary>
         public void ShowAlert(string message, float duration = 2f)
         {
             if (alertText != null)
@@ -232,7 +231,7 @@ namespace RobotSimulation
             }
         }
 
-        private System.Collections.IEnumerator HideAlertAfter(float duration)
+        private IEnumerator HideAlertAfter(float duration)
         {
             yield return new WaitForSeconds(duration);
             if (alertText != null)
@@ -241,60 +240,21 @@ namespace RobotSimulation
             }
         }
 
-        /// <summary>
-        /// Set velocity display range
-        /// </summary>
         public void SetVelocityRange(float linearMax, float angularMax)
         {
             maxLinearVelocity = linearMax;
             maxAngularVelocity = angularMax;
         }
 
-        /// <summary>
-        /// Update mini-map position indicator
-        /// </summary>
         public void UpdatePositionIndicator(Vector3 worldPos, float mapSize)
         {
             if (positionIndicator != null)
             {
-                // Assuming map is centered at origin, Z-forward
-                positionIndicator.anchoredPosition = new Vector2(
-                    worldPos.x * mapSize,
-                    worldPos.z * mapSize
-                );
+                float x = Mathf.Clamp(worldPos.x / mapSize, -0.5f, 0.5f);
+                float y = Mathf.Clamp(worldPos.z / mapSize, -0.5f, 0.5f);
+                positionIndicator.anchorMin = new Vector2(0.5f + x, 0.5f + y);
+                positionIndicator.anchorMax = positionIndicator.anchorMin;
             }
-        }
-
-        /// <summary>
-        /// Get formatted status report
-        /// </summary>
-        public string GetStatusReport()
-        {
-            if (manager == null || manager.RobotState == null) return "No robot connected";
-
-            var state = manager.RobotState;
-            _sb.Clear();
-            _sb.AppendLine("=== Robot Status Report ===");
-            _sb.AppendLine($"Time: {state.simulationTime:F2}s");
-            _sb.AppendLine($"Mode: {state.controlMode}");
-            _sb.AppendLine($"Position: ({state.position.x:F3}, {state.position.z:F3})");
-            _sb.AppendLine($"Rotation: {state.rotation:F1}°");
-            _sb.AppendLine($"Linear Velocity: {state.linearVelocity:F4} m/s");
-            _sb.AppendLine($"Angular Velocity: {state.angularVelocity:F4} rad/s");
-            _sb.AppendLine($"Left Wheel: {state.leftWheelVelocity:F4} m/s");
-            _sb.AppendLine($"Right Wheel: {state.rightWheelVelocity:F4} m/s");
-            _sb.AppendLine($"Target: {(state.hasTargetPoint ? "Set" : "None")}");
-
-            if (state.jointAngles != null && state.jointAngles.Length > 0)
-            {
-                _sb.AppendLine("Joint Angles:");
-                for (int i = 0; i < state.jointAngles.Length; i++)
-                {
-                    _sb.AppendLine($"  J{i}: {state.jointAngles[i]:F2}°");
-                }
-            }
-
-            return _sb.ToString();
         }
     }
 }

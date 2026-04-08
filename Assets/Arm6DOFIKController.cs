@@ -1,11 +1,11 @@
-﻿using UnityEngine;
+using System;
 using System.Collections;
+using UnityEngine;
 
 namespace RobotSimulation
 {
 	/// <summary>
-	/// Inverse Kinematics Controller for 6-DOF Arm.
-	/// Iterative Jacobian-transpose solver running on physics steps.
+	/// Inverse kinematics controller using the URDF-driven kinematics model.
 	/// </summary>
 	public class Arm6DOFIKController : MonoBehaviour
 	{
@@ -15,37 +15,46 @@ namespace RobotSimulation
 		public Arm6DOFFKController armController;
 
 		[Header("IK Settings")]
-		public int maxIterations = 40;
-		public float tolerance = 0.01f;           // meters
-		public float angleTolerance = 1f;         // degrees (reserved)
-		public float damping = 0.5f;              // Jacobian transpose gain
-		public float maxDeltaDegPerIteration = 5f;
-		public float dlsLambda = 0.05f;           // Damped least-squares regularization
-		public bool useMeasuredJointState = true; // Use articulation measured angles each iteration
+		public int maxIterations = 120;
+		public float tolerance = 0.01f;
+		public float damping = 1.0f;
+		public float maxDeltaDegPerIteration = 8f;
+		public float dlsLambda = 0.02f;
+		public bool useMeasuredJointState = true;
+		public bool resyncMeasuredStateEachIteration = false;
 
 		[Header("Joint Limits")]
 		public bool enforceJointLimits = true;
 
 		[Header("Status")]
-		[SerializeField] private bool _isSolving = false;
-		[SerializeField] private bool _lastSolveSuccess = false;
+		[SerializeField] private bool _isSolving;
+		[SerializeField] private bool _isMoveInProgress;
+		[SerializeField] private bool _lastSolveSuccess;
 		[SerializeField] private float _lastSolveError = float.MaxValue;
-		[SerializeField] private Vector3 _targetPosition;
-		[SerializeField] private Quaternion _targetRotation = Quaternion.identity;
+		[SerializeField] private int _lastSolveIterations;
+		[SerializeField] private Vector3 _targetWorldPosition;
+		[SerializeField] private Vector3 _targetBasePosition;
+		[SerializeField] private float _activeMoveSpeedScale = 1f;
 
-		public bool IsSolving => _isSolving;
-		public bool LastSolveSuccess => _lastSolveSuccess;
-		public float LastSolveError => _lastSolveError;
-		public Vector3 TargetPosition => _targetPosition;
-
-		private ArticulationBody[] _joints;
-		private Transform[] _jointTransforms;
-		private Transform _endEffector;
 		private float[] _currentAngles = new float[6];
 		private Vector2[] _jointLimits;
 		private Coroutine _solveRoutine;
+		private Coroutine _moveWaitRoutine;
+		private ArmMoveResult _lastMoveResult = new ArmMoveResult();
+		private ArmCollisionMonitor _collisionMonitor;
+		private ArmCollisionGuardResult _lastCollisionGuardResult = new ArmCollisionGuardResult();
+		private bool _solveBlockedByCollisionGuard;
 
-		void Awake()
+		public bool IsSolving => _isSolving;
+		public bool IsMoveInProgress => _isMoveInProgress;
+		public bool LastSolveSuccess => _lastSolveSuccess;
+		public float LastSolveError => _lastSolveError;
+		public int LastSolveIterations => _lastSolveIterations;
+		public Vector3 TargetWorldPosition => _targetWorldPosition;
+		public ArmMoveResult LastMoveResult => _lastMoveResult;
+		public ArmCollisionGuardResult LastCollisionGuardResult => _lastCollisionGuardResult;
+
+		private void Awake()
 		{
 			if (Instance == null)
 			{
@@ -53,156 +62,405 @@ namespace RobotSimulation
 			}
 		}
 
-		void Start()
+		private void Start()
 		{
 			RefreshReferences();
 		}
 
-		public bool MoveToPosition(Vector3 targetPosition)
+		public bool TryStartMoveToWorldPosition(Vector3 worldPosition)
 		{
-			return MoveToPosition(targetPosition, Quaternion.identity, false);
+			return MoveToPosition(worldPosition);
 		}
 
-		public bool MoveToPosition(Vector3 targetPosition, Quaternion targetRotation, bool withRotation = true)
+		public bool MoveToPosition(Vector3 targetWorldPosition)
 		{
-			RefreshReferences();
+			return MoveToPosition(targetWorldPosition, Quaternion.identity, false);
+		}
 
-			if (armController == null || !armController.IsInitialized)
+		public bool MoveToPosition(Vector3 targetWorldPosition, Quaternion targetRotation, bool withRotation = false)
+		{
+			StopActiveCoroutines();
+			return TryBeginSolve(targetWorldPosition, out _);
+		}
+
+		public Coroutine MoveToWorldPositionAndWait(ArmMoveRequest request, Action<ArmMoveResult> onComplete = null)
+		{
+			if (_moveWaitRoutine != null)
 			{
-				Debug.LogError("[Arm6DOF IK] Arm controller not initialized!");
+				StopCoroutine(_moveWaitRoutine);
+			}
+
+			_moveWaitRoutine = StartCoroutine(MoveToWorldPositionAndWaitCoroutine(request, onComplete));
+			return _moveWaitRoutine;
+		}
+
+		public void StopCurrentMove(bool emergencyStop = true)
+		{
+			StopActiveCoroutines();
+			if (emergencyStop)
+			{
+				RefreshReferences();
+				if (armController != null)
+				{
+					armController.EmergencyStop();
+				}
+			}
+
+			Vector3 currentWorld = GetCurrentWorldEndEffectorPosition();
+			_lastMoveResult = new ArmMoveResult
+			{
+				accepted = true,
+				success = false,
+				targetWorldPosition = _targetWorldPosition,
+				finalWorldPosition = currentWorld,
+				finalPositionError = Vector3.Distance(currentWorld, _targetWorldPosition),
+				iterations = _lastSolveIterations,
+				collisionGuardResult = _lastCollisionGuardResult,
+				summary = "Stopped by user."
+			};
+		}
+
+		public bool IsPositionReachable(Vector3 worldPosition)
+		{
+			RefreshReferences();
+			return armController != null && armController.IsPositionReachable(worldPosition);
+		}
+
+		public string GetReachabilityInfo(Vector3 worldPosition)
+		{
+			RefreshReferences();
+			if (armController == null || !armController.KinematicsReady)
+			{
+				return "Arm controller not initialized";
+			}
+
+			Vector3 targetBase = armController.WorldToBasePosition(worldPosition);
+			float distance = targetBase.magnitude;
+			float minReach = armController.GetMinReach();
+			float maxReach = armController.GetMaxReach();
+			bool reachable = armController.TryGetReachability(worldPosition, tolerance, out string reason);
+			float outerMargin = maxReach - distance;
+			float innerMargin = distance - minReach;
+
+			string info = "=== Reachability Info ===\n";
+			info += $"Target World Position: ({worldPosition.x:F3}, {worldPosition.y:F3}, {worldPosition.z:F3})\n";
+			info += $"Target Base Position: ({targetBase.x:F3}, {targetBase.y:F3}, {targetBase.z:F3})\n";
+			info += $"Distance from base: {distance:F3}m\n";
+			info += $"Min reach (dead-zone radius): {minReach:F3}m\n";
+			info += $"Max reach: {maxReach:F3}m\n";
+			info += reachable
+				? $"Status: REACHABLE (inner margin: {innerMargin:F3}m, outer margin: {outerMargin:F3}m)\n"
+				: distance < minReach
+					? $"Status: OUT OF REACH - INSIDE DEAD ZONE (shortfall: {minReach - distance:F3}m)\n"
+					: $"Status: OUT OF REACH - OUTSIDE OUTER SPHERE (shortfall: {distance - maxReach:F3}m)\n";
+			info += $"Reason: {reason}\n";
+			return info;
+		}
+
+		public Coroutine MoveToPositionAsync(Vector3 targetPosition, Action<bool> onComplete = null)
+		{
+			return MoveToWorldPositionAndWait(new ArmMoveRequest
+			{
+				worldPosition = targetPosition,
+				positionToleranceMeters = tolerance,
+				stableFixedFrames = 1,
+				timeoutSeconds = Mathf.Max(1f, maxIterations * Time.fixedDeltaTime * 2f)
+			}, result => onComplete?.Invoke(result.success));
+		}
+
+		public Coroutine RunRegressionTest(Action<string> onComplete = null)
+		{
+			return StartCoroutine(RunRegressionTestCoroutine(onComplete));
+		}
+
+		private bool TryBeginSolve(Vector3 targetWorldPosition, out ArmMoveResult immediateResult)
+		{
+			immediateResult = new ArmMoveResult
+			{
+				targetWorldPosition = targetWorldPosition
+			};
+
+			RefreshReferences();
+			RefreshCollisionMonitor();
+			if (armController == null || !armController.IsInitialized || !armController.KinematicsReady)
+			{
+				Debug.LogError("[Arm6DOF IK] Arm controller or kinematics model is not initialized.");
+				immediateResult.summary = "Arm controller is not initialized.";
 				return false;
 			}
 
-			if (!IsPositionReachable(targetPosition))
+			if (!armController.TryGetReachability(targetWorldPosition, tolerance, out string reachabilityReason))
 			{
-				float maxReach = armController.GetMaxReach();
-				float distance = Vector3.Distance(armController.transform.position, targetPosition);
+				Vector3 currentWorld = GetCurrentWorldEndEffectorPosition();
+				immediateResult.accepted = false;
+				immediateResult.unreachable = true;
+				immediateResult.finalWorldPosition = currentWorld;
+				immediateResult.finalPositionError = Vector3.Distance(currentWorld, targetWorldPosition);
+				immediateResult.summary = reachabilityReason;
+				_lastMoveResult = immediateResult;
 				_lastSolveSuccess = false;
-				_lastSolveError = distance - maxReach;
-
-				Debug.LogError("[Arm6DOF IK] ERROR: Target position is OUT OF REACH!");
-				Debug.LogError($"  Target: ({targetPosition.x:F3}, {targetPosition.y:F3}, {targetPosition.z:F3})");
-				Debug.LogError($"  Distance from base: {distance:F3}m");
-				Debug.LogError($"  Max reach: {maxReach:F3}m");
-				Debug.LogError($"  Shortfall: {_lastSolveError:F3}m");
+				_lastSolveError = immediateResult.finalPositionError;
+				Debug.LogError($"[Arm6DOF IK] Unreachable target: {immediateResult.summary}");
 				return false;
 			}
 
-			if (_isSolving && _solveRoutine != null)
+			_targetWorldPosition = targetWorldPosition;
+			_targetBasePosition = armController.WorldToBasePosition(targetWorldPosition);
+			if (useMeasuredJointState || _currentAngles == null || _currentAngles.Length < 6)
 			{
-				StopCoroutine(_solveRoutine);
-				_solveRoutine = null;
-				_isSolving = false;
+				_currentAngles = (float[])armController.CurrentJointAngles.Clone();
 			}
-
-			_targetPosition = targetPosition;
-			_targetRotation = targetRotation;
-			_currentAngles = (float[])armController.CurrentJointAngles.Clone();
-
+			_jointLimits = armController.jointLimits;
 			_lastSolveSuccess = false;
-			_lastSolveError = CalculatePositionError(targetPosition);
+			_lastSolveIterations = 0;
+			_lastSolveError = Vector3.Distance(armController.ModelEndEffectorPose.position, _targetBasePosition);
+			_solveBlockedByCollisionGuard = false;
+			_lastCollisionGuardResult = new ArmCollisionGuardResult { allowed = true };
 
-			_solveRoutine = StartCoroutine(SolveIKCoroutine(targetPosition, targetRotation, withRotation));
+			StartSolveRoutine();
+			immediateResult.accepted = true;
+			immediateResult.summary = "IK solve started.";
 			return true;
 		}
 
-		public bool IsPositionReachable(Vector3 position)
+		private void StartSolveRoutine()
 		{
-			if (armController == null) return false;
-			return armController.IsPositionReachable(position);
-		}
-
-		private IEnumerator SolveIKCoroutine(Vector3 targetPos, Quaternion targetRot, bool withRotation)
-		{
-			_isSolving = true;
-			RefreshReferences();
-
-			if (_jointTransforms == null || _jointTransforms.Length < 6)
+			if (_solveRoutine != null)
 			{
-				_isSolving = false;
-				_lastSolveSuccess = false;
-				Debug.LogError("[Arm6DOF IK] Joint transforms are not ready. Please initialize FK controller joints.");
-				yield break;
+				StopCoroutine(_solveRoutine);
+				_solveRoutine = null;
 			}
 
-			bool success = false;
+			_solveRoutine = StartCoroutine(SolveIKCoroutine(_targetBasePosition));
+		}
+
+		private IEnumerator SolveIKCoroutine(Vector3 targetBasePosition)
+		{
+			_isSolving = true;
+			bool converged = false;
 
 			for (int iteration = 0; iteration < maxIterations; iteration++)
 			{
-				if (useMeasuredJointState)
+				_lastSolveIterations = iteration + 1;
+
+				if (resyncMeasuredStateEachIteration)
 				{
 					SyncCurrentAnglesFromMeasuredState();
 				}
 
-				Vector3 current = GetEndEffectorPosition();
-				float error = Vector3.Distance(current, targetPos);
-				if (error < tolerance)
+				Pose currentPose = armController.ForwardPoe(_currentAngles);
+				Vector3 currentPosition = currentPose.position;
+				Vector3 positionError = targetBasePosition - currentPosition;
+				float errorMagnitude = positionError.magnitude;
+				if (errorMagnitude <= tolerance)
 				{
-					success = true;
-					Debug.Log($"[Arm6DOF IK] Solved in {iteration + 1} iterations. Error: {error:F4}m");
+					converged = true;
+					_lastSolveError = errorMagnitude;
 					break;
 				}
 
-				Vector3 posError = targetPos - current;
-
-				float[,] jacobian = CalculateJacobian();
-				float[] deltaThetaRad = CalculateDampedLeastSquaresStep(jacobian, posError);
+				float[,] jacobian = armController.ComputeGeometricJacobian(_currentAngles);
+				float[] deltaThetaRad = CalculateDampedLeastSquaresStep(jacobian, positionError);
 
 				for (int i = 0; i < 6; i++)
 				{
-					float deltaDeg = Mathf.Clamp(deltaThetaRad[i] * Mathf.Rad2Deg, -maxDeltaDegPerIteration, maxDeltaDegPerIteration);
+					float maxStepDeg = maxDeltaDegPerIteration * Mathf.Max(0.1f, _activeMoveSpeedScale);
+					float deltaDeg = Mathf.Clamp(deltaThetaRad[i] * Mathf.Rad2Deg, -maxStepDeg, maxStepDeg);
 					_currentAngles[i] += deltaDeg;
-
 					if (enforceJointLimits && _jointLimits != null && i < _jointLimits.Length)
 					{
 						_currentAngles[i] = Mathf.Clamp(_currentAngles[i], _jointLimits[i].x, _jointLimits[i].y);
 					}
 				}
 
-				armController.SetAllJointTargets(_currentAngles);
+				float[] stepStartAngles = armController.CaptureMeasuredJointAngles();
+				float[] stepTargetAngles = (float[])_currentAngles.Clone();
+				if (armController.EvaluateMotionCollision(stepStartAngles, stepTargetAngles, out ArmCollisionGuardResult guardResult))
+				{
+					_lastCollisionGuardResult = guardResult;
+					_solveBlockedByCollisionGuard = true;
+					_lastSolveSuccess = false;
+					_lastSolveError = Vector3.Distance(armController.ForwardPoe(stepStartAngles).position, targetBasePosition);
+					_lastMoveResult = new ArmMoveResult
+					{
+						accepted = true,
+						success = false,
+						targetWorldPosition = _targetWorldPosition,
+						finalWorldPosition = GetCurrentWorldEndEffectorPosition(),
+						finalPositionError = Vector3.Distance(GetCurrentWorldEndEffectorPosition(), _targetWorldPosition),
+						iterations = _lastSolveIterations,
+						blockedByCollisionGuard = true,
+						collisionGuardResult = guardResult,
+						summary = guardResult.message
+					};
+					armController.HoldCurrentPose();
+					_isSolving = false;
+					_solveRoutine = null;
+					if (!_isMoveInProgress)
+					{
+						Debug.LogWarning($"[Arm6DOF IK] {guardResult.message}");
+					}
+					yield break;
+				}
+
+				armController.ApplyAllJointTargetsRaw(stepTargetAngles);
 				yield return new WaitForFixedUpdate();
 			}
 
-			_lastSolveError = Vector3.Distance(GetEndEffectorPosition(), targetPos);
-			_lastSolveSuccess = success && _lastSolveError <= tolerance;
+			_lastSolveError = Vector3.Distance(armController.ForwardPoe(_currentAngles).position, targetBasePosition);
+			_lastSolveSuccess = converged || _lastSolveError <= tolerance;
 			_isSolving = false;
 			_solveRoutine = null;
 
-			if (!_lastSolveSuccess)
+			if (!_lastSolveSuccess && !_isMoveInProgress)
 			{
-				Debug.LogWarning($"[Arm6DOF IK] Failed to converge. Final error: {_lastSolveError:F4}m");
+				Debug.LogWarning($"[Arm6DOF IK] Solve ended without convergence. Error={_lastSolveError:F4}m after {_lastSolveIterations} iterations.");
 			}
 		}
 
-		private float[,] CalculateJacobian()
+		private IEnumerator MoveToWorldPositionAndWaitCoroutine(ArmMoveRequest request, Action<ArmMoveResult> onComplete)
 		{
-			float[,] jacobian = new float[3, 6];
-			if (_jointTransforms == null) return jacobian;
-
-			Vector3 endPos = GetEndEffectorPosition();
-
-			for (int i = 0; i < 6; i++)
+			ArmMoveRequest safeRequest = request ?? new ArmMoveRequest();
+			if (safeRequest.stableFixedFrames <= 0)
 			{
-				if (i >= _jointTransforms.Length || _jointTransforms[i] == null) continue;
-
-				// This project drives articulation xDrive, so joint axis is local X.
-				Vector3 jointAxis = _jointTransforms[i].right;
-				Vector3 fromJointToEnd = endPos - _jointTransforms[i].position;
-				Vector3 col = Vector3.Cross(jointAxis, fromJointToEnd);
-
-				jacobian[0, i] = col.x;
-				jacobian[1, i] = col.y;
-				jacobian[2, i] = col.z;
+				safeRequest.stableFixedFrames = 1;
 			}
 
-			return jacobian;
+			if (safeRequest.timeoutSeconds <= 0f)
+			{
+				safeRequest.timeoutSeconds = 5f;
+			}
+
+			safeRequest.speedScale = Mathf.Clamp(safeRequest.speedScale, 0.1f, 3f);
+			_activeMoveSpeedScale = safeRequest.speedScale;
+
+			_isMoveInProgress = true;
+			StopSolveRoutine();
+			if (!TryBeginSolve(safeRequest.worldPosition, out ArmMoveResult startResult))
+			{
+				_isMoveInProgress = false;
+				startResult.timedOut = false;
+				startResult.success = false;
+				onComplete?.Invoke(startResult);
+				yield break;
+			}
+
+			int stableFrames = 0;
+			float elapsed = 0f;
+			bool arrivalLockActive = false;
+			ArmMoveResult result = new ArmMoveResult
+			{
+				accepted = true,
+				targetWorldPosition = safeRequest.worldPosition
+			};
+
+			while (elapsed < safeRequest.timeoutSeconds)
+			{
+				yield return new WaitForFixedUpdate();
+				elapsed += Time.fixedDeltaTime;
+
+				Vector3 currentWorldPosition = GetCurrentWorldEndEffectorPosition();
+				float error = Vector3.Distance(currentWorldPosition, safeRequest.worldPosition);
+				float restartThreshold = arrivalLockActive
+					? safeRequest.positionToleranceMeters * 2f
+					: safeRequest.positionToleranceMeters;
+				if (_collisionMonitor != null && _collisionMonitor.EvaluateCollisionState())
+				{
+					result.collided = true;
+					result.success = false;
+					result.finalWorldPosition = currentWorldPosition;
+					result.finalPositionError = error;
+					result.iterations = _lastSolveIterations;
+					result.collisionMessage = _collisionMonitor.ActiveCollisionMessage;
+					result.summary = string.IsNullOrEmpty(result.collisionMessage)
+						? "Arm collision detected."
+						: result.collisionMessage;
+					break;
+				}
+
+				if (_solveBlockedByCollisionGuard)
+				{
+					result.success = false;
+					result.blockedByCollisionGuard = true;
+					result.collisionGuardResult = _lastCollisionGuardResult;
+					result.finalWorldPosition = currentWorldPosition;
+					result.finalPositionError = error;
+					result.iterations = _lastSolveIterations;
+					result.summary = string.IsNullOrEmpty(_lastCollisionGuardResult?.message)
+						? "Arm motion blocked by forbidden collision guard."
+						: _lastCollisionGuardResult.message;
+					break;
+				}
+
+				if (!_isSolving && !_solveBlockedByCollisionGuard && error > restartThreshold)
+				{
+					arrivalLockActive = false;
+					StartSolveRoutine();
+				}
+
+				if (error <= safeRequest.positionToleranceMeters)
+				{
+					if (!arrivalLockActive && armController != null)
+					{
+						arrivalLockActive = true;
+						armController.HoldCurrentPose();
+					}
+
+					stableFrames++;
+					if (stableFrames >= safeRequest.stableFixedFrames)
+					{
+						result.success = true;
+						result.finalWorldPosition = currentWorldPosition;
+						result.finalPositionError = error;
+						result.iterations = _lastSolveIterations;
+						result.summary = $"Reached target in {elapsed:F2}s.";
+						if (armController != null)
+						{
+							armController.HoldCurrentPose();
+						}
+						break;
+					}
+				}
+				else
+				{
+					stableFrames = 0;
+				}
+			}
+
+			if (!result.success)
+			{
+				if (!result.collided)
+				{
+					if (!result.blockedByCollisionGuard)
+					{
+						result.finalWorldPosition = GetCurrentWorldEndEffectorPosition();
+						result.finalPositionError = Vector3.Distance(result.finalWorldPosition, safeRequest.worldPosition);
+						result.iterations = _lastSolveIterations;
+						result.timedOut = true;
+						result.summary = "Timed out while waiting for the end effector to settle at the target position.";
+					}
+				}
+			}
+
+			StopSolveRoutine();
+			_activeMoveSpeedScale = 1f;
+			_lastMoveResult = result;
+			_isMoveInProgress = false;
+			_moveWaitRoutine = null;
+			onComplete?.Invoke(result);
 		}
 
-		private float[] CalculateDampedLeastSquaresStep(float[,] jacobian, Vector3 posError)
+		private float[] CalculateDampedLeastSquaresStep(float[,] jacobian, Vector3 positionError)
 		{
-			// deltaTheta = J^T * (J*J^T + lambda^2*I)^-1 * error
+			float[,] linearJacobian = new float[3, 6];
+			for (int c = 0; c < 6; c++)
+			{
+				linearJacobian[0, c] = jacobian[3, c];
+				linearJacobian[1, c] = jacobian[4, c];
+				linearJacobian[2, c] = jacobian[5, c];
+			}
+
 			float[,] jjt = new float[3, 3];
-
 			for (int r = 0; r < 3; r++)
 			{
 				for (int c = 0; c < 3; c++)
@@ -210,8 +468,9 @@ namespace RobotSimulation
 					float sum = 0f;
 					for (int k = 0; k < 6; k++)
 					{
-						sum += jacobian[r, k] * jacobian[c, k];
+						sum += linearJacobian[r, k] * linearJacobian[c, k];
 					}
+
 					jjt[r, c] = sum;
 				}
 			}
@@ -223,49 +482,49 @@ namespace RobotSimulation
 
 			if (!TryInvert3x3(jjt, out float[,] inv))
 			{
-				// Fallback to Jacobian transpose if matrix inversion fails.
 				float[] fallback = new float[6];
 				for (int i = 0; i < 6; i++)
 				{
-					float v = 0f;
-					for (int j = 0; j < 3; j++)
-					{
-						v += jacobian[j, i] * posError[j];
-					}
-					fallback[i] = v * damping;
+					float value = 0f;
+					value += linearJacobian[0, i] * positionError.x;
+					value += linearJacobian[1, i] * positionError.y;
+					value += linearJacobian[2, i] * positionError.z;
+					fallback[i] = value * damping;
 				}
+
 				return fallback;
 			}
 
 			float[] weightedError = new float[3];
-			for (int r = 0; r < 3; r++)
-			{
-				weightedError[r] = inv[r, 0] * posError[0]
-								 + inv[r, 1] * posError[1]
-								 + inv[r, 2] * posError[2];
-			}
+			weightedError[0] = inv[0, 0] * positionError.x + inv[0, 1] * positionError.y + inv[0, 2] * positionError.z;
+			weightedError[1] = inv[1, 0] * positionError.x + inv[1, 1] * positionError.y + inv[1, 2] * positionError.z;
+			weightedError[2] = inv[2, 0] * positionError.x + inv[2, 1] * positionError.y + inv[2, 2] * positionError.z;
 
-			float[] deltaThetaRad = new float[6];
+			float[] deltaTheta = new float[6];
 			for (int i = 0; i < 6; i++)
 			{
-				float v = 0f;
-				for (int j = 0; j < 3; j++)
-				{
-					v += jacobian[j, i] * weightedError[j];
-				}
-				deltaThetaRad[i] = v * damping;
+				float value = 0f;
+				value += linearJacobian[0, i] * weightedError[0];
+				value += linearJacobian[1, i] * weightedError[1];
+				value += linearJacobian[2, i] * weightedError[2];
+				deltaTheta[i] = value * damping;
 			}
 
-			return deltaThetaRad;
+			return deltaTheta;
 		}
 
-		private bool TryInvert3x3(float[,] m, out float[,] inv)
+		private static bool TryInvert3x3(float[,] matrix, out float[,] inverse)
 		{
-			inv = new float[3, 3];
-
-			float a = m[0, 0]; float b = m[0, 1]; float c = m[0, 2];
-			float d = m[1, 0]; float e = m[1, 1]; float f = m[1, 2];
-			float g = m[2, 0]; float h = m[2, 1]; float i = m[2, 2];
+			inverse = new float[3, 3];
+			float a = matrix[0, 0];
+			float b = matrix[0, 1];
+			float c = matrix[0, 2];
+			float d = matrix[1, 0];
+			float e = matrix[1, 1];
+			float f = matrix[1, 2];
+			float g = matrix[2, 0];
+			float h = matrix[2, 1];
+			float i = matrix[2, 2];
 
 			float A = (e * i) - (f * h);
 			float B = -((d * i) - (f * g));
@@ -277,26 +536,24 @@ namespace RobotSimulation
 			float H = -((a * f) - (c * d));
 			float I = (a * e) - (b * d);
 
-			float det = a * A + b * B + c * C;
-			if (Mathf.Abs(det) < 1e-8f)
+			float determinant = (a * A) + (b * B) + (c * C);
+			if (Mathf.Abs(determinant) < 1e-8f)
 			{
 				return false;
 			}
 
-			float invDet = 1f / det;
-			inv[0, 0] = A * invDet; inv[0, 1] = D * invDet; inv[0, 2] = G * invDet;
-			inv[1, 0] = B * invDet; inv[1, 1] = E * invDet; inv[1, 2] = H * invDet;
-			inv[2, 0] = C * invDet; inv[2, 1] = F * invDet; inv[2, 2] = I * invDet;
-
+			float invDet = 1f / determinant;
+			inverse[0, 0] = A * invDet; inverse[0, 1] = D * invDet; inverse[0, 2] = G * invDet;
+			inverse[1, 0] = B * invDet; inverse[1, 1] = E * invDet; inverse[1, 2] = H * invDet;
+			inverse[2, 0] = C * invDet; inverse[2, 1] = F * invDet; inverse[2, 2] = I * invDet;
 			return true;
 		}
 
 		private void SyncCurrentAnglesFromMeasuredState()
 		{
-			if (armController == null || armController.CurrentJointAngles == null) return;
-			if (_currentAngles == null || _currentAngles.Length < 6)
+			if (armController == null || armController.CurrentJointAngles == null)
 			{
-				_currentAngles = new float[6];
+				return;
 			}
 
 			for (int i = 0; i < 6; i++)
@@ -305,78 +562,34 @@ namespace RobotSimulation
 			}
 		}
 
-		private Vector3 GetEndEffectorPosition()
-		{
-			if (_endEffector != null) return _endEffector.position;
-			if (_jointTransforms != null && _jointTransforms.Length > 0 && _jointTransforms[5] != null)
-			{
-				return _jointTransforms[5].position;
-			}
-			return armController != null ? armController.EndEffectorPosition : Vector3.zero;
-		}
-
-		private float CalculatePositionError(Vector3 target)
-		{
-			return Vector3.Distance(GetEndEffectorPosition(), target);
-		}
-
-		public string GetReachabilityInfo(Vector3 position)
-		{
-			if (armController == null) return "Arm controller not initialized";
-
-			float maxReach = armController.GetMaxReach();
-			float distance = Vector3.Distance(armController.transform.position, position);
-			float shortfall = maxReach - distance;
-
-			string info = "=== Reachability Info ===\n";
-			info += $"Target Position: ({position.x:F3}, {position.y:F3}, {position.z:F3})\n";
-			info += $"Distance from base: {distance:F3}m\n";
-			info += $"Max reach: {maxReach:F3}m\n";
-
-			if (shortfall > 0)
-			{
-				info += $"Status: REACHABLE (margin: {shortfall:F3}m)\n";
-			}
-			else
-			{
-				info += $"Status: OUT OF REACH (shortfall: {Mathf.Abs(shortfall):F3}m)\n";
-			}
-
-			return info;
-		}
-
-		public Coroutine MoveToPositionAsync(Vector3 targetPosition, System.Action<bool> onComplete = null)
-		{
-			return StartCoroutine(MoveToPositionCoroutine(targetPosition, Quaternion.identity, false, onComplete));
-		}
-
-		public Coroutine RunRegressionTest(System.Action<string> onComplete = null)
-		{
-			return StartCoroutine(RunRegressionTestCoroutine(onComplete));
-		}
-
-		private IEnumerator RunRegressionTestCoroutine(System.Action<string> onComplete)
+		private Vector3 GetCurrentWorldEndEffectorPosition()
 		{
 			RefreshReferences();
-			if (armController == null || !armController.IsInitialized)
+			if (armController == null)
 			{
-				string failed = "IK regression aborted: FK controller is not initialized.";
+				return Vector3.zero;
+			}
+
+			return armController.EndEffectorWorldPosition;
+		}
+
+		private IEnumerator RunRegressionTestCoroutine(Action<string> onComplete)
+		{
+			RefreshReferences();
+			if (armController == null || !armController.IsInitialized || !armController.KinematicsReady)
+			{
+				string failed = "IK regression aborted: FK controller or kinematics model is not initialized.";
 				Debug.LogError($"[Arm6DOF IK] {failed}");
 				onComplete?.Invoke(failed);
 				yield break;
 			}
 
-			Vector3 seed = GetEndEffectorPosition();
+			Vector3 seed = GetCurrentWorldEndEffectorPosition();
 			Vector3[] targets = new Vector3[]
 			{
-				seed + new Vector3(0.04f, 0.00f, 0.00f),
-				seed + new Vector3(-0.04f, 0.00f, 0.00f),
-				seed + new Vector3(0.00f, 0.04f, 0.00f),
-				seed + new Vector3(0.00f, -0.04f, 0.00f),
-				seed + new Vector3(0.00f, 0.00f, 0.04f),
-				seed + new Vector3(0.00f, 0.00f, -0.04f),
 				seed + new Vector3(0.03f, 0.02f, -0.02f),
-				seed + new Vector3(-0.03f, 0.02f, 0.02f)
+				seed + new Vector3(-0.03f, 0.02f, 0.02f),
+				seed + new Vector3(0.02f, -0.02f, 0.02f)
 			};
 
 			int passed = 0;
@@ -384,11 +597,16 @@ namespace RobotSimulation
 			for (int i = 0; i < targets.Length; i++)
 			{
 				bool done = false;
-				bool success = false;
-
-				MoveToPositionAsync(targets[i], result =>
+				ArmMoveResult result = null;
+				MoveToWorldPositionAndWait(new ArmMoveRequest
 				{
-					success = result;
+					worldPosition = targets[i],
+					positionToleranceMeters = tolerance,
+					stableFixedFrames = 3,
+					timeoutSeconds = 4f
+				}, moveResult =>
+				{
+					result = moveResult;
 					done = true;
 				});
 
@@ -397,16 +615,17 @@ namespace RobotSimulation
 					yield return null;
 				}
 
-				if (success)
+				if (result != null && result.success)
 				{
 					passed++;
 				}
 
-				worstError = Mathf.Max(worstError, _lastSolveError);
-				Debug.Log($"[Arm6DOF IK][Regression] Case {i + 1}/{targets.Length}: success={success}, error={_lastSolveError:F4}m, target=({targets[i].x:F3},{targets[i].y:F3},{targets[i].z:F3})");
+				float caseError = result != null ? result.finalPositionError : float.MaxValue;
+				worstError = Mathf.Max(worstError, caseError);
+				Debug.Log($"[Arm6DOF IK][Regression] Case {i + 1}/{targets.Length}: success={result?.success}, error={caseError:F4}m");
 			}
 
-			string summary = $"IK regression finished: {passed}/{targets.Length} passed, worstError={worstError:F4}m, tolerance={tolerance:F4}m";
+			string summary = $"IK regression finished: {passed}/{targets.Length} passed, worstError={worstError:F4}m";
 			if (passed == targets.Length)
 			{
 				Debug.Log($"[Arm6DOF IK][Regression] {summary}");
@@ -419,23 +638,6 @@ namespace RobotSimulation
 			onComplete?.Invoke(summary);
 		}
 
-		private IEnumerator MoveToPositionCoroutine(Vector3 targetPos, Quaternion targetRot, bool withRotation, System.Action<bool> onComplete)
-		{
-			bool accepted = MoveToPosition(targetPos, targetRot, withRotation);
-			if (!accepted)
-			{
-				onComplete?.Invoke(false);
-				yield break;
-			}
-
-			while (_isSolving)
-			{
-				yield return null;
-			}
-
-			onComplete?.Invoke(_lastSolveSuccess);
-		}
-
 		private void RefreshReferences()
 		{
 			if (armController == null)
@@ -443,27 +645,48 @@ namespace RobotSimulation
 				armController = Arm6DOFFKController.Instance;
 			}
 
-			if (armController == null) return;
-
-			if (_joints == null || _joints.Length < 6)
+			if (armController == null)
 			{
-				_joints = armController.joints;
+				armController = FindObjectOfType<Arm6DOFFKController>();
+			}
+		}
+
+		private void RefreshCollisionMonitor()
+		{
+			if (_collisionMonitor == null)
+			{
+				_collisionMonitor = ArmCollisionMonitor.Instance;
 			}
 
-			if (_jointTransforms == null || _jointTransforms.Length < 6)
+			if (_collisionMonitor == null)
 			{
-				_jointTransforms = armController.jointTransforms;
+				_collisionMonitor = FindObjectOfType<ArmCollisionMonitor>();
+			}
+		}
+
+		private void StopSolveRoutine()
+		{
+			if (_solveRoutine != null)
+			{
+				StopCoroutine(_solveRoutine);
+				_solveRoutine = null;
 			}
 
-			if (_jointLimits == null || _jointLimits.Length < 6)
+			_isSolving = false;
+		}
+
+		private void StopActiveCoroutines()
+		{
+			StopSolveRoutine();
+
+			if (_moveWaitRoutine != null)
 			{
-				_jointLimits = armController.jointLimits;
+				StopCoroutine(_moveWaitRoutine);
+				_moveWaitRoutine = null;
 			}
 
-			if (_endEffector == null)
-			{
-				_endEffector = armController.endEffector;
-			}
+			_isSolving = false;
+			_isMoveInProgress = false;
 		}
 	}
 }

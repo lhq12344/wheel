@@ -3,6 +3,13 @@ using System.Collections.Generic;
 
 public class OneJointTrapezoidController : MonoBehaviour
 {
+	enum JointResolveStatus
+	{
+		Resolved,
+		NoDofFound,
+		AmbiguousChildren
+	}
+
 	public ArticulationBody joint;
 	[Header("Auto-Bind")]
 	public string expectedJointName = "";
@@ -10,6 +17,10 @@ public class OneJointTrapezoidController : MonoBehaviour
 	[Header("Goal")]
 	public float goalDeg = 0f;
 	public float stopToleranceDeg = 0.1f;
+	public bool syncGoalToCurrentOnAwake = true;
+	public float goalChangeReplanThresholdDeg = 0.25f;
+	public bool preserveVelocityOnSameDirectionRetarget = true;
+	public float hardRetargetResetThresholdDeg = 12f;
 
 	[Header("Limits")]
 	public float vMaxDeg = 60f;
@@ -24,18 +35,30 @@ public class OneJointTrapezoidController : MonoBehaviour
 	private float qCmdDeg;
 	private float vCmdDeg;
 	private float lastGoalDeg;
+	private JointResolveStatus _resolveStatus = JointResolveStatus.Resolved;
 
 	void Awake()
 	{
 		joint = ResolveJointWithDof(joint);
 		if (joint == null)
 		{
-			Debug.LogError("[OneJointTrapezoidController] No ArticulationBody with DOF found. Assign a revolute joint body to 'joint'.");
+			if (_resolveStatus == JointResolveStatus.AmbiguousChildren)
+			{
+				Debug.LogWarning($"[OneJointTrapezoidController] Disabled '{gameObject.name}' because it is attached above multiple DOF child joints and no explicit binding was provided.");
+			}
+			else
+			{
+				Debug.LogWarning("[OneJointTrapezoidController] No ArticulationBody with DOF found. Disabling this controller.");
+			}
 			enabled = false;
 			return;
 		}
 
 		qCmdDeg = joint.jointPosition[0] * Mathf.Rad2Deg;
+		if (syncGoalToCurrentOnAwake)
+		{
+			goalDeg = qCmdDeg;
+		}
 		lastGoalDeg = goalDeg;
 
 		var d = joint.xDrive;
@@ -56,8 +79,15 @@ public class OneJointTrapezoidController : MonoBehaviour
 		// If target changes at runtime/Inspector, restart profile from measured state.
 		if (!Mathf.Approximately(lastGoalDeg, goalDeg))
 		{
+			float newErrorDeg = goalDeg - qActDeg;
+			bool reversingDirection = Mathf.Abs(vCmdDeg) > 0.01f && Mathf.Sign(newErrorDeg) != Mathf.Sign(vCmdDeg);
 			qCmdDeg = qActDeg;
-			vCmdDeg = 0f;
+			if (!preserveVelocityOnSameDirectionRetarget
+				|| reversingDirection
+				|| Mathf.Abs(goalDeg - lastGoalDeg) >= Mathf.Max(goalChangeReplanThresholdDeg, hardRetargetResetThresholdDeg))
+			{
+				vCmdDeg = 0f;
+			}
 			lastGoalDeg = goalDeg;
 			joint.WakeUp();
 		}
@@ -108,6 +138,8 @@ public class OneJointTrapezoidController : MonoBehaviour
 
 	ArticulationBody ResolveJointWithDof(ArticulationBody preferred)
 	{
+		_resolveStatus = JointResolveStatus.Resolved;
+
 		if (HasDof(preferred)) return preferred;
 
 		ArticulationBody self = GetComponent<ArticulationBody>();
@@ -173,9 +205,12 @@ public class OneJointTrapezoidController : MonoBehaviour
 				candidateNames += i == 0 ? candidates[i].name : ", " + candidates[i].name;
 			}
 
-			Debug.LogError($"[OneJointTrapezoidController] Ambiguous auto-bind on '{gameObject.name}'. Found {candidates.Count} DOF joints under this object: {candidateNames}. Assign 'joint' or set 'expectedJointName' (e.g. Link_05).");
+			_resolveStatus = JointResolveStatus.AmbiguousChildren;
+			Debug.LogWarning($"[OneJointTrapezoidController] Ambiguous auto-bind on '{gameObject.name}'. Found {candidates.Count} DOF joints under this object: {candidateNames}. This controller will be disabled unless an explicit joint or expectedJointName is assigned.");
+			return null;
 		}
 
+		_resolveStatus = JointResolveStatus.NoDofFound;
 		return null;
 	}
 

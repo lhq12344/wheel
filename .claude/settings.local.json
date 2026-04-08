@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add .gitignore Assets/ ProjectSettings/ Packages/ .vsconfig wheel.sln Assembly-CSharp.csproj)",
+      "Bash(git add -f Assets/ ProjectSettings/ Packages/ .vsconfig wheel.sln Assembly-CSharp.csproj .gitignore)",
+      "Bash(git add -f UIElementsSchema/)",
+      "Bash(git commit:*)",
+      "Bash(git push -u origin main)"
+    ]
+  }
+}
