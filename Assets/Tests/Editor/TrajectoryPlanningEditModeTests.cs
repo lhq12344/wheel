@@ -72,5 +72,44 @@ namespace RobotSimulation.Tests.Editor
 				Object.DestroyImmediate(obstacle);
 			}
 		}
+
+		[Test]
+		public void BasePoseBoxCollisionQuery_DetectsBlockingObstacle()
+		{
+			GameObject obstacle = GameObject.CreatePrimitive(PrimitiveType.Cube);
+			obstacle.name = "BoxFilterObstacle";
+			obstacle.transform.position = Vector3.zero;
+			obstacle.transform.localScale = new Vector3(1.5f, 1f, 1.5f);
+
+			try
+			{
+				PlannerPhysicsQueries physicsQueries = new PlannerPhysicsQueries
+				{
+					baseHalfHeight = 0.5f
+				};
+				List<Collider> obstacles = physicsQueries.CollectObstacleColliders(null);
+
+				bool blockedAtOrigin = physicsQueries.IsBasePoseCheckBoxCollisionFree(
+					Vector3.zero,
+					Quaternion.identity,
+					new Vector3(0.45f, 0.5f, 0.45f),
+					obstacles,
+					out Collider hitCollider);
+				bool clearAwayFromObstacle = physicsQueries.IsBasePoseCheckBoxCollisionFree(
+					new Vector3(3f, 0f, 3f),
+					Quaternion.identity,
+					new Vector3(0.45f, 0.5f, 0.45f),
+					obstacles,
+					out _);
+
+				Assert.IsFalse(blockedAtOrigin, "The overlap-box query should detect the blocking obstacle at the origin.");
+				Assert.IsNotNull(hitCollider, "The blocking collider should be reported.");
+				Assert.IsTrue(clearAwayFromObstacle, "A distant base pose should remain collision-free.");
+			}
+			finally
+			{
+				Object.DestroyImmediate(obstacle);
+			}
+		}
 	}
 }

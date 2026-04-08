@@ -1,6 +1,8 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
+using System.Globalization;
 using UnityEngine;
+using UnityEngine.AI;
 
 namespace RobotSimulation
 {
@@ -28,11 +30,15 @@ namespace RobotSimulation
 	{
 		private const float DefaultWorkspaceInnerRadiusMeters = 0.24338f;
 		private const float DefaultWorkspaceOuterRadiusMeters = 0.8066f;
+		private const float DefaultAnnularSamplingInnerRadiusMeters = 0f;
+		private const float DefaultAnnularSamplingOuterRadiusMeters = 0f;
+		private const string AnnularSamplingLabel = "AnnularRandomSampling";
 		private const float BasePositionToleranceMeters = 0.02f;
 		private const float LoosePrecheckToleranceMeters = 0.05f;
 		private const float LoosePrecheckHardSingularityThreshold = 140f;
 		private const float LoosePrecheckSoftSingularityThreshold = 70f;
 		private const float DockingGeometryRadiusConsistencyToleranceMeters = 0.035f;
+		private const float DockingHardWorkspaceShellToleranceMeters = 0.01f;
 		private const float DockingPreferredRadiusMarginMeters = 0.015f;
 
 		private static readonly float[] SectorHalfAnglesDeg = { 25f, 45f, 70f, 180f };
@@ -43,30 +49,55 @@ namespace RobotSimulation
 			"ExpandedSectorSearch70",
 			"FallbackFullRingSearch"
 		};
+		private static readonly Vector2[] ResidualDescentDirections =
+		{
+			new Vector2(1f, 0f),
+			new Vector2(-1f, 0f),
+			new Vector2(0f, 1f),
+			new Vector2(0f, -1f),
+			new Vector2(1f, 1f),
+			new Vector2(1f, -1f),
+			new Vector2(-1f, 1f),
+			new Vector2(-1f, -1f)
+		};
 
 		private const string FailureCategoryNone = "none";
 		private const string FailureCategoryNoCollisionFreeBasePose = "NoCollisionFreeBasePose";
 		private const string FailureCategoryNoWorkspaceConsistentPose = "NoWorkspaceConsistentPose";
 		private const string FailureCategoryNoLooseIkPose = "NoLooseIkPose";
 		private const string FailureCategoryNoPathReachablePose = "NoPathReachablePose";
+		private const string FailureCategoryNoFineCandidateAfterRefinement = "NoFineCandidateAfterRefinement";
 
 		internal sealed class DockingCandidate
 		{
 			public Vector3 baseWorldPosition;
 			public float baseYawDeg;
 			public float targetAngleRad;
+			public float targetBearingLocalDeg;
 			public float radius;
+			public float sampledRadiusMeters;
 			public float shellMargin;
 			public float preferredBandPenalty;
 			public float workspaceBandPenalty;
 			public float travelDistance;
+			public float planarTargetDistanceMeters;
+			public float ikResidualMeters;
+			public float distanceBandPenaltyMeters;
+			public int descentIteration;
+			public string searchSource;
 			public float clearance;
 			public float heuristicCost;
+			public float manipulabilityIndex;
+			public float looseIkResidualMeters;
+			public float looseIkSingularityPenalty;
+			public float minJointLimitMarginDeg;
+			public float jointLimitPenalty;
 			public Vector3 futureArmBasePosition;
 			public Vector3 targetInFutureArmBase;
 			public float targetDistanceInFutureArmBase;
 			public Vector3 futureArmBaseEulerAngles;
 			public string sectorLabel;
+			public string sampledRadiusBand;
 			public string radiusBand;
 			public string evaluationStageSummary;
 		}
@@ -82,6 +113,7 @@ namespace RobotSimulation
 			internal Vector3 currentBasePosition;
 			internal float currentBaseYaw;
 			internal float baseRadius;
+			internal Vector3 baseCollisionBoxHalfExtents;
 			internal float minReach;
 			internal float maxReach;
 			internal float preferredMin;
@@ -90,9 +122,35 @@ namespace RobotSimulation
 			internal Quaternion armBaseLocalRotation;
 			internal Vector3 primarySectorDirection;
 			internal int sectorStage;
+			internal string samplingLabel;
 			internal float[] startAngles;
 			internal List<DockingCandidate> coarseCandidates;
 			internal List<DockingCandidate> fineCandidates;
+		}
+
+		public sealed class DockingDebugSample
+		{
+			public Vector3 baseWorldPosition;
+			public Vector3 targetWorldPosition;
+			public bool ikFailed;
+			public bool strictPreviewFailed;
+			public bool selected;
+			public string reason = string.Empty;
+		}
+
+		private sealed class DockingCandidateBuildStats
+		{
+			public int sampledCount;
+			public int geometryRejectedCount;
+			public int navMeshRejectedCount;
+			public int boxRejectedCount;
+			public int collisionRejectedCount;
+			public int acceptedCount;
+
+			public string ToDebugString()
+			{
+				return $"sampled={sampledCount}, accepted={acceptedCount}, geometryRejected={geometryRejectedCount}, navMeshRejected={navMeshRejectedCount}, boxRejected={boxRejectedCount}, collisionRejected={collisionRejectedCount}";
+			}
 		}
 
 		private sealed class DockingFailureSummary
@@ -110,6 +168,23 @@ namespace RobotSimulation
 			public string failureCategory = FailureCategoryNone;
 		}
 
+		private sealed class ResidualDescentSample
+		{
+			public Vector3 baseWorldPosition;
+			public float baseYawDeg;
+			public bool collisionBlocked;
+			public bool geometryValid;
+			public bool ikConverged;
+			public float ikResidualMeters = float.PositiveInfinity;
+			public float planarTargetDistanceMeters = float.PositiveInfinity;
+			public float distanceBandPenaltyMeters = float.PositiveInfinity;
+			public float moveDistanceMeters = float.PositiveInfinity;
+			public string failureReason = string.Empty;
+			public string searchSource = string.Empty;
+			public int descentIteration = -1;
+			public DockingCandidate candidate;
+		}
+
 		private readonly BaseRrtStarPlanner _basePlanner = new BaseRrtStarPlanner();
 		private readonly SceneDistanceFieldSampler _distanceFieldSampler = new SceneDistanceFieldSampler();
 		private readonly ArmMotionPlanner _armMotionPlanner = new ArmMotionPlanner();
@@ -118,19 +193,44 @@ namespace RobotSimulation
 		private int _cachedArmBaseTransformId;
 		private Vector3 _cachedArmBaseLocalPosition;
 		private Quaternion _cachedArmBaseLocalRotation = Quaternion.identity;
+		private bool _hasDockingSamplingDebugInfo;
+		private Vector3 _lastDockingTargetWorldPosition;
+		private float _lastDockingSamplingInnerRadiusMeters;
+		private float _lastDockingSamplingOuterRadiusMeters;
+		private readonly List<DockingDebugSample> _lastDockingDebugSamples = new List<DockingDebugSample>();
 
-		public int dockingAngularSamples = 24;
-		public int preferredBandRadiusSamples = 4;
-		public int fallbackBandRadiusSamples = 3;
-		public int coarseAngularSamples = 12;
-		public int coarsePreferredBandRadiusSamples = 3;
-		public int coarseFallbackBandRadiusSamples = 2;
+		public int dockingAngularSamples = 60;
+		public int preferredBandRadiusSamples = 7;
+		public int fallbackBandRadiusSamples = 5;
+		public int coarseAngularSamples = 72;
+		public int coarsePreferredBandRadiusSamples = 7;
+		public int coarseFallbackBandRadiusSamples = 4;
 		public int coarseSeedKeepCount = 12;
 		public float[] fineRadiusOffsetsMeters = { -0.06f, -0.03f, 0f, 0.03f, 0.06f };
 		public float[] fineAngleOffsetsDeg = { -12f, -6f, 0f, 6f, 12f };
+		public float[] coarseTargetBearingOffsetsDeg = { 0f, -35f, 35f, -70f, 70f };
+		public float[] fineTargetBearingOffsetsDeg = { 0f, -15f, 15f };
 		public int maxFineCandidateEvaluations = 48;
 		public float dockingDistanceFieldResolution = 0.35f;
 		public float dockingPlanningMargin = 3.5f;
+		public float annularSamplingInnerRadiusMeters = DefaultAnnularSamplingInnerRadiusMeters;
+		public float annularSamplingOuterRadiusMeters = DefaultAnnularSamplingOuterRadiusMeters;
+		public float annularSamplingWorkspaceMarginMeters = 0.02f;
+		public int annularRandomSampleCount = 128;
+		public int annularAnchorSampleCount = 12;
+		public int dockingDebugSampleLimit = 128;
+		public float residualDescentCoarseStepMeters = 0.10f;
+		public float residualDescentFineStepMeters = 0.02f;
+		public float residualDescentAcceptResidualFloorMeters = 0.05f;
+		public int residualDescentMaxCoarseIterations = 8;
+		public int residualDescentMaxFineIterations = 16;
+		public bool enableNavMeshPoseFilter = true;
+		public float navMeshSampleMaxDistanceMeters = 1.0f;
+		public int navMeshAreaMask = NavMesh.AllAreas;
+		public bool enableStaticBoxCollisionFilter = true;
+		public float baseCollisionBoxPaddingMeters = 0.02f;
+		public float jointLimitHardMarginDeg = 8f;
+		public float jointLimitSoftMarginDeg = 18f;
 		public bool allowProvisionalDockingWhenIkSoftFails = true;
 		public int provisionalDockingPathCheckBudget = 6;
 
@@ -143,6 +243,44 @@ namespace RobotSimulation
 			_basePlanner.settings.goalBias = 0.25f;
 			_armMotionPlanner.settings.toleranceMeters = 0.02f;
 			_armMotionPlanner.settings.maxIterations = 180;
+		}
+
+		public bool TryGetLastDockingSamplingDebugInfo(out Vector3 targetWorldPosition, out float innerRadiusMeters, out float outerRadiusMeters)
+		{
+			targetWorldPosition = _lastDockingTargetWorldPosition;
+			innerRadiusMeters = _lastDockingSamplingInnerRadiusMeters;
+			outerRadiusMeters = _lastDockingSamplingOuterRadiusMeters;
+			return _hasDockingSamplingDebugInfo;
+		}
+
+		public int CopyLastDockingDebugSamples(List<DockingDebugSample> destination)
+		{
+			if (destination == null)
+			{
+				return 0;
+			}
+
+			destination.Clear();
+			for (int i = 0; i < _lastDockingDebugSamples.Count; i++)
+			{
+				DockingDebugSample sample = _lastDockingDebugSamples[i];
+				if (sample == null)
+				{
+					continue;
+				}
+
+				destination.Add(new DockingDebugSample
+				{
+					baseWorldPosition = sample.baseWorldPosition,
+					targetWorldPosition = sample.targetWorldPosition,
+					ikFailed = sample.ikFailed,
+					strictPreviewFailed = sample.strictPreviewFailed,
+					selected = sample.selected,
+					reason = sample.reason
+				});
+			}
+
+			return destination.Count;
 		}
 
 		public CoordinatedTaskResolution EvaluateCurrentBaseExecution(
@@ -178,10 +316,15 @@ namespace RobotSimulation
 				return resolution;
 			}
 
-			if (TryEvaluateArmFeasibilityAtBasePoseLoose(
+			LogCurrentBaseFrameConsistency(
 				diffDriveController.rb.transform,
 				diffDriveController.rb.position,
 				diffDriveController.rb.rotation,
+				armController,
+				request.armTargetWorldPosition,
+				request != null ? request.eePositionToleranceMeters : -1f);
+
+			if (TryEvaluateArmFeasibilityAtLiveBaseLoose(
 				armController,
 				request.armTargetWorldPosition,
 				out float[] solvedAngles,
@@ -197,11 +340,28 @@ namespace RobotSimulation
 				resolution.baseMoveRequired = false;
 				resolution.hasPreferredArmSolveSeed = solvedAngles != null && solvedAngles.Length >= 6;
 				resolution.preferredArmSolveSeedAnglesDeg = CloneAngles(solvedAngles);
-				Debug.Log($"[CoordinatedTaskPlanner] LooseReachabilityAccepted: residual={residualMeters:F4}m, singularityPenalty={singularityPenalty:F2}");
+				Debug.Log($"[CoordinatedTaskPlanner] LooseReachabilityAccepted(live-base): residual={residualMeters:F4}m, singularityPenalty={singularityPenalty:F2}");
 				resolution.dockingSummary = L(
 					"当前底盘位姿已经支持所请求的末端世界目标，因此无需移动底盘。",
 					"Current base pose already supports the requested end-effector world target, so no base move is required.");
 				return resolution;
+			}
+
+			bool projectedAccepted = TryEvaluateArmFeasibilityAtBasePoseLoose(
+				diffDriveController.rb.transform,
+				diffDriveController.rb.position,
+				diffDriveController.rb.rotation,
+				armController,
+				request.armTargetWorldPosition,
+				out _,
+				out float projectedResidualMeters,
+				out float projectedSingularityPenalty,
+				out string projectedFailureReason,
+				request != null ? request.eePositionToleranceMeters : -1f);
+			if (projectedAccepted || !string.Equals(projectedFailureReason, currentBaseFailure, StringComparison.Ordinal))
+			{
+				Debug.LogWarning(
+					$"[CoordinatedTaskPlanner] CurrentBaseReachability divergence: liveAccepted=false, projectedAccepted={projectedAccepted}, liveFailure='{currentBaseFailure}', projectedFailure='{projectedFailureReason}', projectedResidual={projectedResidualMeters:F4}m, projectedSingularity={projectedSingularityPenalty:F2}");
 			}
 
 			resolution.armReachableFromCurrentBase = false;
@@ -225,6 +385,7 @@ namespace RobotSimulation
 		{
 			context = null;
 			resolution = CreateDefaultResolution(diffDriveController);
+			ClearDockingDebugSamples();
 			if (diffDriveController == null || diffDriveController.rb == null)
 			{
 				resolution.failureReason = L("差速底盘控制器缺失。", "DiffDrive controller is missing.");
@@ -253,11 +414,21 @@ namespace RobotSimulation
 
 			Transform baseRoot = diffDriveController.rb.transform;
 			Vector3 currentBasePosition = diffDriveController.rb.position;
+			float currentBaseYaw = diffDriveController.rb.rotation.eulerAngles.y;
 			float minReach = armController.GetMinReach() > 0f ? armController.GetMinReach() : DefaultWorkspaceInnerRadiusMeters;
 			float maxReach = armController.GetMaxReach() > 0f ? armController.GetMaxReach() : DefaultWorkspaceOuterRadiusMeters;
-			float preferredMin = Mathf.Clamp(maxReach * 0.4f, minReach + 0.01f, maxReach);
-			float preferredMax = Mathf.Clamp(maxReach * 0.8f, preferredMin, maxReach);
+			Vector3 liveTargetInCurrentArmBase = armController.WorldToBasePosition(request.armTargetWorldPosition);
+			float liveTargetDistanceInCurrentArmBase = liveTargetInCurrentArmBase.magnitude;
+			ResolvePreferredAnnularBand(minReach, maxReach, liveTargetDistanceInCurrentArmBase, out float preferredMin, out float preferredMax);
+			Debug.Log($"[CoordinatedTaskPlanner] Docking search radius anchor: liveTargetInCurrentArmBase={liveTargetInCurrentArmBase}, liveRadius={liveTargetDistanceInCurrentArmBase:F4}, preferredBand=[{preferredMin:F4}, {preferredMax:F4}]");
+			CacheDockingSamplingDebugInfo(request.armTargetWorldPosition, preferredMin, preferredMax);
+			bool navMeshFilterActive = ShouldUseNavMeshPoseFilter(currentBasePosition);
 			float[] startAngles = armController.CaptureMeasuredJointAngles();
+			Vector3 baseCollisionBoxHalfExtents = physicsQueries != null
+				? physicsQueries.EstimateBaseCollisionBoxHalfExtents(diffDriveController)
+				: new Vector3(baseRadius, 0.35f, baseRadius);
+			baseCollisionBoxHalfExtents.x += Mathf.Max(0f, baseCollisionBoxPaddingMeters);
+			baseCollisionBoxHalfExtents.z += Mathf.Max(0f, baseCollisionBoxPaddingMeters);
 			if (!TryGetCachedArmBaseLocalOffset(baseRoot, armController, out Vector3 armBaseLocalPosition, out Quaternion armBaseLocalRotation))
 			{
 				resolution.failureReason = L("无法解析机械臂相对底盘的安装偏移。", "Could not resolve the arm mounting offset relative to the base.");
@@ -278,10 +449,17 @@ namespace RobotSimulation
 				maxReach,
 				preferredMin,
 				preferredMax,
+				request.eePositionToleranceMeters,
+				liveTargetDistanceInCurrentArmBase,
 				baseRadius,
+				currentBaseYaw,
+				baseCollisionBoxHalfExtents,
 				physicsQueries,
 				obstacles,
 				primarySectorDirection,
+				navMeshFilterActive,
+				out DockingCandidateBuildStats coarseBuildStats,
+				out string coarseSamplingLabel,
 				out int selectedSectorStage,
 				out int preferredBandConsistentCount);
 
@@ -291,7 +469,7 @@ namespace RobotSimulation
 				resolution.dockingFailureCategory = FailureCategoryNoCollisionFreeBasePose;
 				Collider blockedCurrentPose = null;
 				bool currentPoseCollisionFree = physicsQueries != null && physicsQueries.IsBasePoseCollisionFree(currentBasePosition, baseRadius, obstacles, out blockedCurrentPose);
-				Debug.LogWarning($"[CoordinatedTaskPlanner] Docking coarse search found zero collision-free candidates. baseRadius={baseRadius:F3}, currentPoseCollisionFree={currentPoseCollisionFree}, blockedCurrentPose={(blockedCurrentPose != null ? blockedCurrentPose.name : "none")}, obstacleCount={(obstacles != null ? obstacles.Count : 0)}, sector={SectorLabels[Mathf.Clamp(selectedSectorStage, 0, SectorLabels.Length - 1)]}, primarySectorDirection={primarySectorDirection}");
+				Debug.LogWarning($"[CoordinatedTaskPlanner] Docking coarse search found zero collision-free candidates. baseRadius={baseRadius:F3}, baseFootprintHalfExtents={baseCollisionBoxHalfExtents}, currentPoseCollisionFree={currentPoseCollisionFree}, blockedCurrentPose={(blockedCurrentPose != null ? blockedCurrentPose.name : "none")}, obstacleCount={(obstacles != null ? obstacles.Count : 0)}, sampling={coarseSamplingLabel}, primaryDirection={primarySectorDirection}, navMeshFilterActive={navMeshFilterActive}, staticBoxFilterActive={enableStaticBoxCollisionFilter}, stats={(coarseBuildStats != null ? coarseBuildStats.ToDebugString() : "none")}");
 				resolution.failureReason = L(
 					"Zu5 停靠搜索环带内没有找到无碰撞的底盘停靠位。",
 					"No collision-free base parking pose exists inside the Zu5 docking search ring.");
@@ -312,8 +490,10 @@ namespace RobotSimulation
 				preferredMin,
 				preferredMax,
 				baseRadius,
+				baseCollisionBoxHalfExtents,
 				physicsQueries,
 				obstacles,
+				navMeshFilterActive,
 				coarseSeeds);
 
 			context = new DockingSearchContext
@@ -327,6 +507,7 @@ namespace RobotSimulation
 				currentBasePosition = currentBasePosition,
 				currentBaseYaw = diffDriveController.rb.rotation.eulerAngles.y,
 				baseRadius = baseRadius,
+				baseCollisionBoxHalfExtents = baseCollisionBoxHalfExtents,
 				minReach = minReach,
 				maxReach = maxReach,
 				preferredMin = preferredMin,
@@ -335,6 +516,7 @@ namespace RobotSimulation
 				armBaseLocalRotation = armBaseLocalRotation,
 				primarySectorDirection = primarySectorDirection,
 				sectorStage = selectedSectorStage,
+				samplingLabel = coarseSamplingLabel,
 				startAngles = CloneAngles(startAngles),
 				coarseCandidates = coarseCandidates,
 				fineCandidates = fineCandidates
@@ -344,7 +526,7 @@ namespace RobotSimulation
 			resolution.dockingFailureCategory = FailureCategoryNone;
 			resolution.dockingSummary = L(
 				$"停靠位粗筛保留了 {fineCandidates.Count} 个精筛候选（原始无碰撞候选 {coarseCandidates.Count} 个）。",
-				$"Docking search found {coarseCandidates.Count} coarse candidates in {SectorLabels[Mathf.Clamp(selectedSectorStage, 0, SectorLabels.Length - 1)]}; {preferredBandConsistentCount} remained inside the preferred band under the real arm-base frame, and {fineCandidates.Count} advanced to fine screening.");
+				$"Docking search found {coarseCandidates.Count} coarse candidates in {coarseSamplingLabel}; {preferredBandConsistentCount} remained inside the preferred band under the real arm-base frame, and {fineCandidates.Count} advanced to fine screening.");
 			return true;
 		}
 
@@ -378,6 +560,17 @@ namespace RobotSimulation
 			int provisionalPathChecksUsed = 0;
 
 			List<DockingCandidate> fineCandidates = context.fineCandidates ?? new List<DockingCandidate>();
+			if (fineCandidates.Count <= 0)
+			{
+				resolution.dockingFailureCategory = FailureCategoryNoFineCandidateAfterRefinement;
+				resolution.failureReason = L(
+					$"停靠位粗筛已找到 {resolution.coarseCandidateCount} 个候选，但精筛局部细化后没有保留下任何可评估候选。",
+					$"Docking coarse search found {resolution.coarseCandidateCount} candidates, but fine-stage refinement did not preserve any evaluable candidate.");
+				resolution.dockingSummary = resolution.failureReason;
+				Debug.LogWarning($"[CoordinatedTaskPlanner] Docking fine refinement produced zero candidates. sampling={context.samplingLabel ?? AnnularSamplingLabel}, coarse={resolution.coarseCandidateCount}, fine={resolution.fineCandidateCount}");
+				return false;
+			}
+
 			int evaluationBudget = Mathf.Min(fineCandidates.Count, Mathf.Max(1, maxFineCandidateEvaluations));
 			for (int i = 0; i < evaluationBudget; i++)
 			{
@@ -419,13 +612,13 @@ namespace RobotSimulation
 					resolution.dockingSummary = L(
 						$"停靠位精筛未直接获得稳定机械臂解（{bestProvisionalReason}），将先执行保守停靠位 ({bestProvisionalCandidate.baseWorldPosition.x:F2}, {bestProvisionalCandidate.baseWorldPosition.y:F2}, {bestProvisionalCandidate.baseWorldPosition.z:F2})。粗筛 {resolution.coarseCandidateCount} 个，精筛 {resolution.fineCandidateCount} 个，IK {resolution.ikSolveCount} 次，路径检查 {resolution.basePathCheckCount} 次。",
 						$"Docking fine search did not find a strict arm-ready pose ({bestProvisionalReason}), so execution will first move to a conservative docking pose ({bestProvisionalCandidate.baseWorldPosition.x:F2}, {bestProvisionalCandidate.baseWorldPosition.y:F2}, {bestProvisionalCandidate.baseWorldPosition.z:F2}) from {bestProvisionalCandidate.sectorLabel}. targetInFutureArmBase={bestProvisionalCandidate.targetInFutureArmBase}, |target|={bestProvisionalCandidate.targetDistanceInFutureArmBase:F4}. Coarse={resolution.coarseCandidateCount}, fine={resolution.fineCandidateCount}, IK={resolution.ikSolveCount}, path checks={resolution.basePathCheckCount}.");
-					Debug.Log($"[CoordinatedTaskPlanner] Docking summary: sector={bestProvisionalCandidate.sectorLabel}, coarse={resolution.coarseCandidateCount}, fine={resolution.fineCandidateCount}, preferredConsistent={failureSummary.preferredBandConsistentCount}, ik={resolution.ikSolveCount}, pathChecks={resolution.basePathCheckCount}, foundProvisional=true, targetInFutureArmBase={bestProvisionalCandidate.targetInFutureArmBase}, targetDistance={bestProvisionalCandidate.targetDistanceInFutureArmBase:F4}");
+					Debug.Log($"[CoordinatedTaskPlanner] Docking summary: sampling={bestProvisionalCandidate.sectorLabel}, coarse={resolution.coarseCandidateCount}, fine={resolution.fineCandidateCount}, preferredConsistent={failureSummary.preferredBandConsistentCount}, ik={resolution.ikSolveCount}, pathChecks={resolution.basePathCheckCount}, foundProvisional=true, targetInFutureArmBase={bestProvisionalCandidate.targetInFutureArmBase}, targetDistance={bestProvisionalCandidate.targetDistanceInFutureArmBase:F4}");
 					return true;
 				}
 
 				resolution.failureReason = BuildDockingFailureReasonV3(failureSummary);
 				resolution.dockingSummary = resolution.failureReason;
-				Debug.Log($"[CoordinatedTaskPlanner] Docking summary: sector={SectorLabels[Mathf.Clamp(context.sectorStage, 0, SectorLabels.Length - 1)]}, coarse={resolution.coarseCandidateCount}, fine={resolution.fineCandidateCount}, preferredConsistent={failureSummary.preferredBandConsistentCount}, ik={resolution.ikSolveCount}, pathChecks={resolution.basePathCheckCount}, found=false, category={resolution.dockingFailureCategory}");
+				Debug.Log($"[CoordinatedTaskPlanner] Docking summary: sampling={context.samplingLabel ?? AnnularSamplingLabel}, coarse={resolution.coarseCandidateCount}, fine={resolution.fineCandidateCount}, preferredConsistent={failureSummary.preferredBandConsistentCount}, ik={resolution.ikSolveCount}, pathChecks={resolution.basePathCheckCount}, found=false, category={resolution.dockingFailureCategory}");
 				return false;
 			}
 
@@ -441,7 +634,7 @@ namespace RobotSimulation
 			resolution.dockingSummary = L(
 				$"已解析到底盘停靠位 ({bestCandidate.baseWorldPosition.x:F2}, {bestCandidate.baseWorldPosition.y:F2}, {bestCandidate.baseWorldPosition.z:F2})，朝向 {bestCandidate.baseYawDeg:F1}°。粗筛 {resolution.coarseCandidateCount} 个，精筛 {resolution.fineCandidateCount} 个，IK {resolution.ikSolveCount} 次，路径检查 {resolution.basePathCheckCount} 次。",
 				$"Resolved base stop at ({bestCandidate.baseWorldPosition.x:F2}, {bestCandidate.baseWorldPosition.y:F2}, {bestCandidate.baseWorldPosition.z:F2}) with yaw {bestCandidate.baseYawDeg:F1}deg from {bestCandidate.sectorLabel}. targetInFutureArmBase={bestCandidate.targetInFutureArmBase}, |target|={bestCandidate.targetDistanceInFutureArmBase:F4}. Coarse={resolution.coarseCandidateCount}, fine={resolution.fineCandidateCount}, IK={resolution.ikSolveCount}, path checks={resolution.basePathCheckCount}.");
-			Debug.Log($"[CoordinatedTaskPlanner] Docking summary: sector={bestCandidate.sectorLabel}, coarse={resolution.coarseCandidateCount}, fine={resolution.fineCandidateCount}, preferredConsistent={failureSummary.preferredBandConsistentCount}, ik={resolution.ikSolveCount}, pathChecks={resolution.basePathCheckCount}, found=true, targetInFutureArmBase={bestCandidate.targetInFutureArmBase}, targetDistance={bestCandidate.targetDistanceInFutureArmBase:F4}");
+			Debug.Log($"[CoordinatedTaskPlanner] Docking summary: sampling={bestCandidate.sectorLabel}, coarse={resolution.coarseCandidateCount}, fine={resolution.fineCandidateCount}, preferredConsistent={failureSummary.preferredBandConsistentCount}, ik={resolution.ikSolveCount}, pathChecks={resolution.basePathCheckCount}, found=true, targetInFutureArmBase={bestCandidate.targetInFutureArmBase}, targetDistance={bestCandidate.targetDistanceInFutureArmBase:F4}");
 			return true;
 		}
 
@@ -603,20 +796,52 @@ namespace RobotSimulation
 			float maxReach,
 			float preferredMin,
 			float preferredMax,
+			float requestedEeToleranceMeters,
+			float referenceRadiusMeters,
 			float baseRadius,
+			float currentBaseYaw,
+			Vector3 baseCollisionBoxHalfExtents,
 			PlannerPhysicsQueries physicsQueries,
 			IReadOnlyList<Collider> obstacles,
 			Vector3 primarySectorDirection,
+			bool navMeshFilterActive,
+			out DockingCandidateBuildStats buildStats,
+			out string samplingLabel,
 			out int selectedSectorStage,
 			out int preferredBandConsistentCount)
 		{
-			selectedSectorStage = SectorHalfAnglesDeg.Length - 1;
+			buildStats = new DockingCandidateBuildStats();
+			samplingLabel = "MidpointResidualDescent";
+			selectedSectorStage = 0;
 			preferredBandConsistentCount = 0;
-			List<DockingCandidate> fallback = new List<DockingCandidate>();
-			for (int sectorStage = 0; sectorStage < SectorHalfAnglesDeg.Length; sectorStage++)
+			List<DockingCandidate> residualCandidates = BuildResidualDescentDockingCandidates(
+				baseRoot,
+				armController,
+				armTargetWorldPosition,
+				currentBasePosition,
+				minReach,
+				maxReach,
+				preferredMin,
+				preferredMax,
+				requestedEeToleranceMeters,
+				baseRadius,
+				obstacles,
+				buildStats,
+				currentBaseYaw,
+				out bool hitAcceptResidual,
+				out bool foundImprovement);
+			preferredBandConsistentCount = CountPreferredBandConsistent(residualCandidates, preferredMin, preferredMax);
+			if (residualCandidates.Count > 0 && (hitAcceptResidual || foundImprovement))
 			{
-				bool includeFallbackBand = sectorStage >= 2;
-				List<DockingCandidate> stageCandidates = BuildSectorSearchCandidates(
+				return residualCandidates;
+			}
+
+			Debug.LogWarning(
+				$"[CoordinatedTaskPlanner] MidpointResidualDescent exhausted without a strong improvement. residualCandidates={residualCandidates.Count}, hitAcceptResidual={hitAcceptResidual}, foundImprovement={foundImprovement}. Falling back to sector search.");
+			samplingLabel = "SectorFallback";
+			for (int sectorIndex = 0; sectorIndex < SectorLabels.Length; sectorIndex++)
+			{
+				List<DockingCandidate> sectorCandidates = BuildSectorSearchCandidates(
 					baseRoot,
 					armController,
 					armTargetWorldPosition,
@@ -627,30 +852,599 @@ namespace RobotSimulation
 					maxReach,
 					preferredMin,
 					preferredMax,
+					referenceRadiusMeters,
 					baseRadius,
+					baseCollisionBoxHalfExtents,
 					physicsQueries,
 					obstacles,
 					primarySectorDirection,
-					sectorStage,
-					includeFallbackBand,
-					true);
-				int stagePreferredCount = CountPreferredBandConsistent(stageCandidates, preferredMin, preferredMax);
-				if (stageCandidates.Count > 0)
+					sectorIndex,
+					includeFallbackBand: true,
+					navMeshFilterActive,
+					buildStats,
+					coarseSearch: true);
+				if (sectorCandidates.Count <= 0)
 				{
-					selectedSectorStage = sectorStage;
-					preferredBandConsistentCount = stagePreferredCount;
-					return stageCandidates;
+					continue;
 				}
 
-				if (fallback.Count == 0 || stagePreferredCount > preferredBandConsistentCount)
+				for (int candidateIndex = 0; candidateIndex < sectorCandidates.Count; candidateIndex++)
 				{
-					fallback = stageCandidates;
-					selectedSectorStage = sectorStage;
-					preferredBandConsistentCount = stagePreferredCount;
+					DockingCandidate candidate = sectorCandidates[candidateIndex];
+					if (candidate == null)
+					{
+						continue;
+					}
+
+					candidate.searchSource = "SectorFallback";
+					candidate.descentIteration = -1;
+				}
+
+				for (int residualIndex = 0; residualIndex < residualCandidates.Count; residualIndex++)
+				{
+					DockingCandidate residualCandidate = residualCandidates[residualIndex];
+					if (residualCandidate == null || IsNearDuplicateCandidate(sectorCandidates, residualCandidate))
+					{
+						continue;
+					}
+
+					sectorCandidates.Add(residualCandidate);
+				}
+
+				SortDockingCandidates(sectorCandidates);
+				selectedSectorStage = sectorIndex;
+				preferredBandConsistentCount = CountPreferredBandConsistent(sectorCandidates, preferredMin, preferredMax);
+				return sectorCandidates;
+			}
+
+			if (residualCandidates.Count > 0)
+			{
+				samplingLabel = "MidpointResidualDescentNoImprovement";
+				return residualCandidates;
+			}
+
+			return new List<DockingCandidate>();
+		}
+
+		private List<DockingCandidate> BuildResidualDescentDockingCandidates(
+			Transform baseRoot,
+			Arm6DOFFKController armController,
+			Vector3 armTargetWorldPosition,
+			Vector3 currentBasePosition,
+			float minReach,
+			float maxReach,
+			float preferredMin,
+			float preferredMax,
+			float requestedEeToleranceMeters,
+			float baseRadius,
+			IReadOnlyList<Collider> obstacles,
+			DockingCandidateBuildStats buildStats,
+			float currentBaseYaw,
+			out bool hitAcceptResidual,
+			out bool foundImprovement)
+		{
+			List<DockingCandidate> candidates = new List<DockingCandidate>();
+			hitAcceptResidual = false;
+			foundImprovement = false;
+
+			HashSet<Collider> obstacleLookup = BuildObstacleLookup(obstacles);
+			float acceptResidualMeters = Mathf.Max(
+				requestedEeToleranceMeters > 0f ? Mathf.Max(0.001f, requestedEeToleranceMeters) : _armMotionPlanner.settings.toleranceMeters,
+				residualDescentAcceptResidualFloorMeters);
+			Vector3 midpoint = new Vector3(
+				(currentBasePosition.x + armTargetWorldPosition.x) * 0.5f,
+				currentBasePosition.y,
+				(currentBasePosition.z + armTargetWorldPosition.z) * 0.5f);
+			ResidualDescentSample currentBaseSample = EvaluateResidualDescentSample(
+				baseRoot,
+				armController,
+				armTargetWorldPosition,
+				currentBasePosition,
+				minReach,
+				maxReach,
+				preferredMin,
+				preferredMax,
+				requestedEeToleranceMeters,
+				baseRadius,
+				obstacleLookup,
+				buildStats,
+				currentBasePosition,
+				currentBaseYaw,
+				"CurrentBaseBaseline",
+				0);
+			ResidualDescentSample midpointSample = EvaluateResidualDescentSample(
+				baseRoot,
+				armController,
+				armTargetWorldPosition,
+				currentBasePosition,
+				minReach,
+				maxReach,
+				preferredMin,
+				preferredMax,
+				requestedEeToleranceMeters,
+				baseRadius,
+				obstacleLookup,
+				buildStats,
+				midpoint,
+				currentBaseYaw,
+				"MidpointResidualDescent",
+				0);
+
+			LogResidualDescentSample("CurrentBaseBaseline", currentBaseSample);
+			LogResidualDescentSample("MidpointResidualDescent", midpointSample);
+
+			TryAddResidualDescentCandidate(candidates, currentBaseSample, false, buildStats);
+			TryAddResidualDescentCandidate(candidates, midpointSample, false, buildStats);
+
+			ResidualDescentSample globalBest = CompareResidualDescentSamples(currentBaseSample, midpointSample) <= 0
+				? currentBaseSample
+				: midpointSample;
+			ResidualDescentSample activeSample = midpointSample;
+
+			hitAcceptResidual =
+				HasResidualDescentAccepted(currentBaseSample, acceptResidualMeters) ||
+				HasResidualDescentAccepted(midpointSample, acceptResidualMeters);
+			if (hitAcceptResidual)
+			{
+				TryAddResidualDescentCandidate(candidates, globalBest, true, buildStats);
+				SortResidualDescentCandidates(candidates);
+				return candidates;
+			}
+
+			float coarseStepMeters = Mathf.Max(0.01f, residualDescentCoarseStepMeters);
+			ResidualDescentSample coarseImprovement = FindBestResidualDescentNeighbor(
+				baseRoot,
+				armController,
+				armTargetWorldPosition,
+				currentBasePosition,
+				minReach,
+				maxReach,
+				preferredMin,
+				preferredMax,
+				requestedEeToleranceMeters,
+				baseRadius,
+				obstacleLookup,
+				buildStats,
+				activeSample,
+				coarseStepMeters,
+				1);
+			if (coarseImprovement != null)
+			{
+				foundImprovement = true;
+				activeSample = coarseImprovement;
+				globalBest = CompareResidualDescentSamples(activeSample, globalBest) < 0 ? activeSample : globalBest;
+				LogAcceptedResidualNeighbor(activeSample, coarseStepMeters);
+				TryAddResidualDescentCandidate(candidates, activeSample, false, buildStats);
+				hitAcceptResidual = HasResidualDescentAccepted(activeSample, acceptResidualMeters);
+			}
+
+			if (!hitAcceptResidual)
+			{
+				float fineStepMeters = Mathf.Max(0.005f, residualDescentFineStepMeters);
+				for (int iteration = 0; iteration < Mathf.Max(1, residualDescentMaxFineIterations); iteration++)
+				{
+					ResidualDescentSample fineImprovement = FindBestResidualDescentNeighbor(
+						baseRoot,
+						armController,
+						armTargetWorldPosition,
+						currentBasePosition,
+						minReach,
+						maxReach,
+						preferredMin,
+						preferredMax,
+						requestedEeToleranceMeters,
+						baseRadius,
+						obstacleLookup,
+						buildStats,
+						activeSample,
+						fineStepMeters,
+						activeSample.descentIteration + 1);
+					if (fineImprovement == null)
+					{
+						break;
+					}
+
+					foundImprovement = true;
+					activeSample = fineImprovement;
+					globalBest = CompareResidualDescentSamples(activeSample, globalBest) < 0 ? activeSample : globalBest;
+					LogAcceptedResidualNeighbor(activeSample, fineStepMeters);
+					TryAddResidualDescentCandidate(candidates, activeSample, false, buildStats);
+					if (HasResidualDescentAccepted(activeSample, acceptResidualMeters))
+					{
+						hitAcceptResidual = true;
+						break;
+					}
 				}
 			}
 
-			return fallback;
+			TryAddResidualDescentCandidate(candidates, globalBest, true, buildStats);
+			SortResidualDescentCandidates(candidates);
+			return candidates;
+		}
+
+		private ResidualDescentSample FindBestResidualDescentNeighbor(
+			Transform baseRoot,
+			Arm6DOFFKController armController,
+			Vector3 armTargetWorldPosition,
+			Vector3 currentBasePosition,
+			float minReach,
+			float maxReach,
+			float preferredMin,
+			float preferredMax,
+			float requestedEeToleranceMeters,
+			float baseRadius,
+			HashSet<Collider> obstacleLookup,
+			DockingCandidateBuildStats buildStats,
+			ResidualDescentSample activeSample,
+			float stepSizeMeters,
+			int nextDescentIteration)
+		{
+			if (activeSample == null)
+			{
+				return null;
+			}
+
+			ResidualDescentSample bestNeighbor = null;
+			for (int directionIndex = 0; directionIndex < ResidualDescentDirections.Length; directionIndex++)
+			{
+				Vector2 direction = ResidualDescentDirections[directionIndex];
+				Vector3 candidateBasePosition = activeSample.baseWorldPosition + new Vector3(
+					direction.x * stepSizeMeters,
+					0f,
+					direction.y * stepSizeMeters);
+				ResidualDescentSample neighbor = EvaluateResidualDescentSample(
+					baseRoot,
+					armController,
+					armTargetWorldPosition,
+					currentBasePosition,
+					minReach,
+					maxReach,
+					preferredMin,
+					preferredMax,
+					requestedEeToleranceMeters,
+					baseRadius,
+					obstacleLookup,
+					buildStats,
+					candidateBasePosition,
+					activeSample.baseYawDeg,
+					"MidpointResidualDescent",
+					nextDescentIteration);
+				if (CompareResidualDescentSamples(neighbor, activeSample) >= 0)
+				{
+					continue;
+				}
+
+				if (bestNeighbor == null || CompareResidualDescentSamples(neighbor, bestNeighbor) < 0)
+				{
+					bestNeighbor = neighbor;
+				}
+			}
+
+			return bestNeighbor;
+		}
+
+		private ResidualDescentSample EvaluateResidualDescentSample(
+			Transform baseRoot,
+			Arm6DOFFKController armController,
+			Vector3 armTargetWorldPosition,
+			Vector3 currentBasePosition,
+			float minReach,
+			float maxReach,
+			float preferredMin,
+			float preferredMax,
+			float requestedEeToleranceMeters,
+			float baseRadius,
+			HashSet<Collider> obstacleLookup,
+			DockingCandidateBuildStats buildStats,
+			Vector3 candidateBasePosition,
+			float fallbackYawDeg,
+			string searchSource,
+			int descentIteration)
+		{
+			ResidualDescentSample sample = new ResidualDescentSample
+			{
+				baseWorldPosition = new Vector3(candidateBasePosition.x, currentBasePosition.y, candidateBasePosition.z),
+				searchSource = searchSource ?? string.Empty,
+				descentIteration = descentIteration
+			};
+			sample.baseYawDeg = ComputeFacingTargetYawDeg(armTargetWorldPosition, sample.baseWorldPosition, fallbackYawDeg);
+			sample.planarTargetDistanceMeters = PlanarDistance(sample.baseWorldPosition, armTargetWorldPosition);
+			sample.distanceBandPenaltyMeters = ComputePlanarDistanceBandPenalty(sample.planarTargetDistanceMeters);
+			sample.moveDistanceMeters = PlanarDistance(currentBasePosition, sample.baseWorldPosition);
+
+			if (buildStats != null)
+			{
+				buildStats.sampledCount++;
+			}
+
+			if (IsResidualDescentCollisionBlocked(sample.baseWorldPosition, baseRadius, obstacleLookup, out Collider blockingCollider))
+			{
+				sample.collisionBlocked = true;
+				sample.failureReason = blockingCollider != null ? $"OverlapSphere:{blockingCollider.name}" : "OverlapSphere";
+				if (buildStats != null)
+				{
+					buildStats.collisionRejectedCount++;
+				}
+
+				return sample;
+			}
+
+			bool solved = TrySolveArmTargetAtBasePoseLoose(
+				baseRoot,
+				sample.baseWorldPosition,
+				Quaternion.Euler(0f, sample.baseYawDeg, 0f),
+				armController,
+				armTargetWorldPosition,
+				out float[] solvedAnglesDeg,
+				out _,
+				out float residualMeters,
+				out float singularityPenalty,
+				out string failureReason,
+				requestedEeToleranceMeters);
+			sample.ikConverged = solved;
+			sample.ikResidualMeters = SanitizeResidualMetric(residualMeters);
+			sample.failureReason = failureReason ?? string.Empty;
+
+			DockingCandidate candidate = CreateDockingCandidateFromBasePose(
+				baseRoot,
+				armController,
+				armTargetWorldPosition,
+				currentBasePosition,
+				minReach,
+				maxReach,
+				preferredMin,
+				preferredMax,
+				baseRadius,
+				0,
+				searchSource,
+				classifyRadiusBand(sample.planarTargetDistanceMeters, preferredMin, preferredMax),
+				sample.baseWorldPosition,
+				sample.baseYawDeg,
+				sample.planarTargetDistanceMeters,
+				ComputeAngleFromDirection(ProjectXZ(armTargetWorldPosition - sample.baseWorldPosition)));
+			if (candidate == null)
+			{
+				if (buildStats != null)
+				{
+					buildStats.geometryRejectedCount++;
+				}
+
+				return sample;
+			}
+
+			sample.geometryValid = true;
+			candidate.searchSource = sample.searchSource;
+			candidate.descentIteration = sample.descentIteration;
+			candidate.planarTargetDistanceMeters = sample.planarTargetDistanceMeters;
+			candidate.ikResidualMeters = sample.ikResidualMeters;
+			candidate.distanceBandPenaltyMeters = sample.distanceBandPenaltyMeters;
+			candidate.evaluationStageSummary = "AcceptedAsSeed";
+			PopulateCandidateIkDiagnostics(candidate, armController, solvedAnglesDeg, sample.ikResidualMeters, singularityPenalty);
+			sample.candidate = candidate;
+			return sample;
+		}
+
+		private bool TryAddResidualDescentCandidate(
+			List<DockingCandidate> candidates,
+			ResidualDescentSample sample,
+			bool markAsBest,
+			DockingCandidateBuildStats buildStats)
+		{
+			DockingCandidate candidate = sample != null ? sample.candidate : null;
+			if (candidate == null || IsNearDuplicateCandidate(candidates, candidate))
+			{
+				return false;
+			}
+
+			candidate.searchSource = string.IsNullOrEmpty(sample.searchSource) ? "MidpointResidualDescent" : sample.searchSource;
+			candidate.descentIteration = sample.descentIteration;
+			candidate.planarTargetDistanceMeters = sample.planarTargetDistanceMeters;
+			candidate.ikResidualMeters = sample.ikResidualMeters;
+			candidate.distanceBandPenaltyMeters = sample.distanceBandPenaltyMeters;
+			candidate.evaluationStageSummary = markAsBest ? "AcceptedAsBestDocking" : "AcceptedAsSeed";
+			candidates.Add(candidate);
+			if (buildStats != null)
+			{
+				buildStats.acceptedCount++;
+			}
+
+			return true;
+		}
+
+		private static void LogResidualDescentSample(string label, ResidualDescentSample sample)
+		{
+			if (sample == null)
+			{
+				return;
+			}
+
+			Debug.Log(
+				$"[CoordinatedTaskPlanner] {label}: candidateBasePosition={sample.baseWorldPosition}, yaw={sample.baseYawDeg:F1}, residual={sample.ikResidualMeters:F4}m, planarTargetDistance={sample.planarTargetDistanceMeters:F4}m, distanceBandPenalty={sample.distanceBandPenaltyMeters:F4}m, collisionBlocked={sample.collisionBlocked}, failure='{sample.failureReason}'");
+		}
+
+		private static void LogAcceptedResidualNeighbor(ResidualDescentSample sample, float stepSizeMeters)
+		{
+			if (sample == null)
+			{
+				return;
+			}
+
+			Debug.Log(
+				$"[CoordinatedTaskPlanner] MidpointResidualDescent accepted neighbor: candidateBasePosition={sample.baseWorldPosition}, stepSizeMeters={stepSizeMeters:F3}, ikResidualMeters={sample.ikResidualMeters:F4}, planarTargetDistanceMeters={sample.planarTargetDistanceMeters:F4}, descentIteration={sample.descentIteration}");
+		}
+
+		private static bool HasResidualDescentAccepted(ResidualDescentSample sample, float acceptResidualMeters)
+		{
+			return sample != null
+				&& !sample.collisionBlocked
+				&& sample.candidate != null
+				&& sample.ikResidualMeters < Mathf.Max(0.001f, acceptResidualMeters);
+		}
+
+		private static int CompareResidualDescentSamples(ResidualDescentSample left, ResidualDescentSample right)
+		{
+			if (ReferenceEquals(left, right))
+			{
+				return 0;
+			}
+
+			if (left == null)
+			{
+				return 1;
+			}
+
+			if (right == null)
+			{
+				return -1;
+			}
+
+			int collisionOrder = left.collisionBlocked.CompareTo(right.collisionBlocked);
+			if (collisionOrder != 0)
+			{
+				return collisionOrder;
+			}
+
+			int ikOrder = CompareResidualMetric(left.ikResidualMeters, right.ikResidualMeters);
+			if (ikOrder != 0)
+			{
+				return ikOrder;
+			}
+
+			int distanceOrder = CompareResidualMetric(left.distanceBandPenaltyMeters, right.distanceBandPenaltyMeters);
+			if (distanceOrder != 0)
+			{
+				return distanceOrder;
+			}
+
+			int moveOrder = CompareResidualMetric(left.moveDistanceMeters, right.moveDistanceMeters);
+			if (moveOrder != 0)
+			{
+				return moveOrder;
+			}
+
+			return CompareResidualMetric(left.planarTargetDistanceMeters, right.planarTargetDistanceMeters);
+		}
+
+		private static int CompareResidualMetric(float left, float right)
+		{
+			bool leftFinite = IsFiniteValue(left);
+			bool rightFinite = IsFiniteValue(right);
+			if (leftFinite != rightFinite)
+			{
+				return leftFinite ? -1 : 1;
+			}
+
+			if (!leftFinite && !rightFinite)
+			{
+				return 0;
+			}
+
+			return left.CompareTo(right);
+		}
+
+		private static void SortResidualDescentCandidates(List<DockingCandidate> candidates)
+		{
+			if (candidates == null)
+			{
+				return;
+			}
+
+			candidates.Sort((left, right) =>
+			{
+				int ikOrder = CompareResidualMetric(left != null ? left.ikResidualMeters : float.PositiveInfinity, right != null ? right.ikResidualMeters : float.PositiveInfinity);
+				if (ikOrder != 0)
+				{
+					return ikOrder;
+				}
+
+				int distanceOrder = CompareResidualMetric(left != null ? left.distanceBandPenaltyMeters : float.PositiveInfinity, right != null ? right.distanceBandPenaltyMeters : float.PositiveInfinity);
+				if (distanceOrder != 0)
+				{
+					return distanceOrder;
+				}
+
+				int moveOrder = CompareResidualMetric(left != null ? left.travelDistance : float.PositiveInfinity, right != null ? right.travelDistance : float.PositiveInfinity);
+				if (moveOrder != 0)
+				{
+					return moveOrder;
+				}
+
+				return CompareResidualMetric(left != null ? left.heuristicCost : float.PositiveInfinity, right != null ? right.heuristicCost : float.PositiveInfinity);
+			});
+		}
+
+		private static float SanitizeResidualMetric(float value)
+		{
+			if (float.IsNaN(value))
+			{
+				return float.PositiveInfinity;
+			}
+
+			return value;
+		}
+
+		private static bool IsFiniteValue(float value)
+		{
+			return !float.IsNaN(value) && !float.IsInfinity(value);
+		}
+
+		private static HashSet<Collider> BuildObstacleLookup(IReadOnlyList<Collider> obstacles)
+		{
+			if (obstacles == null || obstacles.Count == 0)
+			{
+				return null;
+			}
+
+			HashSet<Collider> obstacleLookup = new HashSet<Collider>();
+			for (int i = 0; i < obstacles.Count; i++)
+			{
+				Collider obstacle = obstacles[i];
+				if (obstacle != null)
+				{
+					obstacleLookup.Add(obstacle);
+				}
+			}
+
+			return obstacleLookup.Count > 0 ? obstacleLookup : null;
+		}
+
+		private static bool IsResidualDescentCollisionBlocked(Vector3 candidateBasePosition, float baseRadius, HashSet<Collider> obstacleLookup, out Collider blockingCollider)
+		{
+			blockingCollider = null;
+			if (obstacleLookup == null || obstacleLookup.Count == 0)
+			{
+				return false;
+			}
+
+			Collider[] overlaps = Physics.OverlapSphere(
+				candidateBasePosition,
+				Mathf.Max(0.01f, baseRadius),
+				~0,
+				QueryTriggerInteraction.Ignore);
+			for (int i = 0; i < overlaps.Length; i++)
+			{
+				Collider overlap = overlaps[i];
+				if (overlap == null || !obstacleLookup.Contains(overlap))
+				{
+					continue;
+				}
+
+				blockingCollider = overlap;
+				return true;
+			}
+
+			return false;
+		}
+
+		private static float ComputeFacingTargetYawDeg(Vector3 armTargetWorldPosition, Vector3 baseWorldPosition, float fallbackYawDeg)
+		{
+			Vector3 toTarget = ProjectXZ(armTargetWorldPosition - baseWorldPosition);
+			if (toTarget.sqrMagnitude <= 1e-6f)
+			{
+				return fallbackYawDeg;
+			}
+
+			return Mathf.Atan2(toTarget.x, toTarget.z) * Mathf.Rad2Deg;
 		}
 
 		private List<DockingCandidate> BuildSectorSearchCandidates(
@@ -664,12 +1458,16 @@ namespace RobotSimulation
 			float maxReach,
 			float preferredMin,
 			float preferredMax,
+			float referenceRadiusMeters,
 			float baseRadius,
+			Vector3 baseCollisionBoxHalfExtents,
 			PlannerPhysicsQueries physicsQueries,
 			IReadOnlyList<Collider> obstacles,
 			Vector3 primarySectorDirection,
 			int sectorStage,
 			bool includeFallbackBand,
+			bool navMeshFilterActive,
+			DockingCandidateBuildStats buildStats,
 			bool coarseSearch)
 		{
 			List<float> radii = BuildDockingRadii(
@@ -677,6 +1475,7 @@ namespace RobotSimulation
 				maxReach,
 				preferredMin,
 				preferredMax,
+				referenceRadiusMeters,
 				coarseSearch ? coarsePreferredBandRadiusSamples : preferredBandRadiusSamples,
 				includeFallbackBand
 					? (coarseSearch ? coarseFallbackBandRadiusSamples : fallbackBandRadiusSamples)
@@ -691,41 +1490,354 @@ namespace RobotSimulation
 				float radius = radii[radiusIndex];
 				for (int angleIndex = 0; angleIndex < angularSamples; angleIndex++)
 				{
+					float[] targetBearingOffsets = coarseTargetBearingOffsetsDeg != null && coarseTargetBearingOffsetsDeg.Length > 0
+						? coarseTargetBearingOffsetsDeg
+						: new[] { 0f };
 					float angleRad = SampleSectorAngle(centerAngleRad, sectorHalfAngleRad, angleIndex, angularSamples);
-					DockingCandidate candidate = CreateDockingCandidate(
-						baseRoot,
-						armController,
-						armTargetWorldPosition,
-						currentBasePosition,
-						armBaseLocalPosition,
-						armBaseLocalRotation,
-						minReach,
-						maxReach,
-						preferredMin,
-						preferredMax,
-						baseRadius,
-						sectorStage,
-						SectorLabels[Mathf.Clamp(sectorStage, 0, SectorLabels.Length - 1)],
-						classifyRadiusBand(radius, preferredMin, preferredMax),
-						angleRad,
-						radius);
-					if (candidate == null)
+					for (int bearingIndex = 0; bearingIndex < targetBearingOffsets.Length; bearingIndex++)
 					{
-						continue;
-					}
+						if (buildStats != null)
+						{
+							buildStats.sampledCount++;
+						}
 
-					if (!physicsQueries.IsBasePoseCollisionFree(candidate.baseWorldPosition, baseRadius, obstacles, out _))
-					{
-						candidate.evaluationStageSummary = "RejectedByBaseCollision";
-						continue;
-					}
+						DockingCandidate candidate = CreateDockingCandidate(
+							baseRoot,
+							armController,
+							armTargetWorldPosition,
+							currentBasePosition,
+							armBaseLocalPosition,
+							armBaseLocalRotation,
+							minReach,
+							maxReach,
+							preferredMin,
+							preferredMax,
+							baseRadius,
+							sectorStage,
+							SectorLabels[Mathf.Clamp(sectorStage, 0, SectorLabels.Length - 1)],
+							classifyRadiusBand(radius, preferredMin, preferredMax),
+							angleRad,
+							radius,
+							targetBearingOffsets[bearingIndex]);
+						if (candidate == null)
+						{
+							if (buildStats != null)
+							{
+								buildStats.geometryRejectedCount++;
+							}
 
-					candidates.Add(candidate);
+							continue;
+						}
+
+						DockingCandidate unguidedCandidate = candidate;
+						candidate = GuideDockingCandidateWithNavMesh(
+							baseRoot,
+							armController,
+							armTargetWorldPosition,
+							currentBasePosition,
+							armBaseLocalRotation,
+							minReach,
+							maxReach,
+							preferredMin,
+							preferredMax,
+							baseRadius,
+							navMeshFilterActive,
+							candidate);
+						if (candidate == null)
+						{
+							RecordDockingDebugSample(unguidedCandidate, armTargetWorldPosition, false, false, false, "RejectedByNavMesh");
+							if (buildStats != null)
+							{
+								buildStats.navMeshRejectedCount++;
+							}
+
+							continue;
+						}
+
+						candidate.searchSource = "SectorFallback";
+						candidate.descentIteration = -1;
+						if (TryAcceptDockingCandidate(candidate, baseRadius, baseCollisionBoxHalfExtents, physicsQueries, obstacles, navMeshFilterActive))
+						{
+							RecordDockingDebugSample(candidate, armTargetWorldPosition, false, false, false, candidate.evaluationStageSummary);
+							if (buildStats != null)
+							{
+								buildStats.acceptedCount++;
+							}
+
+							candidates.Add(candidate);
+							continue;
+						}
+
+						if (buildStats == null)
+						{
+							continue;
+						}
+
+						switch (candidate.evaluationStageSummary)
+						{
+							case "RejectedByNavMesh":
+								buildStats.navMeshRejectedCount++;
+								break;
+							case "RejectedByBaseFootprintBox":
+							case "RejectedByBaseCheckBox":
+							case "RejectedByBaseOverlapBox":
+								buildStats.boxRejectedCount++;
+								break;
+							case "RejectedByBaseCollision":
+								buildStats.collisionRejectedCount++;
+								break;
+							default:
+								buildStats.geometryRejectedCount++;
+								break;
+						}
+						RecordDockingDebugSample(candidate, armTargetWorldPosition, false, false, false, candidate.evaluationStageSummary);
+					}
 				}
 			}
 
 			SortDockingCandidates(candidates);
 			return candidates;
+		}
+
+		private List<DockingCandidate> BuildRandomAnnularCandidates(
+			Transform baseRoot,
+			Arm6DOFFKController armController,
+			Vector3 armTargetWorldPosition,
+			Vector3 currentBasePosition,
+			Vector3 armBaseLocalPosition,
+			Quaternion armBaseLocalRotation,
+			float minReach,
+			float maxReach,
+			float preferredMin,
+			float preferredMax,
+			float baseRadius,
+			Vector3 baseCollisionBoxHalfExtents,
+			PlannerPhysicsQueries physicsQueries,
+			IReadOnlyList<Collider> obstacles,
+			Vector3 primaryDirection,
+			bool navMeshFilterActive,
+			DockingCandidateBuildStats buildStats,
+			int sampleCount)
+		{
+			List<DockingCandidate> candidates = new List<DockingCandidate>();
+			System.Random random = CreateDeterministicSampler(currentBasePosition, armTargetWorldPosition);
+			float anchorAngleRad = ComputeAngleFromDirection(primaryDirection);
+			int anchorCount = Mathf.Clamp(annularAnchorSampleCount, 0, Mathf.Max(0, sampleCount));
+			for (int sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++)
+			{
+				buildStats.sampledCount++;
+				float angleRad;
+				float radius;
+				if (sampleIndex < anchorCount && anchorCount > 0)
+				{
+					float anchorOffset = sampleIndex * (Mathf.PI * 2f / Mathf.Max(1, anchorCount));
+					angleRad = anchorAngleRad + anchorOffset;
+					float anchorT = anchorCount <= 1 ? 0.5f : sampleIndex / (float)(anchorCount - 1);
+					radius = Mathf.Lerp(preferredMin, preferredMax, anchorT);
+				}
+				else
+				{
+					angleRad = Mathf.Lerp(0f, Mathf.PI * 2f, (float)random.NextDouble());
+					radius = SampleAnnularRadius(preferredMin, preferredMax, random);
+				}
+
+				DockingCandidate candidate = CreateDockingCandidate(
+					baseRoot,
+					armController,
+					armTargetWorldPosition,
+					currentBasePosition,
+					armBaseLocalPosition,
+					armBaseLocalRotation,
+					minReach,
+					maxReach,
+					preferredMin,
+					preferredMax,
+					baseRadius,
+					0,
+					AnnularSamplingLabel,
+					classifyRadiusBand(radius, preferredMin, preferredMax),
+					angleRad,
+					radius,
+					0f);
+				if (candidate == null)
+				{
+					buildStats.geometryRejectedCount++;
+					continue;
+				}
+
+				DockingCandidate unguidedCandidate = candidate;
+				candidate = GuideDockingCandidateWithNavMesh(
+					baseRoot,
+					armController,
+					armTargetWorldPosition,
+					currentBasePosition,
+					armBaseLocalRotation,
+					minReach,
+					maxReach,
+					preferredMin,
+					preferredMax,
+					baseRadius,
+					navMeshFilterActive,
+					candidate);
+				if (candidate == null)
+				{
+					buildStats.navMeshRejectedCount++;
+					RecordDockingDebugSample(unguidedCandidate, armTargetWorldPosition, false, false, false, "RejectedByNavMesh");
+					continue;
+				}
+
+				candidate.searchSource = AnnularSamplingLabel;
+				candidate.descentIteration = -1;
+				if (IsNearDuplicateCandidate(candidates, candidate))
+				{
+					buildStats.geometryRejectedCount++;
+					continue;
+				}
+
+				if (TryAcceptDockingCandidate(candidate, baseRadius, baseCollisionBoxHalfExtents, physicsQueries, obstacles, navMeshFilterActive))
+				{
+					buildStats.acceptedCount++;
+					RecordDockingDebugSample(candidate, armTargetWorldPosition, false, false, false, candidate.evaluationStageSummary);
+					candidates.Add(candidate);
+					continue;
+				}
+
+				switch (candidate.evaluationStageSummary)
+				{
+					case "RejectedByNavMesh":
+						buildStats.navMeshRejectedCount++;
+						break;
+					case "RejectedByBaseFootprintBox":
+					case "RejectedByBaseCheckBox":
+					case "RejectedByBaseOverlapBox":
+						buildStats.boxRejectedCount++;
+						break;
+					case "RejectedByBaseCollision":
+						buildStats.collisionRejectedCount++;
+						break;
+					default:
+						buildStats.geometryRejectedCount++;
+						break;
+				}
+				RecordDockingDebugSample(candidate, armTargetWorldPosition, false, false, false, candidate.evaluationStageSummary);
+			}
+
+			SortDockingCandidates(candidates);
+			return candidates;
+		}
+
+		private static System.Random CreateDeterministicSampler(Vector3 currentBasePosition, Vector3 targetWorldPosition)
+		{
+			int xHash = Mathf.RoundToInt(currentBasePosition.x * 1000f);
+			int zHash = Mathf.RoundToInt(currentBasePosition.z * 1000f);
+			int targetXHash = Mathf.RoundToInt(targetWorldPosition.x * 1000f);
+			int targetZHash = Mathf.RoundToInt(targetWorldPosition.z * 1000f);
+			int seed = 17;
+			seed = (seed * 31) + xHash;
+			seed = (seed * 31) + zHash;
+			seed = (seed * 31) + targetXHash;
+			seed = (seed * 31) + targetZHash;
+			return new System.Random(seed);
+		}
+
+		private static float ComputeAngleFromDirection(Vector3 direction)
+		{
+			Vector3 planar = ProjectXZ(direction);
+			if (planar.sqrMagnitude <= 1e-6f)
+			{
+				return 0f;
+			}
+
+			return Mathf.Atan2(planar.z, planar.x);
+		}
+
+		private static float SampleAnnularRadius(float innerRadius, float outerRadius, System.Random random)
+		{
+			float innerSquared = innerRadius * innerRadius;
+			float outerSquared = outerRadius * outerRadius;
+			float t = (float)random.NextDouble();
+			return Mathf.Sqrt(Mathf.Lerp(innerSquared, outerSquared, t));
+		}
+
+		private static float SampleWeightedDockingRadius(float minReach, float maxReach, float preferredMin, float preferredMax, System.Random random)
+		{
+			float bandRoll = (float)random.NextDouble();
+			if (preferredMax > preferredMin + 1e-4f && (bandRoll < 0.65f || maxReach <= preferredMax + 1e-4f))
+			{
+				return SampleAnnularRadius(preferredMin, preferredMax, random);
+			}
+
+			if (preferredMin > minReach + 1e-4f && bandRoll < 0.82f)
+			{
+				return SampleAnnularRadius(minReach, preferredMin, random);
+			}
+
+			if (preferredMax < maxReach - 1e-4f)
+			{
+				return SampleAnnularRadius(preferredMax, maxReach, random);
+			}
+
+			return SampleAnnularRadius(minReach, maxReach, random);
+		}
+
+		private float ComputeMinJointLimitMarginDeg(Arm6DOFFKController armController, float[] jointAnglesDeg)
+		{
+			if (armController == null || jointAnglesDeg == null || jointAnglesDeg.Length < 6)
+			{
+				return float.NegativeInfinity;
+			}
+
+			float minMargin = float.PositiveInfinity;
+			for (int jointIndex = 0; jointIndex < 6; jointIndex++)
+			{
+				Vector2 limits = armController.GetJointLimits(jointIndex);
+				float margin = Mathf.Min(jointAnglesDeg[jointIndex] - limits.x, limits.y - jointAnglesDeg[jointIndex]);
+				minMargin = Mathf.Min(minMargin, margin);
+			}
+
+			return minMargin;
+		}
+
+		private float ComputeJointLimitPenalty(float minJointLimitMarginDeg)
+		{
+			if (float.IsInfinity(minJointLimitMarginDeg) || float.IsNaN(minJointLimitMarginDeg))
+			{
+				return 100f;
+			}
+
+			if (minJointLimitMarginDeg >= jointLimitSoftMarginDeg)
+			{
+				return 0f;
+			}
+
+			return Mathf.Max(0f, jointLimitSoftMarginDeg - minJointLimitMarginDeg);
+		}
+
+		private void PopulateCandidateIkDiagnostics(
+			DockingCandidate candidate,
+			Arm6DOFFKController armController,
+			float[] jointAnglesDeg,
+			float residualMeters,
+			float singularityPenalty)
+		{
+			if (candidate == null)
+			{
+				return;
+			}
+
+			candidate.looseIkResidualMeters = residualMeters;
+			candidate.looseIkSingularityPenalty = singularityPenalty;
+			if (armController == null || jointAnglesDeg == null || jointAnglesDeg.Length < 6)
+			{
+				candidate.manipulabilityIndex = float.NaN;
+				candidate.minJointLimitMarginDeg = float.NaN;
+				candidate.jointLimitPenalty = float.NaN;
+				return;
+			}
+
+			candidate.manipulabilityIndex = Mathf.Max(0f, armController.ComputeManipulabilityIndex(jointAnglesDeg));
+			candidate.minJointLimitMarginDeg = ComputeMinJointLimitMarginDeg(armController, jointAnglesDeg);
+			candidate.jointLimitPenalty = ComputeJointLimitPenalty(candidate.minJointLimitMarginDeg);
 		}
 
 		private List<DockingCandidate> RankAndTrimCoarseCandidates(List<DockingCandidate> candidates)
@@ -757,8 +1869,10 @@ namespace RobotSimulation
 			float preferredMin,
 			float preferredMax,
 			float baseRadius,
+			Vector3 baseCollisionBoxHalfExtents,
 			PlannerPhysicsQueries physicsQueries,
 			IReadOnlyList<Collider> obstacles,
+			bool navMeshFilterActive,
 			List<DockingCandidate> coarseSeeds)
 		{
 			List<DockingCandidate> fineCandidates = new List<DockingCandidate>();
@@ -767,11 +1881,28 @@ namespace RobotSimulation
 				return fineCandidates;
 			}
 
+			for (int seedIndex = 0; seedIndex < coarseSeeds.Count; seedIndex++)
+			{
+				DockingCandidate seed = coarseSeeds[seedIndex];
+				if (seed == null
+					|| IsNearDuplicateCandidate(fineCandidates, seed)
+					|| !TryAcceptDockingCandidate(seed, baseRadius, baseCollisionBoxHalfExtents, physicsQueries, obstacles, navMeshFilterActive))
+				{
+					continue;
+				}
+
+				seed.evaluationStageSummary = "AcceptedAsFineSeed";
+				fineCandidates.Add(seed);
+			}
+
 			float[] radiusOffsets = fineRadiusOffsetsMeters != null && fineRadiusOffsetsMeters.Length > 0
 				? fineRadiusOffsetsMeters
 				: new[] { 0f };
 			float[] angleOffsets = fineAngleOffsetsDeg != null && fineAngleOffsetsDeg.Length > 0
 				? fineAngleOffsetsDeg
+				: new[] { 0f };
+			float[] bearingOffsets = fineTargetBearingOffsetsDeg != null && fineTargetBearingOffsetsDeg.Length > 0
+				? fineTargetBearingOffsetsDeg
 				: new[] { 0f };
 
 			for (int seedIndex = 0; seedIndex < coarseSeeds.Count; seedIndex++)
@@ -781,35 +1912,57 @@ namespace RobotSimulation
 
 				for (int radiusIndex = 0; radiusIndex < radiusOffsets.Length; radiusIndex++)
 				{
-						float radius = Mathf.Clamp(seed.radius + radiusOffsets[radiusIndex], minReach, maxReach);
+					float radius = Mathf.Clamp(seed.radius + radiusOffsets[radiusIndex], minReach, maxReach);
 					for (int angleIndex = 0; angleIndex < angleOffsets.Length; angleIndex++)
 					{
 						float angleRad = seedAngleRad + (angleOffsets[angleIndex] * Mathf.Deg2Rad);
-						DockingCandidate candidate = CreateDockingCandidate(
-							baseRoot,
-							armController,
-							armTargetWorldPosition,
-							currentBasePosition,
-							armBaseLocalPosition,
-							armBaseLocalRotation,
-							minReach,
-							maxReach,
-							preferredMin,
-							preferredMax,
-							baseRadius,
-							Array.IndexOf(SectorLabels, seed.sectorLabel),
-							seed.sectorLabel,
-							seed.radiusBand,
-							angleRad,
-							radius);
-						if (candidate == null
-							|| IsNearDuplicateCandidate(fineCandidates, candidate)
-							|| !physicsQueries.IsBasePoseCollisionFree(candidate.baseWorldPosition, baseRadius, obstacles, out _))
+						for (int bearingIndex = 0; bearingIndex < bearingOffsets.Length; bearingIndex++)
 						{
-							continue;
-						}
+							DockingCandidate candidate = CreateDockingCandidate(
+								baseRoot,
+								armController,
+								armTargetWorldPosition,
+								currentBasePosition,
+								armBaseLocalPosition,
+								armBaseLocalRotation,
+								minReach,
+								maxReach,
+								preferredMin,
+								preferredMax,
+								baseRadius,
+								Array.IndexOf(SectorLabels, seed.sectorLabel),
+								seed.sectorLabel,
+								classifyRadiusBand(radius, preferredMin, preferredMax),
+								angleRad,
+								radius,
+								seed.targetBearingLocalDeg + bearingOffsets[bearingIndex]);
+							if (candidate == null)
+							{
+								continue;
+							}
 
-						fineCandidates.Add(candidate);
+							candidate = GuideDockingCandidateWithNavMesh(
+								baseRoot,
+								armController,
+								armTargetWorldPosition,
+								currentBasePosition,
+								armBaseLocalRotation,
+								minReach,
+								maxReach,
+								preferredMin,
+								preferredMax,
+								baseRadius,
+								navMeshFilterActive,
+								candidate);
+							if (candidate == null
+								|| IsNearDuplicateCandidate(fineCandidates, candidate)
+								|| !TryAcceptDockingCandidate(candidate, baseRadius, baseCollisionBoxHalfExtents, physicsQueries, obstacles, navMeshFilterActive))
+							{
+								continue;
+							}
+
+							fineCandidates.Add(candidate);
+						}
 					}
 				}
 			}
@@ -839,7 +1992,8 @@ namespace RobotSimulation
 			string sectorLabel,
 			string radiusBand,
 			float angleRad,
-			float radius)
+			float radius,
+			float targetBearingLocalDeg)
 		{
 			if (radius < minReach - 1e-4f || radius > maxReach + 1e-4f)
 			{
@@ -853,12 +2007,52 @@ namespace RobotSimulation
 			}
 
 			directionToTarget.Normalize();
-			Quaternion desiredFutureArmBaseRotation = Quaternion.LookRotation(directionToTarget, Vector3.up);
+			Quaternion desiredFutureArmBaseRotation =
+				Quaternion.LookRotation(directionToTarget, Vector3.up)
+				* Quaternion.Inverse(Quaternion.Euler(0f, targetBearingLocalDeg, 0f));
 			Quaternion candidateRotation = desiredFutureArmBaseRotation * Quaternion.Inverse(armBaseLocalRotation);
 			Vector3 futureArmBasePosition = armTargetWorldPosition - (directionToTarget * radius);
 			Vector3 candidateBasePosition = futureArmBasePosition - (candidateRotation * armBaseLocalPosition);
 			candidateBasePosition.y = currentBasePosition.y;
-			Quaternion candidateBaseRotation = Quaternion.Euler(0f, candidateRotation.eulerAngles.y, 0f);
+			return CreateDockingCandidateFromBasePose(
+				baseRoot,
+				armController,
+				armTargetWorldPosition,
+				currentBasePosition,
+				minReach,
+				maxReach,
+				preferredMin,
+				preferredMax,
+				baseRadius,
+				sectorStage,
+				sectorLabel,
+				radiusBand,
+				candidateBasePosition,
+				candidateRotation.eulerAngles.y,
+				radius,
+				angleRad);
+		}
+
+		private DockingCandidate CreateDockingCandidateFromBasePose(
+			Transform baseRoot,
+			Arm6DOFFKController armController,
+			Vector3 armTargetWorldPosition,
+			Vector3 currentBasePosition,
+			float minReach,
+			float maxReach,
+			float preferredMin,
+			float preferredMax,
+			float baseRadius,
+			int sectorStage,
+			string sectorLabel,
+			string radiusBand,
+			Vector3 candidateBasePosition,
+			float candidateBaseYawDeg,
+			float requestedRadius,
+			float fallbackAngleRad)
+		{
+			Quaternion candidateBaseRotation = Quaternion.Euler(0f, candidateBaseYawDeg, 0f);
+			candidateBasePosition.y = currentBasePosition.y;
 			if (!TryGetTargetInFutureArmBase(
 				baseRoot,
 				candidateBasePosition,
@@ -871,7 +2065,8 @@ namespace RobotSimulation
 			}
 
 			float targetDistanceInFutureArmBase = targetInFutureArmBase.magnitude;
-			if (Mathf.Abs(targetDistanceInFutureArmBase - radius) > DockingGeometryRadiusConsistencyToleranceMeters)
+			if (targetDistanceInFutureArmBase < minReach - DockingGeometryRadiusConsistencyToleranceMeters
+				|| targetDistanceInFutureArmBase > maxReach + DockingGeometryRadiusConsistencyToleranceMeters)
 			{
 				return null;
 			}
@@ -881,21 +2076,28 @@ namespace RobotSimulation
 				candidateBasePosition,
 				candidateBaseRotation,
 				armController,
-				out futureArmBasePosition,
+				out Vector3 futureArmBasePosition,
 				out Quaternion futureArmBaseRotation))
 			{
 				return null;
 			}
 
+			Vector3 actualDirection = ProjectXZ(armTargetWorldPosition - futureArmBasePosition);
+			float targetAngleRad = actualDirection.sqrMagnitude > 1e-6f
+				? Mathf.Atan2(actualDirection.z, actualDirection.x)
+				: fallbackAngleRad;
 			float travelDistance = PlanarDistance(currentBasePosition, candidateBasePosition);
+			float planarTargetDistance = PlanarDistance(candidateBasePosition, armTargetWorldPosition);
 			float shellMargin = Mathf.Max(0f, Mathf.Min(targetDistanceInFutureArmBase - minReach, maxReach - targetDistanceInFutureArmBase));
 			float shellMarginPenalty = Mathf.Max(0f, 0.12f - shellMargin) * 8f;
 			float clearance = Mathf.Max(0f, _distanceFieldSampler.SampleDistance(candidateBasePosition) - baseRadius);
 			float preferredBandPenalty = ComputePreferredBandPenalty(targetDistanceInFutureArmBase, preferredMin, preferredMax);
-			float workspaceBandPenalty = preferredBandPenalty + Mathf.Max(0f, Mathf.Abs(targetDistanceInFutureArmBase - radius) - 0.01f) * 4f;
+			float workspaceBandPenalty = preferredBandPenalty + Mathf.Max(0f, Mathf.Abs(targetDistanceInFutureArmBase - requestedRadius) - 0.01f) * 4f;
+			float sectorStagePenalty = Mathf.Max(0, sectorStage) * 0.35f;
 			float heuristicCost =
 				(workspaceBandPenalty * 16f) +
 				shellMarginPenalty +
+				sectorStagePenalty +
 				(travelDistance * 0.8f) -
 				Mathf.Min(clearance, 3f) * 0.2f;
 
@@ -903,22 +2105,111 @@ namespace RobotSimulation
 			{
 				baseWorldPosition = candidateBasePosition,
 				baseYawDeg = candidateBaseRotation.eulerAngles.y,
-				targetAngleRad = angleRad,
-				radius = radius,
+				targetAngleRad = targetAngleRad,
+				targetBearingLocalDeg = Mathf.Atan2(targetInFutureArmBase.x, targetInFutureArmBase.z) * Mathf.Rad2Deg,
+				radius = targetDistanceInFutureArmBase,
+				sampledRadiusMeters = requestedRadius,
 				shellMargin = shellMargin,
 				preferredBandPenalty = preferredBandPenalty,
 				workspaceBandPenalty = workspaceBandPenalty,
 				travelDistance = travelDistance,
+				planarTargetDistanceMeters = planarTargetDistance,
+				ikResidualMeters = float.PositiveInfinity,
+				distanceBandPenaltyMeters = ComputePlanarDistanceBandPenalty(planarTargetDistance),
+				descentIteration = -1,
+				searchSource = string.Empty,
 				clearance = clearance,
 				heuristicCost = heuristicCost,
+				manipulabilityIndex = float.NaN,
+				looseIkResidualMeters = float.PositiveInfinity,
+				looseIkSingularityPenalty = float.NaN,
+				minJointLimitMarginDeg = float.NaN,
+				jointLimitPenalty = float.NaN,
 				futureArmBasePosition = futureArmBasePosition,
 				targetInFutureArmBase = targetInFutureArmBase,
 				targetDistanceInFutureArmBase = targetDistanceInFutureArmBase,
 				futureArmBaseEulerAngles = futureArmBaseRotation.eulerAngles,
 				sectorLabel = sectorLabel,
-				radiusBand = radiusBand,
+				sampledRadiusBand = string.IsNullOrEmpty(radiusBand) ? classifyRadiusBand(requestedRadius, preferredMin, preferredMax) : radiusBand,
+				radiusBand = classifyRadiusBand(targetDistanceInFutureArmBase, preferredMin, preferredMax),
 				evaluationStageSummary = "AcceptedAsSeed"
 			};
+		}
+
+		private DockingCandidate GuideDockingCandidateWithNavMesh(
+			Transform baseRoot,
+			Arm6DOFFKController armController,
+			Vector3 armTargetWorldPosition,
+			Vector3 currentBasePosition,
+			Quaternion armBaseLocalRotation,
+			float minReach,
+			float maxReach,
+			float preferredMin,
+			float preferredMax,
+			float baseRadius,
+			bool navMeshFilterActive,
+			DockingCandidate candidate)
+		{
+			if (candidate == null || !navMeshFilterActive)
+			{
+				return candidate;
+			}
+
+			if (!NavMesh.SamplePosition(
+				candidate.baseWorldPosition,
+				out NavMeshHit hit,
+				Mathf.Max(0.1f, navMeshSampleMaxDistanceMeters),
+				navMeshAreaMask))
+			{
+				candidate.evaluationStageSummary = "RejectedByNavMesh";
+				return null;
+			}
+
+			Vector3 snappedBasePosition = hit.position;
+			snappedBasePosition.y = currentBasePosition.y;
+			if (PlanarDistance(snappedBasePosition, candidate.baseWorldPosition) <= 0.01f)
+			{
+				return candidate;
+			}
+
+			Vector3 directionToTarget = ProjectXZ(armTargetWorldPosition - snappedBasePosition);
+			float baseYawDeg;
+			if (directionToTarget.sqrMagnitude <= 1e-6f)
+			{
+				baseYawDeg = candidate.baseYawDeg;
+			}
+			else
+			{
+				Quaternion desiredFutureArmBaseRotation = Quaternion.LookRotation(directionToTarget.normalized, Vector3.up);
+				Quaternion candidateRotation = desiredFutureArmBaseRotation * Quaternion.Inverse(armBaseLocalRotation);
+				baseYawDeg = candidateRotation.eulerAngles.y;
+			}
+
+			DockingCandidate snappedCandidate = CreateDockingCandidateFromBasePose(
+				baseRoot,
+				armController,
+				armTargetWorldPosition,
+				currentBasePosition,
+				minReach,
+				maxReach,
+				preferredMin,
+				preferredMax,
+				baseRadius,
+				Array.IndexOf(SectorLabels, candidate.sectorLabel),
+				candidate.sectorLabel,
+				candidate.sampledRadiusBand,
+				snappedBasePosition,
+				baseYawDeg,
+				candidate.sampledRadiusMeters,
+				candidate.targetAngleRad);
+			if (snappedCandidate == null)
+			{
+				candidate.evaluationStageSummary = "RejectedByNavMeshSnapGeometry";
+				return null;
+			}
+
+			snappedCandidate.evaluationStageSummary = "GuidedByNavMesh";
+			return snappedCandidate;
 		}
 
 		private static int ComputeSectorAngularSamples(float sectorHalfAngleRad, int baseSamples)
@@ -1027,10 +2318,17 @@ namespace RobotSimulation
 			});
 		}
 
-		private List<float> BuildDockingRadii(float minReach, float maxReach, float preferredMin, float preferredMax, int preferredSamples, int fallbackSamples, bool includeFallbackBand)
+		private List<float> BuildDockingRadii(float minReach, float maxReach, float preferredMin, float preferredMax, float referenceRadiusMeters, int preferredSamples, int fallbackSamples, bool includeFallbackBand)
 		{
 			List<float> radii = new List<float>();
 			AddInterpolatedRange(radii, preferredMin, preferredMax, Mathf.Max(2, preferredSamples));
+			if (referenceRadiusMeters >= minReach - 1e-4f && referenceRadiusMeters <= maxReach + 1e-4f)
+			{
+				float clampedReference = Mathf.Clamp(referenceRadiusMeters, minReach, maxReach);
+				AddUniqueRadius(radii, clampedReference);
+				AddUniqueRadius(radii, Mathf.Clamp(clampedReference - 0.03f, minReach, maxReach));
+				AddUniqueRadius(radii, Mathf.Clamp(clampedReference + 0.03f, minReach, maxReach));
+			}
 			if (includeFallbackBand && fallbackSamples > 0)
 			{
 				AddInterpolatedRange(radii, minReach, preferredMin, Mathf.Max(1, fallbackSamples));
@@ -1072,6 +2370,272 @@ namespace RobotSimulation
 			radii.Add(value);
 		}
 
+		private void ResolvePreferredAnnularBand(float minReach, float maxReach, float referenceRadiusMeters, out float preferredMin, out float preferredMax)
+		{
+			float workspaceMargin = Mathf.Max(0.005f, annularSamplingWorkspaceMarginMeters);
+			float workspaceSpan = Mathf.Max(0.05f, maxReach - minReach);
+			float lowerBound = minReach + workspaceMargin;
+			float upperBound = Mathf.Max(lowerBound + 0.01f, maxReach - workspaceMargin);
+			float clampedReference = Mathf.Clamp(referenceRadiusMeters, lowerBound, upperBound);
+			bool hasUsableReference = referenceRadiusMeters >= minReach - 1e-4f && referenceRadiusMeters <= maxReach + 1e-4f;
+			float comfortCenter = hasUsableReference
+				? clampedReference
+				: Mathf.Lerp(minReach, maxReach, 0.62f);
+			float comfortHalfWidth = hasUsableReference
+				? Mathf.Clamp(workspaceSpan * 0.08f, 0.025f, 0.07f)
+				: Mathf.Clamp(workspaceSpan * 0.12f, 0.03f, 0.08f);
+			float desiredMin = comfortCenter - comfortHalfWidth;
+			float desiredMax = comfortCenter + comfortHalfWidth;
+			float configuredMin = annularSamplingInnerRadiusMeters > 0f ? annularSamplingInnerRadiusMeters : desiredMin;
+			float configuredMax = annularSamplingOuterRadiusMeters > 0f ? annularSamplingOuterRadiusMeters : desiredMax;
+			float safeMin = Mathf.Clamp(configuredMin, lowerBound, upperBound);
+			float safeMax = Mathf.Clamp(configuredMax, safeMin + 0.01f, upperBound);
+			if (safeMax <= safeMin)
+			{
+				safeMax = Mathf.Min(upperBound, safeMin + 0.05f);
+			}
+
+			preferredMin = Mathf.Clamp(safeMin, lowerBound, upperBound);
+			preferredMax = Mathf.Clamp(safeMax, preferredMin + 0.01f, upperBound);
+		}
+
+		private void CacheDockingSamplingDebugInfo(Vector3 targetWorldPosition, float innerRadiusMeters, float outerRadiusMeters)
+		{
+			_hasDockingSamplingDebugInfo = true;
+			_lastDockingTargetWorldPosition = targetWorldPosition;
+			_lastDockingSamplingInnerRadiusMeters = Mathf.Max(0f, innerRadiusMeters);
+			_lastDockingSamplingOuterRadiusMeters = Mathf.Max(_lastDockingSamplingInnerRadiusMeters, outerRadiusMeters);
+		}
+
+		private void ClearDockingDebugSamples()
+		{
+			_lastDockingDebugSamples.Clear();
+		}
+
+		private void RecordDockingDebugSample(
+			DockingCandidate candidate,
+			Vector3 targetWorldPosition,
+			bool ikFailed,
+			bool strictPreviewFailed,
+			bool selected,
+			string reason)
+		{
+			if (candidate == null)
+			{
+				return;
+			}
+
+			if (selected)
+			{
+				for (int i = _lastDockingDebugSamples.Count - 1; i >= 0; i--)
+				{
+					if (_lastDockingDebugSamples[i] != null && _lastDockingDebugSamples[i].selected)
+					{
+						_lastDockingDebugSamples.RemoveAt(i);
+					}
+				}
+			}
+
+			if (_lastDockingDebugSamples.Count >= Mathf.Max(8, dockingDebugSampleLimit))
+			{
+				_lastDockingDebugSamples.RemoveAt(0);
+			}
+
+			_lastDockingDebugSamples.Add(new DockingDebugSample
+			{
+				baseWorldPosition = candidate.baseWorldPosition,
+				targetWorldPosition = targetWorldPosition,
+				ikFailed = ikFailed,
+				strictPreviewFailed = strictPreviewFailed,
+				selected = selected,
+				reason = reason ?? string.Empty
+			});
+		}
+
+		private bool ShouldUseNavMeshPoseFilter(Vector3 currentBasePosition)
+		{
+			if (!enableNavMeshPoseFilter)
+			{
+				return false;
+			}
+
+			float probeDistance = Mathf.Max(0.25f, navMeshSampleMaxDistanceMeters * 2f);
+			if (NavMesh.SamplePosition(currentBasePosition, out _, probeDistance, navMeshAreaMask))
+			{
+				return true;
+			}
+
+			NavMeshTriangulation triangulation = NavMesh.CalculateTriangulation();
+			return triangulation.vertices != null && triangulation.vertices.Length > 0;
+		}
+
+		private bool TryAcceptDockingCandidate(
+			DockingCandidate candidate,
+			float baseRadius,
+			Vector3 baseCollisionBoxHalfExtents,
+			PlannerPhysicsQueries physicsQueries,
+			IReadOnlyList<Collider> obstacles,
+			bool navMeshFilterActive)
+		{
+			if (candidate == null || physicsQueries == null)
+			{
+				return false;
+			}
+
+			bool hasFootprintBox = enableStaticBoxCollisionFilter
+				&& baseCollisionBoxHalfExtents.x > 0.05f
+				&& baseCollisionBoxHalfExtents.y > 0.05f
+				&& baseCollisionBoxHalfExtents.z > 0.05f;
+			if (hasFootprintBox
+				&& !physicsQueries.IsBasePoseCheckBoxCollisionFree(
+					candidate.baseWorldPosition,
+					Quaternion.Euler(0f, candidate.baseYawDeg, 0f),
+					baseCollisionBoxHalfExtents,
+					obstacles,
+					out _))
+			{
+				candidate.evaluationStageSummary = "RejectedByBaseCheckBox";
+				return false;
+			}
+
+			bool circleCollisionFree = physicsQueries.IsBasePoseCollisionFree(candidate.baseWorldPosition, baseRadius, obstacles, out _);
+			if (!circleCollisionFree && !hasFootprintBox)
+			{
+				candidate.evaluationStageSummary = "RejectedByBaseCollision";
+				return false;
+			}
+
+			if (!circleCollisionFree && hasFootprintBox)
+			{
+				candidate.evaluationStageSummary = navMeshFilterActive
+					? "AcceptedByFootprintBoxAfterGuidedNavMesh"
+					: "AcceptedByFootprintBox";
+				return true;
+			}
+
+			candidate.evaluationStageSummary = navMeshFilterActive
+				? "AcceptedAfterGuidedNavMeshAndFootprintFilters"
+				: "AcceptedAfterFootprintFilters";
+			return true;
+		}
+
+		private bool TryEvaluateArmFeasibilityAtLiveBaseLoose(
+			Arm6DOFFKController armController,
+			Vector3 armTargetWorldPosition,
+			out float[] solvedAnglesDeg,
+			out float residualMeters,
+			out float singularityPenalty,
+			out string failureReason,
+			float targetToleranceMeters = -1f,
+			float[] startAnglesOverrideDeg = null)
+		{
+			solvedAnglesDeg = null;
+			residualMeters = float.PositiveInfinity;
+			singularityPenalty = float.PositiveInfinity;
+			failureReason = string.Empty;
+
+			if (!TrySolveArmTargetAtLiveBaseLoose(
+				armController,
+				armTargetWorldPosition,
+				out float[] solvedAngles,
+				out Vector3 targetInLiveArmBase,
+				out residualMeters,
+				out singularityPenalty,
+				out string solveFailure,
+				targetToleranceMeters,
+				startAnglesOverrideDeg))
+			{
+				solvedAnglesDeg = CloneAngles(solvedAngles);
+				failureReason = solveFailure;
+				return false;
+			}
+
+			if (singularityPenalty >= LoosePrecheckHardSingularityThreshold)
+			{
+				solvedAnglesDeg = CloneAngles(solvedAngles);
+				failureReason = L(
+					$"前置机械臂初筛拒绝该位姿：奇异性惩罚 {singularityPenalty:F2} 已超过硬阈值。",
+					$"Loose arm precheck rejected this pose because the singularity penalty {singularityPenalty:F2} exceeded the hard threshold.");
+				return false;
+			}
+
+			float minJointLimitMarginDeg = ComputeMinJointLimitMarginDeg(armController, solvedAngles);
+			float hardLimitViolationToleranceDeg = -Mathf.Max(0.5f, jointLimitHardMarginDeg * 0.1f);
+			if (minJointLimitMarginDeg < hardLimitViolationToleranceDeg)
+			{
+				solvedAnglesDeg = CloneAngles(solvedAngles);
+				failureReason = L(
+					$"前置机械臂初筛拒绝该位姿：关节解超出了允许限位，最小余量 {minJointLimitMarginDeg:F1}°。",
+					$"Loose arm precheck rejected this pose because the solved joint configuration exceeded the allowed joint limits. Minimum margin={minJointLimitMarginDeg:F1}deg.");
+				return false;
+			}
+
+			if (armController.EvaluateMotionCollision(solvedAngles, solvedAngles, out ArmCollisionGuardResult guardResult))
+			{
+				solvedAnglesDeg = CloneAngles(solvedAngles);
+				failureReason = string.IsNullOrEmpty(guardResult.message)
+					? L("前置机械臂初筛发现目标终点姿态存在硬碰撞。", "Loose arm precheck found a hard collision at the terminal pose.")
+					: guardResult.message;
+				Debug.LogWarning($"[CoordinatedTaskPlanner] Live-base loose precheck terminal collision. targetInLiveArmBase={targetInLiveArmBase}");
+				return false;
+			}
+
+			solvedAnglesDeg = CloneAngles(solvedAngles);
+			return true;
+		}
+
+		private bool TrySolveArmTargetAtLiveBaseLoose(
+			Arm6DOFFKController armController,
+			Vector3 armTargetWorldPosition,
+			out float[] solvedAnglesDeg,
+			out Vector3 targetInLiveArmBase,
+			out float residualMeters,
+			out float singularityPenalty,
+			out string failureReason,
+			float targetToleranceMeters = -1f,
+			float[] startAnglesOverrideDeg = null)
+		{
+			solvedAnglesDeg = null;
+			targetInLiveArmBase = Vector3.zero;
+			residualMeters = float.PositiveInfinity;
+			singularityPenalty = float.PositiveInfinity;
+			failureReason = string.Empty;
+
+			if (armController == null || !armController.KinematicsReady)
+			{
+				failureReason = L("机械臂控制器或运动学模型尚未就绪。", "Arm controller or kinematics model is not ready.");
+				return false;
+			}
+
+			targetInLiveArmBase = armController.WorldToBasePosition(armTargetWorldPosition);
+			float solveToleranceMeters = Mathf.Max(
+				targetToleranceMeters > 0f ? Mathf.Max(0.001f, targetToleranceMeters) : _armMotionPlanner.settings.toleranceMeters,
+				LoosePrecheckToleranceMeters);
+			float[] startAngles = startAnglesOverrideDeg != null && startAnglesOverrideDeg.Length >= 6
+				? CloneAngles(startAnglesOverrideDeg)
+				: armController.CaptureMeasuredJointAngles();
+			if (!_armMotionPlanner.TrySolveToBasePosition(
+				armController,
+				targetInLiveArmBase,
+				out float[] solvedAngles,
+				out float bestResidualMeters,
+				out singularityPenalty,
+				out string ikFailure,
+				startAngles,
+				null,
+				solveToleranceMeters))
+			{
+				residualMeters = bestResidualMeters;
+				solvedAnglesDeg = CloneAngles(solvedAngles);
+				failureReason = ikFailure;
+				return false;
+			}
+
+			residualMeters = Vector3.Distance(armController.ForwardPoe(solvedAngles).position, targetInLiveArmBase);
+			solvedAnglesDeg = CloneAngles(solvedAngles);
+			return true;
+		}
+
 		private bool TryEvaluateArmFeasibilityAtBasePoseLoose(
 			Transform baseRoot,
 			Vector3 baseWorldPosition,
@@ -1104,15 +2668,28 @@ namespace RobotSimulation
 				targetToleranceMeters,
 				startAnglesOverrideDeg))
 			{
+				solvedAnglesDeg = CloneAngles(solvedAngles);
 				failureReason = solveFailure;
 				return false;
 			}
 
 			if (singularityPenalty >= LoosePrecheckHardSingularityThreshold)
 			{
+				solvedAnglesDeg = CloneAngles(solvedAngles);
 				failureReason = L(
 					$"前置机械臂初筛拒绝该位姿：奇异性惩罚 {singularityPenalty:F2} 已超过硬阈值。",
 					$"Loose arm precheck rejected this pose because the singularity penalty {singularityPenalty:F2} exceeded the hard threshold.");
+				return false;
+			}
+
+			float minJointLimitMarginDeg = ComputeMinJointLimitMarginDeg(armController, solvedAngles);
+			float hardLimitViolationToleranceDeg = -Mathf.Max(0.5f, jointLimitHardMarginDeg * 0.1f);
+			if (minJointLimitMarginDeg < hardLimitViolationToleranceDeg)
+			{
+				solvedAnglesDeg = CloneAngles(solvedAngles);
+				failureReason = L(
+					$"前置机械臂初筛拒绝该位姿：关节解超出了允许限位，最小余量 {minJointLimitMarginDeg:F1}°。",
+					$"Loose arm precheck rejected this pose because the solved joint configuration exceeded the allowed joint limits. Minimum margin={minJointLimitMarginDeg:F1}deg.");
 				return false;
 			}
 
@@ -1125,6 +2702,7 @@ namespace RobotSimulation
 				solvedAngles,
 				out ArmCollisionGuardResult guardResult))
 			{
+				solvedAnglesDeg = CloneAngles(solvedAngles);
 				failureReason = string.IsNullOrEmpty(guardResult.message)
 					? L("前置机械臂初筛发现目标终点姿态存在硬碰撞。", "Loose arm precheck found a hard collision at the terminal pose.")
 					: guardResult.message;
@@ -1177,12 +2755,15 @@ namespace RobotSimulation
 				armController,
 				targetInFutureArmBase,
 				out float[] solvedAngles,
+				out float bestResidualMeters,
 				out singularityPenalty,
 				out string ikFailure,
 				startAngles,
 				null,
 				solveToleranceMeters))
 			{
+				residualMeters = bestResidualMeters;
+				solvedAnglesDeg = CloneAngles(solvedAngles);
 				failureReason = ikFailure;
 				return false;
 			}
@@ -1418,18 +2999,22 @@ namespace RobotSimulation
 
 			int baseRootId = baseRoot.GetInstanceID();
 			int armBaseId = armController.BaseFrameTransform.GetInstanceID();
+			if (!TryGetArmBaseLocalOffset(baseRoot, armController, out armBaseLocalPosition, out armBaseLocalRotation))
+			{
+				return false;
+			}
+
 			if (_hasCachedArmBaseLocalOffset
 				&& _cachedBaseRootId == baseRootId
 				&& _cachedArmBaseTransformId == armBaseId)
 			{
-				armBaseLocalPosition = _cachedArmBaseLocalPosition;
-				armBaseLocalRotation = _cachedArmBaseLocalRotation;
-				return true;
-			}
-
-			if (!TryGetArmBaseLocalOffset(baseRoot, armController, out armBaseLocalPosition, out armBaseLocalRotation))
-			{
-				return false;
+				float localPositionDelta = Vector3.Distance(_cachedArmBaseLocalPosition, armBaseLocalPosition);
+				float localRotationDelta = Quaternion.Angle(_cachedArmBaseLocalRotation, armBaseLocalRotation);
+				if (localPositionDelta > 0.002f || localRotationDelta > 0.5f)
+				{
+					Debug.LogWarning(
+						$"[CoordinatedTaskPlanner] Arm-base local offset drift detected. cachedPosition={_cachedArmBaseLocalPosition}, livePosition={armBaseLocalPosition}, cachedRotation={_cachedArmBaseLocalRotation.eulerAngles}, liveRotation={armBaseLocalRotation.eulerAngles}, deltaPos={localPositionDelta:F4}m, deltaRot={localRotationDelta:F2}deg");
+				}
 			}
 
 			_hasCachedArmBaseLocalOffset = true;
@@ -1497,6 +3082,43 @@ namespace RobotSimulation
 			return true;
 		}
 
+		private void LogCurrentBaseFrameConsistency(
+			Transform baseRoot,
+			Vector3 baseWorldPosition,
+			Quaternion baseWorldRotation,
+			Arm6DOFFKController armController,
+			Vector3 armTargetWorldPosition,
+			float targetToleranceMeters = -1f)
+		{
+			if (baseRoot == null || armController == null || !armController.KinematicsReady)
+			{
+				return;
+			}
+
+			Vector3 liveTargetInArmBase = armController.WorldToBasePosition(armTargetWorldPosition);
+			if (!TryGetTargetInFutureArmBase(
+				baseRoot,
+				baseWorldPosition,
+				baseWorldRotation,
+				armController,
+				armTargetWorldPosition,
+				out Vector3 projectedTargetInArmBase))
+			{
+				return;
+			}
+
+			float deltaMeters = Vector3.Distance(liveTargetInArmBase, projectedTargetInArmBase);
+			float reportThreshold = Mathf.Max(0.002f, targetToleranceMeters > 0f ? targetToleranceMeters * 0.25f : 0.005f);
+			if (deltaMeters <= reportThreshold)
+			{
+				return;
+			}
+
+			Transform liveArmBase = armController.BaseFrameTransform;
+			Debug.LogWarning(
+				$"[CoordinatedTaskPlanner] CurrentBaseFrameConsistency: delta={deltaMeters:F4}m, liveTargetInArmBase={liveTargetInArmBase}, projectedTargetInArmBase={projectedTargetInArmBase}, liveArmBasePosition={(liveArmBase != null ? liveArmBase.position : Vector3.zero)}, liveArmBaseRotation={(liveArmBase != null ? liveArmBase.rotation.eulerAngles : Vector3.zero)}, baseRootPosition={baseWorldPosition}, baseRootRotation={baseWorldRotation.eulerAngles}");
+		}
+
 		private void LogDockingCandidateGeometry(DockingCandidate candidate)
 		{
 			if (candidate == null)
@@ -1505,7 +3127,17 @@ namespace RobotSimulation
 			}
 
 			Debug.Log(
-				$"[CoordinatedTaskPlanner] DockingCandidateGeometry: sectorStage={candidate.sectorLabel}, radiusBand={candidate.radiusBand}, candidateBasePosition={candidate.baseWorldPosition}, candidateYaw={candidate.baseYawDeg:F2}, futureArmBasePosition={candidate.futureArmBasePosition}, futureArmBaseRotation={candidate.futureArmBaseEulerAngles}, targetInFutureArmBase={candidate.targetInFutureArmBase}, |targetInFutureArmBase|={candidate.targetDistanceInFutureArmBase:F4}, status={candidate.evaluationStageSummary}");
+				$"[CoordinatedTaskPlanner] DockingCandidateGeometry: samplingStage={candidate.sectorLabel}, sampledRadius={FormatDiagnosticFloat(candidate.sampledRadiusMeters, "F4")}, sampledRadiusBand={candidate.sampledRadiusBand}, actualRadiusBand={candidate.radiusBand}, candidateBasePosition={candidate.baseWorldPosition}, candidateYaw={candidate.baseYawDeg:F2}, futureArmBasePosition={candidate.futureArmBasePosition}, futureArmBaseRotation={candidate.futureArmBaseEulerAngles}, targetInFutureArmBase={candidate.targetInFutureArmBase}, |targetInFutureArmBase|={candidate.targetDistanceInFutureArmBase:F4}, targetBearingLocalDeg={candidate.targetBearingLocalDeg:F1}, manipulability={FormatDiagnosticFloat(candidate.manipulabilityIndex, "F5")}, looseResidual={FormatDiagnosticFloat(candidate.looseIkResidualMeters, "F4")}, looseSingularityPenalty={FormatDiagnosticFloat(candidate.looseIkSingularityPenalty, "F2")}, minJointLimitMargin={FormatDiagnosticFloat(candidate.minJointLimitMarginDeg, "F1")}, jointLimitPenalty={FormatDiagnosticFloat(candidate.jointLimitPenalty, "F2")}, status={candidate.evaluationStageSummary}");
+		}
+
+		private static string FormatDiagnosticFloat(float value, string format)
+		{
+			if (float.IsNaN(value) || float.IsInfinity(value))
+			{
+				return "n/a";
+			}
+
+			return value.ToString(format, CultureInfo.InvariantCulture);
 		}
 
 		private static CoordinatedTaskResolution CreateDefaultResolution(DiffDriveTwinController diffDriveController)
@@ -1661,6 +3293,17 @@ namespace RobotSimulation
 			Quaternion candidateRotation = Quaternion.Euler(0f, candidate.baseYawDeg, 0f);
 			candidate.evaluationStageSummary = "EvaluatingFineCandidate";
 			LogDockingCandidateGeometry(candidate);
+			if (candidate.targetDistanceInFutureArmBase < context.minReach - DockingHardWorkspaceShellToleranceMeters
+				|| candidate.targetDistanceInFutureArmBase > context.maxReach + DockingHardWorkspaceShellToleranceMeters)
+			{
+				failureSummary.noWorkspaceConsistentPoseCount++;
+				failureSummary.failureCategory = FailureCategoryNoWorkspaceConsistentPose;
+				candidate.evaluationStageSummary = "RejectedByWorkspaceShell";
+				RecordDockingDebugSample(candidate, context.request.armTargetWorldPosition, false, false, false, candidate.evaluationStageSummary);
+				LogDockingCandidateGeometry(candidate);
+				return false;
+			}
+
 			failureSummary.anyWorkspaceShellCandidate = true;
 			if (candidate.targetDistanceInFutureArmBase >= context.preferredMin - DockingPreferredRadiusMarginMeters
 				&& candidate.targetDistanceInFutureArmBase <= context.preferredMax + DockingPreferredRadiusMarginMeters)
@@ -1681,16 +3324,19 @@ namespace RobotSimulation
 				context.request != null ? context.request.eePositionToleranceMeters : -1f,
 				context.startAngles))
 			{
+				PopulateCandidateIkDiagnostics(candidate, context.armController, solvedAngles, residualMeters, singularityPenalty);
 				failureSummary.lastArmFailure = looseFailure;
 				failureSummary.noLooseIkPoseCount++;
 				failureSummary.failureCategory = FailureCategoryNoLooseIkPose;
 				candidate.evaluationStageSummary = "RejectedByLooseIK";
+				RecordDockingDebugSample(candidate, context.request.armTargetWorldPosition, true, false, false, looseFailure);
 				LogDockingCandidateGeometry(candidate);
 				return false;
 			}
 
 			failureSummary.anyIkCandidate = true;
 			failureSummary.anyCollisionFreeArmCandidate = true;
+			PopulateCandidateIkDiagnostics(candidate, context.armController, solvedAngles, residualMeters, singularityPenalty);
 			basePathCheckCount++;
 			if (!HasBasePathToCandidate(
 				context.currentBasePosition,
@@ -1706,6 +3352,7 @@ namespace RobotSimulation
 				failureSummary.noPathReachablePoseCount++;
 				failureSummary.failureCategory = FailureCategoryNoPathReachablePose;
 				candidate.evaluationStageSummary = "RejectedByBasePath";
+				RecordDockingDebugSample(candidate, context.request.armTargetWorldPosition, false, false, false, pathFailure);
 				LogDockingCandidateGeometry(candidate);
 				return false;
 			}
@@ -1726,6 +3373,7 @@ namespace RobotSimulation
 				failureSummary.noPathReachablePoseCount++;
 				failureSummary.failureCategory = FailureCategoryNoPathReachablePose;
 				strictPreviewPenalty += 8f;
+				RecordDockingDebugSample(candidate, context.request.armTargetWorldPosition, false, true, false, failureSummary.lastArmFailure);
 			}
 
 			if (allowProvisionalDockingWhenIkSoftFails
@@ -1753,19 +3401,23 @@ namespace RobotSimulation
 			float baseTravelScore = candidate.travelDistance * 1.2f;
 			float pathScore = strictPreviewPenalty * 2f;
 			float clearanceScore = -Mathf.Min(candidate.clearance, 2.5f) * 0.15f;
+			float manipulabilityReward = Mathf.Min(candidate.manipulabilityIndex, 0.08f) * 90f;
 			float finalCost = armResidualScore
 				+ workspaceBandScore
 				+ singularityScore
+				+ candidate.jointLimitPenalty * 1.5f
 				+ baseTravelScore
 				+ pathScore
 				+ clearanceScore
-				+ candidate.heuristicCost * 0.25f;
+				+ candidate.heuristicCost * 0.25f
+				- manipulabilityReward;
 			if (bestCandidate == null || finalCost < bestCost)
 			{
 				bestCost = finalCost;
 				bestCandidate = candidate;
 				bestSolvedAngles = CloneAngles(solvedAngles);
 				candidate.evaluationStageSummary = "AcceptedAsBestDocking";
+				RecordDockingDebugSample(candidate, context.request.armTargetWorldPosition, false, strictPreviewPenalty > 0f, true, candidate.evaluationStageSummary);
 				LogDockingCandidateGeometry(candidate);
 			}
 
@@ -1782,6 +3434,23 @@ namespace RobotSimulation
 			if (radius > preferredMax)
 			{
 				return radius - preferredMax;
+			}
+
+			return 0f;
+		}
+
+		private static float ComputePlanarDistanceBandPenalty(float planarTargetDistanceMeters)
+		{
+			const float preferredMinDistance = 0.45f;
+			const float preferredMaxDistance = 0.65f;
+			if (planarTargetDistanceMeters < preferredMinDistance)
+			{
+				return preferredMinDistance - planarTargetDistanceMeters;
+			}
+
+			if (planarTargetDistanceMeters > preferredMaxDistance)
+			{
+				return planarTargetDistanceMeters - preferredMaxDistance;
 			}
 
 			return 0f;

@@ -15,6 +15,7 @@ namespace RobotSimulation
 		[SerializeField] private float basePlanningMargin = 4f;
 		[SerializeField] private float shadowSimulationSpeedMultiplier = 4f;
 		[SerializeField] private int maxLocalReplans = 3;
+		[SerializeField] private bool drawDockingSamplingGizmos = true;
 
 		[Header("Status")]
 		[SerializeField] private RobotPlanningStage currentStage;
@@ -30,6 +31,7 @@ namespace RobotSimulation
 		private readonly ShadowSimulationGate _shadowGate = new ShadowSimulationGate();
 		private readonly LocalReplanner _localReplanner = new LocalReplanner();
 		private readonly CoordinatedTaskPlanner _coordinatedTaskPlanner = new CoordinatedTaskPlanner();
+		private readonly List<CoordinatedTaskPlanner.DockingDebugSample> _dockingDebugGizmoSamples = new List<CoordinatedTaskPlanner.DockingDebugSample>();
 
 		private const float BasePositionToleranceMeters = 0.02f;
 		private const float BaseStopAcceptanceMeters = 0.025f;
@@ -85,6 +87,75 @@ namespace RobotSimulation
 		private void Awake()
 		{
 			EnsurePlannerInternals();
+		}
+
+		private void OnDrawGizmos()
+		{
+			if (!drawDockingSamplingGizmos
+				|| !_coordinatedTaskPlanner.TryGetLastDockingSamplingDebugInfo(out Vector3 targetWorldPosition, out float innerRadiusMeters, out float outerRadiusMeters))
+			{
+				return;
+			}
+
+			Gizmos.color = new Color(0.12f, 0.82f, 0.22f, 0.9f);
+			Gizmos.DrawWireSphere(targetWorldPosition, innerRadiusMeters);
+			Gizmos.color = new Color(0.12f, 0.82f, 0.22f, 0.6f);
+			Gizmos.DrawWireSphere(targetWorldPosition, outerRadiusMeters);
+			Gizmos.color = Color.white;
+			Gizmos.DrawSphere(targetWorldPosition, 0.035f);
+
+			if (_coordinatedTaskPlanner.CopyLastDockingDebugSamples(_dockingDebugGizmoSamples) <= 0)
+			{
+				return;
+			}
+
+			for (int i = 0; i < _dockingDebugGizmoSamples.Count; i++)
+			{
+				CoordinatedTaskPlanner.DockingDebugSample sample = _dockingDebugGizmoSamples[i];
+				if (sample == null)
+				{
+					continue;
+				}
+
+				Vector3 ray = sample.targetWorldPosition - sample.baseWorldPosition;
+				if (sample.selected)
+				{
+					Gizmos.color = new Color(0.12f, 0.82f, 0.22f, 0.95f);
+					Gizmos.DrawRay(sample.baseWorldPosition, ray);
+					DrawGizmoCross(sample.baseWorldPosition, 0.05f);
+					continue;
+				}
+
+				if (sample.ikFailed)
+				{
+					Gizmos.color = new Color(0.92f, 0.15f, 0.15f, 0.9f);
+					Gizmos.DrawRay(sample.baseWorldPosition, ray);
+					DrawGizmoCross(sample.baseWorldPosition, 0.07f);
+					continue;
+				}
+
+				if (sample.strictPreviewFailed)
+				{
+					Gizmos.color = new Color(0.96f, 0.52f, 0.1f, 0.8f);
+					Gizmos.DrawRay(sample.baseWorldPosition, ray);
+					DrawGizmoCross(sample.baseWorldPosition, 0.04f);
+					continue;
+				}
+
+				Gizmos.color = new Color(0.18f, 0.58f, 0.96f, 0.55f);
+				Gizmos.DrawRay(sample.baseWorldPosition, ray);
+				DrawGizmoCross(sample.baseWorldPosition, 0.03f);
+			}
+		}
+
+		private static void DrawGizmoCross(Vector3 center, float halfSize)
+		{
+			Vector3 a = new Vector3(-halfSize, 0f, -halfSize);
+			Vector3 b = new Vector3(halfSize, 0f, halfSize);
+			Vector3 c = new Vector3(-halfSize, 0f, halfSize);
+			Vector3 d = new Vector3(halfSize, 0f, -halfSize);
+			Gizmos.DrawLine(center + a, center + b);
+			Gizmos.DrawLine(center + c, center + d);
 		}
 
 		public void Configure(RobotSimulationManager robotManager)

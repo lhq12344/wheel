@@ -240,6 +240,11 @@ namespace RobotSimulation
 			return _kinematicsModel.ComputeSpaceJacobian(jointAnglesDeg);
 		}
 
+		public float ComputeManipulabilityIndex(float[] jointAnglesDeg)
+		{
+			return _kinematicsModel.ComputeManipulabilityIndex(jointAnglesDeg);
+		}
+
 		public Vector3 WorldToBasePosition(Vector3 worldPosition)
 		{
 			return _kinematicsModel.WorldToBasePosition(GetBaseFrameTransform(), worldPosition);
@@ -989,7 +994,7 @@ namespace RobotSimulation
 				return;
 			}
 
-			#if UNITY_EDITOR
+#if UNITY_EDITOR
 			string[] guids = UnityEditor.AssetDatabase.FindAssets("Zu5_LDASM_unity_fixed");
 			for (int i = 0; i < guids.Length; i++)
 			{
@@ -1008,12 +1013,12 @@ namespace RobotSimulation
 				urdfSource = null;
 				break;
 			}
-			#endif
+#endif
 		}
 
 		private string ResolveUrdfText()
 		{
-			#if UNITY_EDITOR
+#if UNITY_EDITOR
 			if (IsValidUrdfPath(urdfAssetPath))
 			{
 				string fullPath = urdfAssetPath.Replace("Assets", Application.dataPath);
@@ -1022,7 +1027,7 @@ namespace RobotSimulation
 					return File.ReadAllText(fullPath);
 				}
 			}
-			#endif
+#endif
 
 			if (urdfSource != null)
 			{
@@ -1034,7 +1039,7 @@ namespace RobotSimulation
 
 		private void SanitizeUrdfReferences()
 		{
-			#if UNITY_EDITOR
+#if UNITY_EDITOR
 			if (urdfSource != null)
 			{
 				string sourcePath = UnityEditor.AssetDatabase.GetAssetPath(urdfSource);
@@ -1047,7 +1052,7 @@ namespace RobotSimulation
 					urdfAssetPath = sourcePath;
 				}
 			}
-			#endif
+#endif
 
 			if (!IsValidUrdfPath(urdfAssetPath))
 			{
@@ -1062,12 +1067,12 @@ namespace RobotSimulation
 				return true;
 			}
 
-			#if UNITY_EDITOR
+#if UNITY_EDITOR
 			if (urdfSource != null)
 			{
 				return IsValidUrdfPath(UnityEditor.AssetDatabase.GetAssetPath(urdfSource));
 			}
-			#endif
+#endif
 
 			return false;
 		}

@@ -40,6 +40,31 @@ namespace RobotSimulation.Tests.Editor
 			}
 		}
 
+		[Test]
+		public void ManipulabilityIndex_IsPositive_ForNominalConfigurations()
+		{
+			TextAsset urdf = LoadUrdf();
+			Assert.IsNotNull(urdf, "Zu5_LDASM_unity_fixed.urdf was not found.");
+
+			float[] homeAngles = Arm6DOFFKController.CreateDefaultConfiguredHomeJointAnglesDeg();
+			Arm6DOFKinematicsModel model = new Arm6DOFKinematicsModel();
+			Assert.IsTrue(model.Initialize(urdf, null, null, null, homeAngles), model.ErrorMessage);
+
+			float[][] samples =
+			{
+				homeAngles,
+				new float[] { 10f, -20f, 160f, -10f, 80f, 15f },
+				new float[] { -15f, 25f, 120f, 5f, 110f, -25f }
+			};
+
+			for (int i = 0; i < samples.Length; i++)
+			{
+				float manipulability = model.ComputeManipulabilityIndex(samples[i]);
+				Assert.That(manipulability, Is.GreaterThan(0f), $"Sample {i} should have a positive manipulability index.");
+				Assert.That(float.IsNaN(manipulability) || float.IsInfinity(manipulability), Is.False, $"Sample {i} manipulability should stay finite.");
+			}
+		}
+
 		private static TextAsset LoadUrdf()
 		{
 			string[] guids = AssetDatabase.FindAssets("Zu5_LDASM_unity_fixed t:TextAsset");

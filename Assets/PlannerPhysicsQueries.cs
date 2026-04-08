@@ -117,6 +117,62 @@ namespace RobotSimulation
 			return resolvedRadius;
 		}
 
+		public Vector3 EstimateBaseCollisionBoxHalfExtents(DiffDriveTwinController controller)
+		{
+			Vector3 fallbackHalfExtents = new Vector3(0.28f, Mathf.Max(0.15f, baseHalfHeight), 0.28f);
+			if (controller == null)
+			{
+				return fallbackHalfExtents;
+			}
+
+			Transform root = controller.rb != null ? controller.rb.transform : controller.transform;
+			if (root == null)
+			{
+				return fallbackHalfExtents;
+			}
+
+			Collider[] colliders = root.GetComponentsInChildren<Collider>(true);
+			float maxHalfExtentX = Mathf.Max(0.12f, fallbackHalfExtents.x);
+			float maxHalfExtentY = Mathf.Max(0.12f, fallbackHalfExtents.y);
+			float maxHalfExtentZ = Mathf.Max(0.12f, fallbackHalfExtents.z);
+			for (int i = 0; i < colliders.Length; i++)
+			{
+				Collider collider = colliders[i];
+				if (!IsRelevantBaseCollider(collider, root.position.y))
+				{
+					continue;
+				}
+
+				Bounds bounds = collider.bounds;
+				Vector3 min = bounds.min;
+				Vector3 max = bounds.max;
+				Vector3[] corners =
+				{
+					new Vector3(min.x, min.y, min.z),
+					new Vector3(min.x, min.y, max.z),
+					new Vector3(min.x, max.y, min.z),
+					new Vector3(min.x, max.y, max.z),
+					new Vector3(max.x, min.y, min.z),
+					new Vector3(max.x, min.y, max.z),
+					new Vector3(max.x, max.y, min.z),
+					new Vector3(max.x, max.y, max.z)
+				};
+
+				for (int cornerIndex = 0; cornerIndex < corners.Length; cornerIndex++)
+				{
+					Vector3 localCorner = root.InverseTransformPoint(corners[cornerIndex]);
+					maxHalfExtentX = Mathf.Max(maxHalfExtentX, Mathf.Abs(localCorner.x));
+					maxHalfExtentY = Mathf.Max(maxHalfExtentY, Mathf.Abs(localCorner.y));
+					maxHalfExtentZ = Mathf.Max(maxHalfExtentZ, Mathf.Abs(localCorner.z));
+				}
+			}
+
+			return new Vector3(
+				Mathf.Max(0.12f, maxHalfExtentX),
+				Mathf.Max(0.12f, Mathf.Max(baseHalfHeight, maxHalfExtentY)),
+				Mathf.Max(0.12f, maxHalfExtentZ));
+		}
+
 		private static bool IsRelevantBaseCollider(Collider collider, float baseCenterY)
 		{
 			if (collider == null || !collider.enabled || collider.isTrigger)
@@ -184,6 +240,67 @@ namespace RobotSimulation
 			}
 
 			return true;
+		}
+
+		public bool IsBasePoseBoxCollisionFree(Vector3 position, Quaternion rotation, Vector3 halfExtents, IReadOnlyList<Collider> obstacles, out Collider hitCollider)
+		{
+			hitCollider = null;
+			if (obstacles == null)
+			{
+				return true;
+			}
+
+			Vector3 safeHalfExtents = new Vector3(
+				Mathf.Max(0.05f, Mathf.Abs(halfExtents.x)),
+				Mathf.Max(0.05f, Mathf.Abs(halfExtents.y)),
+				Mathf.Max(0.05f, Mathf.Abs(halfExtents.z)));
+			Vector3 boxCenter = position + Vector3.up * safeHalfExtents.y;
+			int hitCount = Physics.OverlapBoxNonAlloc(
+				boxCenter,
+				safeHalfExtents,
+				_overlapBuffer,
+				rotation,
+				~0,
+				QueryTriggerInteraction.Ignore);
+			for (int i = 0; i < hitCount; i++)
+			{
+				Collider overlap = _overlapBuffer[i];
+				if (overlap == null)
+				{
+					continue;
+				}
+
+				if (!ContainsCollider(obstacles, overlap))
+				{
+					continue;
+				}
+
+				hitCollider = overlap;
+				return false;
+			}
+
+			return true;
+		}
+
+		public bool IsBasePoseCheckBoxCollisionFree(Vector3 position, Quaternion rotation, Vector3 halfExtents, IReadOnlyList<Collider> obstacles, out Collider hitCollider)
+		{
+			hitCollider = null;
+			if (obstacles == null)
+			{
+				return true;
+			}
+
+			Vector3 safeHalfExtents = new Vector3(
+				Mathf.Max(0.05f, Mathf.Abs(halfExtents.x)),
+				Mathf.Max(0.05f, Mathf.Abs(halfExtents.y)),
+				Mathf.Max(0.05f, Mathf.Abs(halfExtents.z)));
+			Vector3 boxCenter = position + Vector3.up * safeHalfExtents.y;
+			if (!Physics.CheckBox(boxCenter, safeHalfExtents, rotation, ~0, QueryTriggerInteraction.Ignore))
+			{
+				return true;
+			}
+
+			return IsBasePoseBoxCollisionFree(position, rotation, safeHalfExtents, obstacles, out hitCollider);
 		}
 
 		public bool IsSegmentCollisionFree(Vector3 start, Vector3 end, float radius, IReadOnlyList<Collider> obstacles, out Collider hitCollider)

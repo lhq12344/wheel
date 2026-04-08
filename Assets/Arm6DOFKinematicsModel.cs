@@ -237,6 +237,17 @@ namespace RobotSimulation
 			return jacobian;
 		}
 
+		public float ComputeManipulabilityIndex(float[] jointAnglesDeg)
+		{
+			return ComputeManipulabilityIndex(ComputeSpaceJacobian(jointAnglesDeg));
+		}
+
+		public static float ComputeManipulabilityIndex(float[,] jacobian)
+		{
+			float determinant = ComputeLinearJacobianGramDeterminant(jacobian);
+			return Mathf.Sqrt(Mathf.Max(1e-8f, determinant));
+		}
+
 		public Vector3 WorldToBasePosition(Transform armBase, Vector3 worldPosition)
 		{
 			return armBase != null ? armBase.InverseTransformPoint(worldPosition) : worldPosition;
@@ -469,6 +480,36 @@ namespace RobotSimulation
 			}
 
 			return safe;
+		}
+
+		private static float ComputeLinearJacobianGramDeterminant(float[,] jacobian)
+		{
+			if (jacobian == null
+				|| jacobian.GetLength(0) < 6
+				|| jacobian.GetLength(1) < JointCount)
+			{
+				return 0f;
+			}
+
+			float[,] jjt = new float[3, 3];
+			for (int row = 0; row < 3; row++)
+			{
+				for (int column = 0; column < 3; column++)
+				{
+					float sum = 0f;
+					for (int jointIndex = 0; jointIndex < JointCount; jointIndex++)
+					{
+						sum += jacobian[3 + row, jointIndex] * jacobian[3 + column, jointIndex];
+					}
+
+					jjt[row, column] = sum;
+				}
+			}
+
+			return
+				(jjt[0, 0] * ((jjt[1, 1] * jjt[2, 2]) - (jjt[1, 2] * jjt[2, 1])))
+				- (jjt[0, 1] * ((jjt[1, 0] * jjt[2, 2]) - (jjt[1, 2] * jjt[2, 0])))
+				+ (jjt[0, 2] * ((jjt[1, 0] * jjt[2, 1]) - (jjt[1, 1] * jjt[2, 0])));
 		}
 
 		private static void CopyAngles(float[] source, float[] destination)

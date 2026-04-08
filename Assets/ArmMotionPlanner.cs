@@ -112,7 +112,31 @@ namespace RobotSimulation
 			float[] trajectoryStartAnglesDeg = null,
 			float targetToleranceMeters = -1f)
 		{
+			return TrySolveToBasePosition(
+				armController,
+				targetBasePosition,
+				out solvedAnglesDeg,
+				out _,
+				out singularityPenalty,
+				out failureReason,
+				startAnglesDeg,
+				trajectoryStartAnglesDeg,
+				targetToleranceMeters);
+		}
+
+		public bool TrySolveToBasePosition(
+			Arm6DOFFKController armController,
+			Vector3 targetBasePosition,
+			out float[] solvedAnglesDeg,
+			out float bestResidualMeters,
+			out float singularityPenalty,
+			out string failureReason,
+			float[] startAnglesDeg = null,
+			float[] trajectoryStartAnglesDeg = null,
+			float targetToleranceMeters = -1f)
+		{
 			solvedAnglesDeg = new float[6];
+			bestResidualMeters = float.PositiveInfinity;
 			singularityPenalty = float.PositiveInfinity;
 			failureReason = string.Empty;
 			float solveToleranceMeters = ResolveSolveTolerance(targetToleranceMeters);
@@ -179,6 +203,13 @@ namespace RobotSimulation
 
 			if (!foundConvergedSolution || bestAngles == null)
 			{
+				bestResidualMeters = bestResidual;
+				singularityPenalty = bestSingularityPenalty;
+				if (bestAngles != null)
+				{
+					solvedAnglesDeg = bestAngles;
+				}
+
 				if (bestAngles != null
 					&& TrySolveNearbyTargetOffsets(
 						armController,
@@ -192,6 +223,7 @@ namespace RobotSimulation
 						out float nearbyTrajectoryPeakSingularity))
 				{
 					solvedAnglesDeg = nearbySolvedAngles;
+					bestResidualMeters = nearbyResidual;
 					singularityPenalty = nearbySingularityPenalty;
 					return true;
 				}
@@ -203,6 +235,7 @@ namespace RobotSimulation
 			}
 
 			solvedAnglesDeg = bestAngles;
+			bestResidualMeters = bestResidual;
 			singularityPenalty = bestSingularityPenalty;
 			return true;
 		}
