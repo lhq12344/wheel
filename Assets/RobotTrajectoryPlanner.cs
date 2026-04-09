@@ -44,6 +44,13 @@ namespace RobotSimulation
 		private const float ArmPlanningFallbackToleranceMeters = 0.04f;
 		private const float ArmPlanningFallbackToleranceSlackMeters = 0.012f;
 		private const float ArmPlanningDockingRetryResidualThresholdMeters = 0.08f;
+		private const float ArmExecutionDurationPaddingSeconds = 4f;
+		private const float ArmExecutionMinSegmentSeconds = 0.03f;
+		private const float ArmExecutionSpeedSafetyFactor = 1.2f;
+		private const float ArmExecutionCorrectionGraceSeconds = 2.5f;
+		private const float ArmExecutionCorrectionMaxResidualMeters = 0.18f;
+		private const float ArmExecutionCorrectionMaxJointErrorDeg = 65f;
+		private const float ArmExecutionCorrectionToleranceMeters = 0.05f;
 		private const int MaxArmPlanningDockingRetries = 1;
 		private const int MaxPostSettleCorrectionAttempts = 1;
 
@@ -621,9 +628,13 @@ namespace RobotSimulation
 						if (!_planOnly)
 						{
 							currentStage = RobotPlanningStage.ArmExecution;
-							Debug.Log("[RobotTrajectoryPlanner] Arm execution started.");
-							float armExecutionDeadline = Time.realtimeSinceStartup + armExecutionBudgetSeconds;
-							yield return ExecuteArmTrajectory(result, request, obstacles, armExecutionDeadline);
+							float armExecutionTimeScale = ComputeArmExecutionTimeScale(manager.arm6DOFFKController, armSamples);
+							float scaledExecutionSeconds = ComputeArmScaledExecutionSeconds(armSamples, armExecutionTimeScale);
+							float armExecutionDeadline = Time.realtimeSinceStartup + Mathf.Max(
+								armExecutionBudgetSeconds,
+								scaledExecutionSeconds + ArmExecutionDurationPaddingSeconds);
+							Debug.Log($"[RobotTrajectoryPlanner] Arm execution started. timeScale={armExecutionTimeScale:F2}, scaledDuration={scaledExecutionSeconds:F2}s, budget={armExecutionBudgetSeconds:F2}s");
+							yield return ExecuteArmTrajectory(result, request, obstacles, armExecutionDeadline, armExecutionTimeScale);
 							if (!string.IsNullOrEmpty(result.failureReason))
 							{
 								CompleteFailure(result, result.failedAtStage, result.failureReason, onComplete);
@@ -1021,7 +1032,7 @@ namespace RobotSimulation
 			}
 		}
 
-		private IEnumerator ExecuteArmTrajectory(RobotPlanResult result, RobotPlanRequest request, List<Collider> obstacles, float deadline)
+		private IEnumerator ExecuteArmTrajectory(RobotPlanResult result, RobotPlanRequest request, List<Collider> obstacles, float deadline, float executionTimeScale)
 		{
 			EnsurePlannerInternals();
 			int replanCount = result.replanCount;
@@ -1076,7 +1087,7 @@ namespace RobotSimulation
 				}
 
 				manager.arm6DOFFKController.ApplyAllJointTargetsRaw(sample.jointAnglesDeg);
-				float targetCommandTime = trajectoryStartTime + Mathf.Max(0.02f, sample.timeSeconds);
+				float targetCommandTime = trajectoryStartTime + Mathf.Max(ArmExecutionMinSegmentSeconds, sample.timeSeconds * Mathf.Max(1f, executionTimeScale));
 				while (Time.realtimeSinceStartup < targetCommandTime)
 				{
 					if (_stopRequested)
@@ -1122,12 +1133,14 @@ namespace RobotSimulation
 
 		private IEnumerator WaitForArmTrajectorySettled(RobotPlanResult result, RobotPlanRequest request, float[] finalTargetAnglesDeg, float deadline)
 		{
-			const float finalJointToleranceDeg = 2.0f;
+			const float finalJointToleranceDeg = 3.0f;
 			const int requiredStableFrames = 3;
 			int stableFrames = 0;
 			float finalPositionToleranceMeters = GetRequestedEeTolerance(request);
+			bool correctionAttempted = false;
+			float correctionDeadline = deadline + ArmExecutionCorrectionGraceSeconds;
 
-			while (Time.realtimeSinceStartup <= deadline)
+			while (Time.realtimeSinceStartup <= correctionDeadline)
 			{
 				if (_stopRequested)
 				{
@@ -1158,6 +1171,25 @@ namespace RobotSimulation
 				else
 				{
 					stableFrames = 0;
+				}
+
+				if (Time.realtimeSinceStartup > deadline && !correctionAttempted)
+				{
+					float correctionResidualDeg = manager.arm6DOFFKController.GetMaxJointAngleError(finalTargetAnglesDeg);
+					float correctionResidualMeters = Vector3.Distance(manager.arm6DOFFKController.EndEffectorWorldPosition, request.armTargetWorldPosition);
+					if (correctionResidualMeters <= ArmExecutionCorrectionMaxResidualMeters
+						&& correctionResidualDeg <= ArmExecutionCorrectionMaxJointErrorDeg)
+					{
+						correctionAttempted = true;
+						finalPositionToleranceMeters = Mathf.Max(finalPositionToleranceMeters, ArmExecutionCorrectionToleranceMeters);
+						manager.arm6DOFFKController.ApplyAllJointTargetsRaw(finalTargetAnglesDeg);
+						Debug.LogWarning(
+							$"[RobotTrajectoryPlanner] Arm settle timeout reached, attempting terminal correction. residualDeg={correctionResidualDeg:F2}, residualMeters={correctionResidualMeters:F3}, extraWindow={ArmExecutionCorrectionGraceSeconds:F1}s");
+						yield return new WaitForFixedUpdate();
+						continue;
+					}
+
+					break;
 				}
 
 				yield return new WaitForFixedUpdate();
@@ -1535,6 +1567,79 @@ namespace RobotSimulation
 			};
 			Debug.LogError($"[RobotTrajectoryPlanner] {exception}");
 			onComplete?.Invoke(failed);
+		}
+
+		private static float ComputeArmExecutionTimeScale(Arm6DOFFKController armController, List<RobotPlanJointSample> armSamples)
+		{
+			if (armController == null || armSamples == null || armSamples.Count == 0)
+			{
+				return 1f;
+			}
+
+			float[] previousAngles = armController.CaptureMeasuredJointAngles();
+			float previousTime = 0f;
+			float requiredScale = 1f;
+			for (int sampleIndex = 0; sampleIndex < armSamples.Count; sampleIndex++)
+			{
+				RobotPlanJointSample sample = armSamples[sampleIndex];
+				if (sample == null || sample.jointAnglesDeg == null || sample.jointAnglesDeg.Length < 6)
+				{
+					continue;
+				}
+
+				float plannedDeltaSeconds = Mathf.Max(ArmExecutionMinSegmentSeconds, sample.timeSeconds - previousTime);
+				float requiredSegmentSeconds = EstimateArmSegmentRequiredSeconds(armController, previousAngles, sample.jointAnglesDeg);
+				requiredScale = Mathf.Max(requiredScale, requiredSegmentSeconds / plannedDeltaSeconds);
+				previousAngles = (float[])sample.jointAnglesDeg.Clone();
+				previousTime = sample.timeSeconds;
+			}
+
+			return Mathf.Clamp(requiredScale, 1f, 8f);
+		}
+
+		private static float ComputeArmScaledExecutionSeconds(List<RobotPlanJointSample> armSamples, float executionTimeScale)
+		{
+			if (armSamples == null || armSamples.Count == 0)
+			{
+				return 0f;
+			}
+
+			float lastSampleTime = 0f;
+			for (int sampleIndex = 0; sampleIndex < armSamples.Count; sampleIndex++)
+			{
+				RobotPlanJointSample sample = armSamples[sampleIndex];
+				if (sample == null)
+				{
+					continue;
+				}
+
+				lastSampleTime = Mathf.Max(lastSampleTime, sample.timeSeconds);
+			}
+
+			return Mathf.Max(ArmExecutionMinSegmentSeconds, lastSampleTime * Mathf.Max(1f, executionTimeScale));
+		}
+
+		private static float EstimateArmSegmentRequiredSeconds(Arm6DOFFKController armController, float[] startAnglesDeg, float[] targetAnglesDeg)
+		{
+			float worstSeconds = ArmExecutionMinSegmentSeconds;
+			for (int jointIndex = 0; jointIndex < 6; jointIndex++)
+			{
+				float maxSpeedDegPerSecond = 60f;
+				if (armController.coordinatedJointControllers != null
+					&& jointIndex < armController.coordinatedJointControllers.Length
+					&& armController.coordinatedJointControllers[jointIndex] != null)
+				{
+					maxSpeedDegPerSecond = Mathf.Max(1f, armController.coordinatedJointControllers[jointIndex].vMaxDeg);
+				}
+
+				float startDeg = startAnglesDeg != null && startAnglesDeg.Length > jointIndex ? startAnglesDeg[jointIndex] : 0f;
+				float targetDeg = targetAnglesDeg != null && targetAnglesDeg.Length > jointIndex ? targetAnglesDeg[jointIndex] : startDeg;
+				float jointDeltaDeg = Mathf.Abs(Mathf.DeltaAngle(startDeg, targetDeg));
+				float jointRequiredSeconds = (jointDeltaDeg / maxSpeedDegPerSecond) * ArmExecutionSpeedSafetyFactor;
+				worstSeconds = Mathf.Max(worstSeconds, jointRequiredSeconds);
+			}
+
+			return Mathf.Max(ArmExecutionMinSegmentSeconds, worstSeconds);
 		}
 
 		private void EnsurePlannerInternals()

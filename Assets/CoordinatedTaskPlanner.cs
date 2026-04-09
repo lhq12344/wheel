@@ -40,6 +40,8 @@ namespace RobotSimulation
 		private const float DockingGeometryRadiusConsistencyToleranceMeters = 0.035f;
 		private const float DockingHardWorkspaceShellToleranceMeters = 0.01f;
 		private const float DockingPreferredRadiusMarginMeters = 0.015f;
+		private const float ArmBaseLocalOffsetWarnPositionDeltaMeters = 0.02f;
+		private const float ArmBaseLocalOffsetWarnRotationDeltaDeg = 1.0f;
 
 		private static readonly float[] SectorHalfAnglesDeg = { 25f, 45f, 70f, 180f };
 		private static readonly string[] SectorLabels =
@@ -221,6 +223,9 @@ namespace RobotSimulation
 		public int dockingDebugSampleLimit = 128;
 		public float residualDescentCoarseStepMeters = 0.10f;
 		public float residualDescentFineStepMeters = 0.02f;
+		public float residualDescentCoarseMaxStepMeters = 0.32f;
+		public float residualDescentFineMaxStepMeters = 0.08f;
+		public float residualDescentDynamicStepGain = 0.60f;
 		public float residualDescentAcceptResidualFloorMeters = 0.05f;
 		public int residualDescentMaxCoarseIterations = 8;
 		public int residualDescentMaxFineIterations = 16;
@@ -991,25 +996,30 @@ namespace RobotSimulation
 				return candidates;
 			}
 
-			float coarseStepMeters = Mathf.Max(0.01f, residualDescentCoarseStepMeters);
-			ResidualDescentSample coarseImprovement = FindBestResidualDescentNeighbor(
-				baseRoot,
-				armController,
-				armTargetWorldPosition,
-				currentBasePosition,
-				minReach,
-				maxReach,
-				preferredMin,
-				preferredMax,
-				requestedEeToleranceMeters,
-				baseRadius,
-				obstacleLookup,
-				buildStats,
-				activeSample,
-				coarseStepMeters,
-				1);
-			if (coarseImprovement != null)
+			for (int coarseIteration = 0; coarseIteration < Mathf.Max(1, residualDescentMaxCoarseIterations) && !hitAcceptResidual; coarseIteration++)
 			{
+				float coarseStepMeters = ComputeResidualDescentStepMeters(activeSample, acceptResidualMeters, fineSearch: false);
+				ResidualDescentSample coarseImprovement = FindBestResidualDescentNeighbor(
+					baseRoot,
+					armController,
+					armTargetWorldPosition,
+					currentBasePosition,
+					minReach,
+					maxReach,
+					preferredMin,
+					preferredMax,
+					requestedEeToleranceMeters,
+					baseRadius,
+					obstacleLookup,
+					buildStats,
+					activeSample,
+					coarseStepMeters,
+					coarseIteration + 1);
+				if (coarseImprovement == null)
+				{
+					break;
+				}
+
 				foundImprovement = true;
 				activeSample = coarseImprovement;
 				globalBest = CompareResidualDescentSamples(activeSample, globalBest) < 0 ? activeSample : globalBest;
@@ -1020,9 +1030,9 @@ namespace RobotSimulation
 
 			if (!hitAcceptResidual)
 			{
-				float fineStepMeters = Mathf.Max(0.005f, residualDescentFineStepMeters);
 				for (int iteration = 0; iteration < Mathf.Max(1, residualDescentMaxFineIterations); iteration++)
 				{
+					float fineStepMeters = ComputeResidualDescentStepMeters(activeSample, acceptResidualMeters, fineSearch: true);
 					ResidualDescentSample fineImprovement = FindBestResidualDescentNeighbor(
 						baseRoot,
 						armController,
@@ -1279,6 +1289,36 @@ namespace RobotSimulation
 				&& !sample.collisionBlocked
 				&& sample.candidate != null
 				&& sample.ikResidualMeters < Mathf.Max(0.001f, acceptResidualMeters);
+		}
+
+		private float ComputeResidualDescentStepMeters(
+			ResidualDescentSample activeSample,
+			float acceptResidualMeters,
+			bool fineSearch)
+		{
+			float minStepMeters = fineSearch
+				? Mathf.Max(0.005f, residualDescentFineStepMeters)
+				: Mathf.Max(0.01f, residualDescentCoarseStepMeters);
+			float maxStepMeters = fineSearch
+				? Mathf.Max(minStepMeters, residualDescentFineMaxStepMeters)
+				: Mathf.Max(minStepMeters, residualDescentCoarseMaxStepMeters);
+			if (activeSample == null)
+			{
+				return minStepMeters;
+			}
+
+			float ikSignal = IsFiniteValue(activeSample.ikResidualMeters)
+				? Mathf.Max(0f, activeSample.ikResidualMeters - acceptResidualMeters)
+				: Mathf.Max(acceptResidualMeters * 2f, activeSample.distanceBandPenaltyMeters);
+			float distanceSignal = Mathf.Max(0f, activeSample.distanceBandPenaltyMeters);
+			float residualSignal = Mathf.Max(ikSignal, distanceSignal);
+			if (activeSample.collisionBlocked)
+			{
+				residualSignal = Mathf.Max(residualSignal, minStepMeters * 2f);
+			}
+
+			float adaptiveStepMeters = minStepMeters + (residualSignal * Mathf.Max(0.01f, residualDescentDynamicStepGain));
+			return Mathf.Clamp(adaptiveStepMeters, minStepMeters, maxStepMeters);
 		}
 
 		private static int CompareResidualDescentSamples(ResidualDescentSample left, ResidualDescentSample right)
@@ -3010,7 +3050,8 @@ namespace RobotSimulation
 			{
 				float localPositionDelta = Vector3.Distance(_cachedArmBaseLocalPosition, armBaseLocalPosition);
 				float localRotationDelta = Quaternion.Angle(_cachedArmBaseLocalRotation, armBaseLocalRotation);
-				if (localPositionDelta > 0.002f || localRotationDelta > 0.5f)
+				if (localPositionDelta > ArmBaseLocalOffsetWarnPositionDeltaMeters
+					|| localRotationDelta > ArmBaseLocalOffsetWarnRotationDeltaDeg)
 				{
 					Debug.LogWarning(
 						$"[CoordinatedTaskPlanner] Arm-base local offset drift detected. cachedPosition={_cachedArmBaseLocalPosition}, livePosition={armBaseLocalPosition}, cachedRotation={_cachedArmBaseLocalRotation.eulerAngles}, liveRotation={armBaseLocalRotation.eulerAngles}, deltaPos={localPositionDelta:F4}m, deltaRot={localRotationDelta:F2}deg");
