@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
 
 namespace RobotSimulation
@@ -32,6 +34,7 @@ namespace RobotSimulation
 		private readonly LocalReplanner _localReplanner = new LocalReplanner();
 		private readonly CoordinatedTaskPlanner _coordinatedTaskPlanner = new CoordinatedTaskPlanner();
 		private readonly List<CoordinatedTaskPlanner.DockingDebugSample> _dockingDebugGizmoSamples = new List<CoordinatedTaskPlanner.DockingDebugSample>();
+		private readonly SafetyGateTimelineBuffer _safetyGateTimelineBuffer = new SafetyGateTimelineBuffer();
 
 		private const float BasePositionToleranceMeters = 0.02f;
 		private const float BaseStopAcceptanceMeters = 0.025f;
@@ -45,7 +48,7 @@ namespace RobotSimulation
 		private const float ArmPlanningFallbackToleranceSlackMeters = 0.012f;
 		private const float ArmPlanningDockingRetryResidualThresholdMeters = 0.08f;
 		private const float ArmExecutionDurationPaddingSeconds = 4f;
-		private const float ArmExecutionMinSegmentSeconds = 0.03f;
+		private const float ArmExecutionMinSegmentSeconds = 0.02f;
 		private const float ArmExecutionSpeedSafetyFactor = 1.2f;
 		private const float ArmExecutionCorrectionGraceSeconds = 2.5f;
 		private const float ArmExecutionCorrectionMaxResidualMeters = 0.18f;
@@ -53,6 +56,10 @@ namespace RobotSimulation
 		private const float ArmExecutionCorrectionToleranceMeters = 0.05f;
 		private const int MaxArmPlanningDockingRetries = 1;
 		private const int MaxPostSettleCorrectionAttempts = 1;
+		private const int SafetyGateBlockDecelFrames = 2;
+		private const float SafetyGateMinLookaheadFloorSeconds = 0.02f;
+		private const float SafetyGateRecoveryBudgetFloorSeconds = 4f;
+		private const float SafetyGateRecoveryBudgetCeilingSeconds = 12f;
 
 		private sealed class ArmStagePreparationState
 		{
@@ -62,9 +69,43 @@ namespace RobotSimulation
 		}
 
 		private ExecutionSafetyFilter _safetyFilter;
+		private readonly IMirrorStateProvider _mirrorStateProvider = new UnityMirrorStateProvider();
 		private Coroutine _planningRoutine;
 		private bool _stopRequested;
 		private bool _planOnly;
+		private long _safetyGateSequenceCounter;
+		private bool _loggedDynamicBaseLock;
+		private bool _startupCommandTraceLogged;
+		private bool _startupTraceSeedInitialized;
+		private long _startupTraceSequenceSeed;
+		private Vector3 _startupTraceBaseStartWorldPosition;
+		private float _startupTraceBaseTargetYawDeg;
+		private readonly List<Vector3> _startupTraceBaseWaypoints = new List<Vector3>();
+		private long _lastBaseQueueWaitSequenceId;
+		private long _lastArmQueueWaitSequenceId;
+		private CancellationTokenSource _offlineComputeCts;
+		private readonly SemaphoreSlim _offlineComputeSemaphore = new SemaphoreSlim(2, 2);
+
+		private struct ArmTimingSnapshot
+		{
+			public float[] startAnglesDeg;
+			public float[] maxJointSpeedDegPerSecond;
+			public List<RobotPlanJointSample> samples;
+		}
+
+		private struct ArmExecutionTimingEstimate
+		{
+			public float executionTimeScale;
+			public float scaledExecutionSeconds;
+		}
+
+		private struct StartupPreviewBuildResult
+		{
+			public int totalCount;
+			public bool hasBaseCommands;
+			public bool hasArmCommands;
+			public List<SafetyGateStartupPreviewItem> previewItems;
+		}
 
 		public RobotPlanningStage CurrentStage => currentStage;
 		public bool IsPlanning => isPlanning;
@@ -200,6 +241,8 @@ namespace RobotSimulation
 
 			_planOnly = !executePlan;
 			_stopRequested = false;
+			ResetSafetyGateTimelineState();
+			StartOfflineComputeSession();
 			lastSummary = _planOnly
 				? L("开始规划（仅规划）。", "Planning started (plan only).")
 				: L("开始规划。", "Planning started.");
@@ -211,6 +254,8 @@ namespace RobotSimulation
 		public void StopPlanning(bool emergencyStop)
 		{
 			_stopRequested = true;
+			_safetyGateTimelineBuffer.Clear();
+			CancelOfflineComputeSession();
 			if (manager != null)
 			{
 				if (emergencyStop)
@@ -225,6 +270,7 @@ namespace RobotSimulation
 			}
 
 			isPlanning = false;
+			ReturnShadowToMirror();
 		}
 
 		private IEnumerator PlanAndExecuteCoroutine(RobotPlanRequest request, Action<RobotPlanResult> onComplete)
@@ -257,6 +303,11 @@ namespace RobotSimulation
 			}
 
 			manager.EnsurePlanningSupportComponents();
+			MirrorSnapshot initialMirror = _mirrorStateProvider.Capture(manager.diffDriveController, manager.arm6DOFFKController);
+			if (manager.shadowRobotVisualizer != null)
+			{
+				manager.shadowRobotVisualizer.ResetToMirrorSnapshot(initialMirror, initialMirror.armJointAnglesDeg);
+			}
 			Transform baseIgnoreRoot = manager.diffDriveController.rb.transform.root;
 			Transform armIgnoreRoot = null;
 			if (manager.armBinder != null && manager.armBinder.armRoot != null)
@@ -281,6 +332,7 @@ namespace RobotSimulation
 			};
 			result.resolvedBaseStopWorldPosition = currentBasePosition;
 			result.resolvedBaseStopYawDeg = currentBaseYaw;
+			result.effectiveEePositionToleranceMeters = eeToleranceMeters;
 
 			if (request.requireArmMove)
 			{
@@ -438,6 +490,7 @@ namespace RobotSimulation
 				if (!_planOnly)
 				{
 					currentStage = RobotPlanningStage.BaseExecution;
+					EnterShadowBasePreview();
 					Debug.Log("[RobotTrajectoryPlanner] Base execution started.");
 					float baseExecutionDeadline = Time.realtimeSinceStartup + ComputeBaseExecutionBudgetSeconds(
 						manager.diffDriveController,
@@ -476,6 +529,7 @@ namespace RobotSimulation
 				manager.SyncArmToCurrentBasePoseImmediate();
 				manager.arm6DOFFKController?.RefreshRuntimeState();
 				yield return new WaitForFixedUpdate();
+				EnterShadowArmPreviewFromLiveBase();
 				AppendSummary(summaryParts, L("底盘已稳定停稳，随后开始机械臂阶段。", "Base settled cleanly before the arm stage started."));
 
 				yield return EnsureSettledBaseSupportsArmTarget(
@@ -600,7 +654,56 @@ namespace RobotSimulation
 							}
 						}
 
+						float plannedFinalResidualMeters = ComputeArmTrajectoryFinalWorldResidualMeters(
+							manager.arm6DOFFKController,
+							armSamples,
+							request.armTargetWorldPosition);
+						Debug.Log(
+							$"[RobotTrajectoryPlanner] Arm plan final EE residual={plannedFinalResidualMeters:F3}m, requestedTolerance={eeToleranceMeters:F3}m, effectiveTolerance={planningToleranceMeters:F3}m");
+						if (plannedFinalResidualMeters > eeToleranceMeters + 1e-4f)
+						{
+							if (!_planOnly
+								&& request.autoResolveBaseDockingPose
+								&& request.allowReplan
+								&& armPlanningDockingRetryCount < MaxArmPlanningDockingRetries)
+							{
+								AppendSummary(summaryParts, L(
+									$"机械臂规划虽然在执行容差 {planningToleranceMeters:F3}m 内找到解，但最终末端残差 {plannedFinalResidualMeters:F3}m 仍超过请求容差 {eeToleranceMeters:F3}m，开始重新搜索停靠位并重试。",
+									$"Arm planning found a solution within the execution tolerance {planningToleranceMeters:F3}m, but the final end-effector residual {plannedFinalResidualMeters:F3}m still exceeded the requested tolerance {eeToleranceMeters:F3}m, so docking search will retry."));
+								armPlanningDockingRetryCount++;
+								float baseExecutionDeadline = Time.realtimeSinceStartup + Mathf.Max(4f, baseExecutionBudgetSeconds);
+								yield return RetryDockingSearchAndMoveBaseIfNeeded(
+									request,
+									result,
+									summaryParts,
+									obstacles,
+									baseRadius,
+									baseExecutionDeadline,
+									armStageState);
+								if (!string.IsNullOrEmpty(result.failureReason))
+								{
+									CompleteFailure(result, result.failedAtStage, result.failureReason, onComplete);
+									yield break;
+								}
+
+								manager.SyncArmToCurrentBasePoseImmediate();
+								manager.arm6DOFFKController?.RefreshRuntimeState();
+								yield return new WaitForFixedUpdate();
+								continue;
+							}
+
+							CompleteFailure(
+								result,
+								RobotPlanningStage.ArmPlanning,
+								L(
+									$"机械臂规划最终末端残差为 {plannedFinalResidualMeters:F3}m，超过请求容差 {eeToleranceMeters:F3}m。",
+									$"Arm plan final end-effector residual {plannedFinalResidualMeters:F3}m exceeded the requested tolerance {eeToleranceMeters:F3}m."),
+								onComplete);
+							yield break;
+						}
+
 						result.armTrajectorySamples = armSamples;
+						result.effectiveEePositionToleranceMeters = planningToleranceMeters;
 						currentStage = RobotPlanningStage.ArmShadowValidation;
 						Debug.Log($"[RobotTrajectoryPlanner] Arm shadow validation: samples={armSamples.Count}");
 						lastShadowValidationResult = _shadowGate.ValidateArmTrajectory(manager.arm6DOFFKController, armSamples);
@@ -628,8 +731,17 @@ namespace RobotSimulation
 						if (!_planOnly)
 						{
 							currentStage = RobotPlanningStage.ArmExecution;
-							float armExecutionTimeScale = ComputeArmExecutionTimeScale(manager.arm6DOFFKController, armSamples);
-							float scaledExecutionSeconds = ComputeArmScaledExecutionSeconds(armSamples, armExecutionTimeScale);
+							EnterShadowArmPreviewFromLiveBase();
+							float armExecutionTimeScale = 1f;
+							float scaledExecutionSeconds = Mathf.Max(ArmExecutionMinSegmentSeconds, ComputeArmScaledExecutionSeconds(armSamples, 1f));
+							yield return ComputeArmExecutionTimingEstimateAsync(
+								manager.arm6DOFFKController,
+								armSamples,
+								estimate =>
+								{
+									armExecutionTimeScale = Mathf.Clamp(estimate.executionTimeScale, 1f, 8f);
+									scaledExecutionSeconds = Mathf.Max(ArmExecutionMinSegmentSeconds, estimate.scaledExecutionSeconds);
+								});
 							float armExecutionDeadline = Time.realtimeSinceStartup + Mathf.Max(
 								armExecutionBudgetSeconds,
 								scaledExecutionSeconds + ArmExecutionDurationPaddingSeconds);
@@ -954,8 +1066,32 @@ namespace RobotSimulation
 				yield break;
 			}
 
+			EnterShadowBasePreview();
+
 			int replanCount = result.replanCount;
 			List<Vector3> currentWaypoints = result.baseWaypoints != null ? new List<Vector3>(result.baseWaypoints) : new List<Vector3>();
+			SafetyGateRuntimeContext gateContext = BuildSafetyGateRuntimeContext(request, obstacles, baseRadius);
+			_safetyGateTimelineBuffer.Clear();
+			float[] armPreviewStartAngles = manager.arm6DOFFKController != null
+				? manager.arm6DOFFKController.CaptureMeasuredJointAngles()
+				: null;
+			yield return TraceStartupCommandBundleIfNeeded(
+				result,
+				request,
+				gateContext,
+				manager.diffDriveController.rb.position,
+				finalBaseYaw,
+				currentWaypoints,
+				armPreviewStartAngles,
+				result.armTrajectorySamples);
+			if (IsStartupCommandTraceEnabled(request))
+			{
+				Debug.Log($"[SafetyGate] Base queue initialized: pending={_safetyGateTimelineBuffer.Count}");
+			}
+
+			bool gateBlockPending = false;
+			int gateBlockDecelFramesRemaining = 0;
+			string gateBlockReason = string.Empty;
 			while (true)
 			{
 				if (_stopRequested)
@@ -1003,6 +1139,142 @@ namespace RobotSimulation
 				bool done = false;
 				bool success = false;
 				string message = string.Empty;
+				bool TryInterceptBaseCommand(
+					float linearVelocity,
+					float angularVelocity,
+					Vector3 trackingPoint,
+					out float adjustedLinearVelocity,
+					out float adjustedAngularVelocity,
+					out string blockReason)
+				{
+					adjustedLinearVelocity = linearVelocity;
+					adjustedAngularVelocity = angularVelocity;
+					blockReason = string.Empty;
+					if (!gateContext.enabled)
+					{
+						return true;
+					}
+
+					if (gateBlockPending)
+					{
+						if (gateBlockDecelFramesRemaining > 0)
+						{
+							gateBlockDecelFramesRemaining--;
+							adjustedLinearVelocity = linearVelocity * 0.2f;
+							adjustedAngularVelocity = angularVelocity * 0.2f;
+							return true;
+						}
+
+						manager.diffDriveController.HardStopAtGoal();
+						blockReason = gateBlockReason;
+						return false;
+					}
+
+					if (gateContext.dynamicBaseLockWhenEeWithinTolerance
+						&& request != null
+						&& request.requireArmMove
+						&& IsArmTargetWithinTolerance(request.armTargetWorldPosition, GetRequestedEeTolerance(request)))
+					{
+						if (!_loggedDynamicBaseLock)
+						{
+							_loggedDynamicBaseLock = true;
+							Debug.Log("[SafetyGate] Base command suppressed because EE is already within tolerance.");
+						}
+
+						adjustedLinearVelocity = 0f;
+						adjustedAngularVelocity = 0f;
+						return true;
+					}
+
+					_loggedDynamicBaseLock = false;
+					BaseGateCommand pendingCommand = new BaseGateCommand
+					{
+						fromWorldPosition = manager.diffDriveController.rb.position,
+						toWorldPosition = trackingPoint,
+						targetYawDeg = finalBaseYaw
+					};
+
+					RefreshSafetyGateLoadFactor(gateContext);
+					MirrorSnapshot mirror = _mirrorStateProvider.Capture(manager.diffDriveController, manager.arm6DOFFKController);
+					SafetyGateDecision decision = _shadowGate.EvaluateBaseCommand(mirror, pendingCommand, gateContext);
+					ApplySafetyGateDecisionTelemetry(result, RobotPlanningStage.BaseExecution, decision);
+					LogSafetyGateDecision(RobotPlanningStage.BaseExecution, decision);
+					PushShadowPredictionPose(decision);
+					float leadSeconds = ComputeSafetyGateLeadSeconds(gateContext, mirror, armMode: false, result);
+					long sequenceId = NextSafetyGateSequenceId();
+
+					if (decision.type == SafetyGateDecisionType.Block)
+					{
+						RecordSafetyGateQueueFlush(result, sequenceId);
+						gateBlockPending = true;
+						gateBlockDecelFramesRemaining = Mathf.Max(1, gateContext.decelFramesBeforeStop) - 1;
+						gateBlockReason = BuildSafetyGateFailureReason(RobotPlanningStage.BaseExecution, decision);
+						adjustedLinearVelocity = linearVelocity * 0.2f;
+						adjustedAngularVelocity = angularVelocity * 0.2f;
+						return true;
+					}
+
+					float commandThrottleRatio = decision.type == SafetyGateDecisionType.Throttle
+						? Mathf.Clamp(decision.throttleRatio, 0.2f, 1f)
+						: 1f;
+					SafetyGateTimelineCommand timelineCommand = new SafetyGateTimelineCommand
+					{
+						sequenceId = sequenceId,
+						enqueueRealtime = Time.realtimeSinceStartup,
+						kind = SafetyGateTimelineCommandKind.Base,
+						baseCommand = pendingCommand,
+						baseLinearVelocity = linearVelocity * commandThrottleRatio,
+						baseAngularVelocity = angularVelocity * commandThrottleRatio,
+						predictedBaseWorldPosition = decision.predictorState.predictedBaseWorldPosition,
+						predictedBaseWorldRotation = decision.predictorState.predictedBaseWorldRotation,
+						throttleRatio = commandThrottleRatio,
+						predictedLeadSeconds = leadSeconds,
+						readyRealtime = Time.realtimeSinceStartup + Mathf.Max(SafetyGateMinLookaheadFloorSeconds, leadSeconds),
+						predictedRiskSummary = decision.reason
+					};
+					_safetyGateTimelineBuffer.Enqueue(timelineCommand);
+					LogTimelineQueueEnqueueIfNeeded(request, armQueue: false, timelineCommand);
+					manager.shadowRobotVisualizer?.ApplyShadowStep(timelineCommand);
+
+					bool hasHeadCommand = false;
+					SafetyGateTimelineCommand headCommand = default;
+					float requiredLeadSeconds = leadSeconds;
+					if (_safetyGateTimelineBuffer.TryPeek(out headCommand))
+					{
+						hasHeadCommand = true;
+						requiredLeadSeconds = Mathf.Max(SafetyGateMinLookaheadFloorSeconds, headCommand.predictedLeadSeconds);
+					}
+
+					if (_safetyGateTimelineBuffer.TryDequeueReady(Time.realtimeSinceStartup, requiredLeadSeconds, out SafetyGateTimelineCommand executableCommand))
+					{
+						if (executableCommand.kind != SafetyGateTimelineCommandKind.Base)
+						{
+							RecordSafetyGateQueueFlush(result, executableCommand.sequenceId);
+							gateBlockPending = true;
+							gateBlockDecelFramesRemaining = Mathf.Max(1, gateContext.decelFramesBeforeStop) - 1;
+							gateBlockReason = "SafetyGate timeline kind mismatch while executing base command.";
+							adjustedLinearVelocity = linearVelocity * 0.2f;
+							adjustedAngularVelocity = angularVelocity * 0.2f;
+							return true;
+						}
+
+						float executionRatio = Mathf.Clamp(executableCommand.throttleRatio, 0.2f, 1f);
+						adjustedLinearVelocity = linearVelocity * executionRatio;
+						adjustedAngularVelocity = angularVelocity * executionRatio;
+						LogTimelineQueueDequeuedIfNeeded(request, armQueue: false, executableCommand);
+						return true;
+					}
+
+					if (hasHeadCommand)
+					{
+						LogTimelineQueueWaitingIfNeeded(request, armQueue: false, headCommand, requiredLeadSeconds);
+					}
+
+					adjustedLinearVelocity = 0f;
+					adjustedAngularVelocity = 0f;
+					return true;
+				}
+
 				yield return _basePathFollower.FollowWaypoints(
 					manager.diffDriveController,
 					currentWaypoints,
@@ -1014,7 +1286,8 @@ namespace RobotSimulation
 						success = ok;
 						message = text;
 						done = true;
-					});
+					},
+					TryInterceptBaseCommand);
 
 				while (!done)
 				{
@@ -1024,10 +1297,13 @@ namespace RobotSimulation
 				if (!success)
 				{
 					result.failedAtStage = RobotPlanningStage.BaseExecution;
-					result.failureReason = message;
+					result.failureReason = gateBlockPending && !string.IsNullOrEmpty(gateBlockReason)
+						? gateBlockReason
+						: message;
 					yield break;
 				}
 
+				_safetyGateTimelineBuffer.Clear();
 				yield break;
 			}
 		}
@@ -1035,10 +1311,35 @@ namespace RobotSimulation
 		private IEnumerator ExecuteArmTrajectory(RobotPlanResult result, RobotPlanRequest request, List<Collider> obstacles, float deadline, float executionTimeScale)
 		{
 			EnsurePlannerInternals();
+			EnterShadowArmPreviewFromLiveBase();
 			int replanCount = result.replanCount;
 			List<RobotPlanJointSample> currentSamples = result.armTrajectorySamples != null ? new List<RobotPlanJointSample>(result.armTrajectorySamples) : new List<RobotPlanJointSample>();
 			float[] previousAngles = manager.arm6DOFFKController.CaptureMeasuredJointAngles();
-			float trajectoryStartTime = Time.realtimeSinceStartup;
+			float previousSampleTimeSeconds = 0f;
+			float nextCommandTime = Time.realtimeSinceStartup;
+			float baseRadius = _physicsQueries.EstimateBaseRadius(manager.diffDriveController);
+			SafetyGateRuntimeContext gateContext = BuildSafetyGateRuntimeContext(request, obstacles, baseRadius);
+			_safetyGateTimelineBuffer.Clear();
+			yield return TraceStartupCommandBundleIfNeeded(
+				result,
+				request,
+				gateContext,
+				manager != null && manager.diffDriveController != null && manager.diffDriveController.rb != null
+					? manager.diffDriveController.rb.position
+					: Vector3.zero,
+				manager != null && manager.diffDriveController != null && manager.diffDriveController.rb != null
+					? manager.diffDriveController.rb.rotation.eulerAngles.y
+					: 0f,
+				result.baseWaypoints,
+				previousAngles,
+				currentSamples);
+			if (IsStartupCommandTraceEnabled(request))
+			{
+				Debug.Log($"[SafetyGate] Arm queue initialized: pending={_safetyGateTimelineBuffer.Count}");
+			}
+
+			int recoveryAttemptCount = result.safetyGateRecoveryAttemptCount;
+			int maxRecoveryAttempts = Mathf.Max(0, gateContext.maxRecoveryReplans);
 
 			for (int sampleIndex = 0; sampleIndex < currentSamples.Count; sampleIndex++)
 			{
@@ -1071,6 +1372,9 @@ namespace RobotSimulation
 							currentSamples = replannedSamples;
 							result.armTrajectorySamples = replannedSamples;
 							previousAngles = manager.arm6DOFFKController.CaptureMeasuredJointAngles();
+							previousSampleTimeSeconds = 0f;
+							nextCommandTime = Time.realtimeSinceStartup;
+							_safetyGateTimelineBuffer.Clear();
 							sampleIndex = -1;
 							currentStage = RobotPlanningStage.ArmExecution;
 							continue;
@@ -1086,9 +1390,128 @@ namespace RobotSimulation
 					yield break;
 				}
 
-				manager.arm6DOFFKController.ApplyAllJointTargetsRaw(sample.jointAnglesDeg);
-				float targetCommandTime = trajectoryStartTime + Mathf.Max(ArmExecutionMinSegmentSeconds, sample.timeSeconds * Mathf.Max(1f, executionTimeScale));
-				while (Time.realtimeSinceStartup < targetCommandTime)
+				ArmGateCommand pendingCommand = new ArmGateCommand
+				{
+					fromAnglesDeg = previousAngles != null ? (float[])previousAngles.Clone() : null,
+					toAnglesDeg = sample.jointAnglesDeg != null ? (float[])sample.jointAnglesDeg.Clone() : null
+				};
+				float commandThrottleRatio = 1f;
+				if (gateContext.enabled)
+				{
+					RefreshSafetyGateLoadFactor(gateContext);
+					MirrorSnapshot mirror = _mirrorStateProvider.Capture(manager.diffDriveController, manager.arm6DOFFKController);
+					SafetyGateDecision decision = _shadowGate.EvaluateArmCommand(mirror, pendingCommand, gateContext, manager.arm6DOFFKController);
+					ApplySafetyGateDecisionTelemetry(result, RobotPlanningStage.ArmExecution, decision);
+					LogSafetyGateDecision(RobotPlanningStage.ArmExecution, decision);
+					PushShadowPredictionPose(decision);
+					float leadSeconds = ComputeSafetyGateLeadSeconds(gateContext, mirror, armMode: true, result);
+					long sequenceId = NextSafetyGateSequenceId();
+
+					if (decision.type == SafetyGateDecisionType.Block)
+					{
+						RecordSafetyGateQueueFlush(result, sequenceId);
+						manager.arm6DOFFKController.HoldCurrentPose();
+						yield return new WaitForFixedUpdate();
+						float eeTolerance = GetEffectiveEeTolerance(result, request);
+						float eeError = Vector3.Distance(manager.arm6DOFFKController.EndEffectorWorldPosition, request.armTargetWorldPosition);
+						string gateFailureReason = BuildSafetyGateFailureReason(RobotPlanningStage.ArmExecution, decision);
+						if (recoveryAttemptCount < maxRecoveryAttempts && eeError > eeTolerance)
+						{
+							recoveryAttemptCount++;
+							result.safetyGateRecoveryAttemptCount = recoveryAttemptCount;
+							bool recovered = false;
+							string recoveryFailureReason = string.Empty;
+							ArmStagePreparationState recoveryState = new ArmStagePreparationState
+							{
+								ResolvedBaseGoal = manager.diffDriveController.rb.position,
+								ResolvedBaseYaw = manager.diffDriveController.rb.rotation.eulerAngles.y,
+								PreferredArmSolveSeed = null
+							};
+							List<string> recoverySummaryParts = new List<string>();
+							float remainingBudget = Mathf.Max(
+								SafetyGateRecoveryBudgetFloorSeconds,
+								Mathf.Min(
+									SafetyGateRecoveryBudgetCeilingSeconds,
+									Mathf.Max(0f, deadline - Time.realtimeSinceStartup)));
+							float recoveryDeadline = Time.realtimeSinceStartup + remainingBudget;
+							result.failureReason = string.Empty;
+							result.failedAtStage = RobotPlanningStage.None;
+							yield return RetryDockingSearchAndMoveBaseIfNeeded(
+								request,
+								result,
+								recoverySummaryParts,
+								obstacles,
+								baseRadius,
+								recoveryDeadline,
+								recoveryState);
+							recovered = string.IsNullOrEmpty(result.failureReason);
+							recoveryFailureReason = result.failureReason;
+							if (recovered)
+							{
+								_distanceFieldSampler.Build(
+									manager.arm6DOFFKController.EndEffectorWorldPosition,
+									request.armTargetWorldPosition,
+									obstacles,
+									Mathf.Max(0.2f, distanceFieldResolution),
+									2.5f);
+								if (_localReplanner.TryReplanArm(
+									_armMotionPlanner,
+									manager.arm6DOFFKController,
+									request.armTargetWorldPosition,
+									_distanceFieldSampler,
+									out List<RobotPlanJointSample> replannedAfterRecovery,
+									out _))
+								{
+									currentSamples = replannedAfterRecovery;
+									result.armTrajectorySamples = replannedAfterRecovery;
+								}
+
+								_safetyGateTimelineBuffer.Clear();
+								previousAngles = manager.arm6DOFFKController.CaptureMeasuredJointAngles();
+								previousSampleTimeSeconds = 0f;
+								nextCommandTime = Time.realtimeSinceStartup;
+								sampleIndex = -1;
+								currentStage = RobotPlanningStage.ArmExecution;
+								continue;
+							}
+
+							result.failedAtStage = RobotPlanningStage.ArmExecution;
+							result.failureReason = string.IsNullOrWhiteSpace(recoveryFailureReason)
+								? gateFailureReason
+								: $"{gateFailureReason} {recoveryFailureReason}";
+							yield break;
+						}
+
+						result.failedAtStage = RobotPlanningStage.ArmExecution;
+						result.failureReason = gateFailureReason;
+						yield break;
+					}
+
+					commandThrottleRatio = decision.type == SafetyGateDecisionType.Throttle
+						? Mathf.Clamp(decision.throttleRatio, 0.2f, 1f)
+						: 1f;
+					bool armExecutionPipelineWarmed = previousSampleTimeSeconds > 0f;
+					float commandReadyRealtime = armExecutionPipelineWarmed
+						? nextCommandTime
+						: Time.realtimeSinceStartup + Mathf.Max(SafetyGateMinLookaheadFloorSeconds, leadSeconds);
+					SafetyGateTimelineCommand timelineCommand = new SafetyGateTimelineCommand
+					{
+						sequenceId = sequenceId,
+						enqueueRealtime = Time.realtimeSinceStartup,
+						kind = SafetyGateTimelineCommandKind.Arm,
+						armCommand = pendingCommand,
+						throttleRatio = commandThrottleRatio,
+						predictedLeadSeconds = leadSeconds,
+						readyRealtime = commandReadyRealtime,
+						predictedRiskSummary = decision.reason
+					};
+					_safetyGateTimelineBuffer.Enqueue(timelineCommand);
+					LogTimelineQueueEnqueueIfNeeded(request, armQueue: true, timelineCommand);
+					manager.shadowRobotVisualizer?.ApplyShadowStep(timelineCommand);
+				}
+
+				bool commandExecuted = false;
+				while (!commandExecuted)
 				{
 					if (_stopRequested)
 					{
@@ -1113,21 +1536,91 @@ namespace RobotSimulation
 						yield break;
 					}
 
-					yield return new WaitForFixedUpdate();
-				}
+					float requiredLeadSeconds = 0f;
+					bool hasHeadCommand = false;
+					SafetyGateTimelineCommand headCommand = default;
+					if (gateContext.enabled && _safetyGateTimelineBuffer.TryPeek(out headCommand))
+					{
+						hasHeadCommand = true;
+						requiredLeadSeconds = Mathf.Max(SafetyGateMinLookaheadFloorSeconds, headCommand.predictedLeadSeconds);
+					}
 
-				previousAngles = (float[])sample.jointAnglesDeg.Clone();
+					if (!_safetyGateTimelineBuffer.TryDequeueReady(Time.realtimeSinceStartup, requiredLeadSeconds, out SafetyGateTimelineCommand executableCommand))
+					{
+						if (hasHeadCommand)
+						{
+							LogTimelineQueueWaitingIfNeeded(request, armQueue: true, headCommand, requiredLeadSeconds);
+						}
+
+						yield return new WaitForFixedUpdate();
+						continue;
+					}
+
+					if (executableCommand.kind != SafetyGateTimelineCommandKind.Arm)
+					{
+						RecordSafetyGateQueueFlush(result, executableCommand.sequenceId);
+						result.failedAtStage = RobotPlanningStage.ArmExecution;
+						result.failureReason = "SafetyGate timeline kind mismatch while executing arm command.";
+						yield break;
+					}
+
+					float segmentThrottleTimeScale = 1f / Mathf.Clamp(executableCommand.throttleRatio, 0.2f, 1f);
+					LogTimelineQueueDequeuedIfNeeded(request, armQueue: true, executableCommand);
+					manager.arm6DOFFKController.ApplyAllJointTargetsRaw(executableCommand.armCommand.toAnglesDeg);
+					float plannedSegmentSeconds = Mathf.Max(ArmExecutionMinSegmentSeconds, sample.timeSeconds - previousSampleTimeSeconds);
+					float targetCommandTime = nextCommandTime + (plannedSegmentSeconds * Mathf.Max(1f, executionTimeScale) * Mathf.Max(1f, segmentThrottleTimeScale));
+					previousSampleTimeSeconds = sample.timeSeconds;
+					nextCommandTime = targetCommandTime;
+
+					while (Time.realtimeSinceStartup < targetCommandTime)
+					{
+						if (_stopRequested)
+						{
+							result.failedAtStage = RobotPlanningStage.ArmExecution;
+							result.failureReason = L("规划已停止。", "Planning was stopped.");
+							yield break;
+						}
+
+						if (Time.realtimeSinceStartup > deadline)
+						{
+							result.failedAtStage = RobotPlanningStage.ArmExecution;
+							result.failureReason = L("机械臂执行阶段超时。", "Planning timed out during arm execution.");
+							yield break;
+						}
+
+						if (manager.armCollisionMonitor != null && manager.armCollisionMonitor.EvaluateCollisionState())
+						{
+							result.failedAtStage = RobotPlanningStage.ArmExecution;
+							result.failureReason = string.IsNullOrEmpty(manager.armCollisionMonitor.ActiveCollisionMessage)
+								? L("机械臂在轨迹执行过程中发生碰撞。", "Arm collided during trajectory execution.")
+								: manager.armCollisionMonitor.ActiveCollisionMessage;
+							yield break;
+						}
+
+						yield return new WaitForFixedUpdate();
+					}
+
+					previousAngles = executableCommand.armCommand.toAnglesDeg != null
+						? (float[])executableCommand.armCommand.toAnglesDeg.Clone()
+						: previousAngles;
+					commandExecuted = true;
+				}
 			}
 
 			if (currentSamples.Count > 0)
 			{
-				yield return WaitForArmTrajectorySettled(result, request, currentSamples[currentSamples.Count - 1].jointAnglesDeg, deadline);
+				yield return WaitForArmTrajectorySettled(
+					result,
+					request,
+					currentSamples[currentSamples.Count - 1].jointAnglesDeg,
+					deadline);
 				if (!string.IsNullOrEmpty(result.failureReason))
 				{
 					yield break;
 				}
 			}
 
+			_safetyGateTimelineBuffer.Clear();
 			manager.arm6DOFFKController.HoldCurrentPose();
 		}
 
@@ -1136,7 +1629,7 @@ namespace RobotSimulation
 			const float finalJointToleranceDeg = 3.0f;
 			const int requiredStableFrames = 3;
 			int stableFrames = 0;
-			float finalPositionToleranceMeters = GetRequestedEeTolerance(request);
+			float finalPositionToleranceMeters = GetEffectiveEeTolerance(result, request);
 			bool correctionAttempted = false;
 			float correctionDeadline = deadline + ArmExecutionCorrectionGraceSeconds;
 
@@ -1183,8 +1676,9 @@ namespace RobotSimulation
 						correctionAttempted = true;
 						finalPositionToleranceMeters = Mathf.Max(finalPositionToleranceMeters, ArmExecutionCorrectionToleranceMeters);
 						manager.arm6DOFFKController.ApplyAllJointTargetsRaw(finalTargetAnglesDeg);
+						LogArmSettleDiagnostics(request, finalTargetAnglesDeg);
 						Debug.LogWarning(
-							$"[RobotTrajectoryPlanner] Arm settle timeout reached, attempting terminal correction. residualDeg={correctionResidualDeg:F2}, residualMeters={correctionResidualMeters:F3}, extraWindow={ArmExecutionCorrectionGraceSeconds:F1}s");
+							$"[RobotTrajectoryPlanner] Arm settle timeout reached, attempting terminal correction. residualDeg={correctionResidualDeg:F2}, residualMeters={correctionResidualMeters:F3}, tolerance={finalPositionToleranceMeters:F3}, extraWindow={ArmExecutionCorrectionGraceSeconds:F1}s");
 						yield return new WaitForFixedUpdate();
 						continue;
 					}
@@ -1197,10 +1691,778 @@ namespace RobotSimulation
 
 			float residualDeg = manager.arm6DOFFKController.GetMaxJointAngleError(finalTargetAnglesDeg);
 			float residualMeters = Vector3.Distance(manager.arm6DOFFKController.EndEffectorWorldPosition, request.armTargetWorldPosition);
+			LogArmSettleDiagnostics(request, finalTargetAnglesDeg);
+			Debug.LogWarning(
+				$"[RobotTrajectoryPlanner] Arm settle failed after correction window. residualDeg={residualDeg:F2}, residualMeters={residualMeters:F3}, tolerance={finalPositionToleranceMeters:F3}");
 			result.failedAtStage = RobotPlanningStage.ArmExecution;
 			result.failureReason = L(
-				$"机械臂轨迹未能平滑稳定到位，最终关节误差={residualDeg:F2}°，末端误差={residualMeters:F3}m。",
-				$"Arm trajectory did not settle smoothly enough. Final joint error={residualDeg:F2}deg, EE error={residualMeters:F3}m.");
+				$"机械臂轨迹未能平滑稳定到位，最终关节误差={residualDeg:F2}°，末端误差={residualMeters:F3}m，收敛容差={finalPositionToleranceMeters:F3}m。",
+				$"Arm trajectory did not settle smoothly enough. Final joint error={residualDeg:F2}deg, EE error={residualMeters:F3}m, settle tolerance={finalPositionToleranceMeters:F3}m.");
+		}
+
+		private SafetyGateRuntimeContext BuildSafetyGateRuntimeContext(
+			RobotPlanRequest request,
+			IReadOnlyList<Collider> obstacles,
+			float baseRadius)
+		{
+			SafetyGateRequestSettings settings = request != null ? request.safetyGate : null;
+			SafetyGateRuntimeContext context = new SafetyGateRuntimeContext
+			{
+				enabled = settings == null || settings.enabled,
+				throttleOnRisk = settings == null || settings.throttleOnRisk,
+				commLatencySeconds = settings != null ? Mathf.Max(0f, settings.commLatencySeconds) : 0.04f,
+				computeBudgetSeconds = settings != null ? Mathf.Max(0f, settings.computeBudgetSeconds) : 0.02f,
+				minLookaheadSeconds = settings != null ? Mathf.Max(SafetyGateMinLookaheadFloorSeconds, settings.minLookaheadSeconds) : 0.08f,
+				baseInflationMeters = settings != null ? Mathf.Max(0f, settings.baseInflationMeters) : 0.02f,
+				armInflationMeters = settings != null ? Mathf.Max(0f, settings.armInflationMeters) : 0.015f,
+				queueLeadTimeSeconds = settings != null ? Mathf.Max(0f, settings.queueLeadTimeSeconds) : 0f,
+				maxRecoveryReplans = settings != null ? Mathf.Max(0, settings.maxRecoveryReplans) : 3,
+				dynamicBaseLockWhenEeWithinTolerance = settings == null || settings.dynamicBaseLockWhenEeWithinTolerance,
+				decelFramesBeforeStop = settings != null ? Mathf.Max(1, settings.decelFramesBeforeStop) : SafetyGateBlockDecelFrames,
+				baseRadiusMeters = Mathf.Max(0.05f, baseRadius),
+				obstacles = obstacles
+			};
+
+			RefreshSafetyGateLoadFactor(context);
+			return context;
+		}
+
+		private void ResetSafetyGateTimelineState()
+		{
+			_safetyGateTimelineBuffer.Clear();
+			_safetyGateSequenceCounter = 0;
+			_loggedDynamicBaseLock = false;
+			_startupCommandTraceLogged = false;
+			_startupTraceSeedInitialized = false;
+			_startupTraceSequenceSeed = 0;
+			_startupTraceBaseStartWorldPosition = Vector3.zero;
+			_startupTraceBaseTargetYawDeg = 0f;
+			_startupTraceBaseWaypoints.Clear();
+			_lastBaseQueueWaitSequenceId = 0;
+			_lastArmQueueWaitSequenceId = 0;
+		}
+
+		private void StartOfflineComputeSession()
+		{
+			CancelOfflineComputeSession();
+			_offlineComputeCts = new CancellationTokenSource();
+		}
+
+		private void CancelOfflineComputeSession()
+		{
+			if (_offlineComputeCts == null)
+			{
+				return;
+			}
+
+			try
+			{
+				_offlineComputeCts.Cancel();
+			}
+			catch
+			{
+				// ignored
+			}
+			finally
+			{
+				_offlineComputeCts.Dispose();
+				_offlineComputeCts = null;
+			}
+		}
+
+		private long NextSafetyGateSequenceId()
+		{
+			_safetyGateSequenceCounter++;
+			return _safetyGateSequenceCounter;
+		}
+
+		private float ComputeSafetyGateLeadSeconds(
+			SafetyGateRuntimeContext context,
+			MirrorSnapshot snapshot,
+			bool armMode,
+			RobotPlanResult result = null)
+		{
+			if (context == null)
+			{
+				return 0.08f;
+			}
+
+			float baseWindow = Mathf.Max(
+				Mathf.Max(context.minLookaheadSeconds, SafetyGateMinLookaheadFloorSeconds),
+				context.commLatencySeconds + context.computeBudgetSeconds);
+			float brakeWindow = 0f;
+			if (!armMode)
+			{
+				brakeWindow = snapshot.basePlanarSpeed / Mathf.Max(0.05f, context.baseBrakeDecelMetersPerSecond2);
+			}
+			else if (snapshot.armJointVelocitiesDegPerSecond != null)
+			{
+				float maxJointSpeed = 0f;
+				for (int i = 0; i < snapshot.armJointVelocitiesDegPerSecond.Length; i++)
+				{
+					maxJointSpeed = Mathf.Max(maxJointSpeed, Mathf.Abs(snapshot.armJointVelocitiesDegPerSecond[i]));
+				}
+
+				brakeWindow = maxJointSpeed / Mathf.Max(1f, context.armBrakeDecelDegPerSecond2);
+			}
+
+			float leadSeconds = Mathf.Max(Mathf.Max(baseWindow, brakeWindow), context.queueLeadTimeSeconds);
+			if (result != null)
+			{
+				result.safetyGateLastDeltaTSeconds = leadSeconds;
+			}
+
+			return leadSeconds;
+		}
+
+		private void RecordSafetyGateQueueFlush(
+			RobotPlanResult result,
+			long blockedSequenceId)
+		{
+			int flushedCount = _safetyGateTimelineBuffer.Flush();
+			if (flushedCount > 0)
+			{
+				Debug.LogWarning($"[SafetyGate] Timeline queue flushed: count={flushedCount}, blockedSeq={blockedSequenceId}");
+			}
+
+			if (result == null)
+			{
+				return;
+			}
+
+			result.safetyGateQueueFlushCount++;
+			result.safetyGateLastBlockSequenceId = blockedSequenceId;
+		}
+
+		private void RefreshSafetyGateLoadFactor(SafetyGateRuntimeContext context)
+		{
+			if (context == null)
+			{
+				return;
+			}
+
+			context.loadFactor = manager != null && manager.onlineCalibration != null
+				? Mathf.Clamp01(manager.onlineCalibration.ArmZeroOffsetBlend)
+				: 0f;
+		}
+
+		private static void ApplySafetyGateDecisionTelemetry(
+			RobotPlanResult result,
+			RobotPlanningStage stage,
+			SafetyGateDecision decision)
+		{
+			if (result == null || decision == null)
+			{
+				return;
+			}
+
+			if (decision.type != SafetyGateDecisionType.Allow)
+			{
+				result.safetyGateInterceptCount++;
+			}
+
+			if (!float.IsNaN(decision.leadTimeMs) && !float.IsInfinity(decision.leadTimeMs))
+			{
+				result.safetyGateMinLeadTimeMs = float.IsInfinity(result.safetyGateMinLeadTimeMs)
+					? decision.leadTimeMs
+					: Mathf.Min(result.safetyGateMinLeadTimeMs, decision.leadTimeMs);
+			}
+
+			if (!float.IsNaN(decision.minPredictedClearanceMeters) && !float.IsInfinity(decision.minPredictedClearanceMeters))
+			{
+				result.safetyGateMinPredictedClearanceMeters = float.IsInfinity(result.safetyGateMinPredictedClearanceMeters)
+					? decision.minPredictedClearanceMeters
+					: Mathf.Min(result.safetyGateMinPredictedClearanceMeters, decision.minPredictedClearanceMeters);
+			}
+
+			result.safetyGateLastDecision = decision.type.ToString();
+			string stageName = RobotSimulationLocalization.PlanningStage(stage);
+			string reason = string.IsNullOrWhiteSpace(decision.reason)
+				? decision.blockCategory.ToString()
+				: decision.reason;
+			result.safetyGateLastReason = $"{stageName}: {reason}";
+		}
+
+		private static void LogSafetyGateDecision(RobotPlanningStage stage, SafetyGateDecision decision)
+		{
+			if (decision == null)
+			{
+				return;
+			}
+
+			string stageName = RobotSimulationLocalization.PlanningStage(stage);
+			string reason = string.IsNullOrWhiteSpace(decision.reason) ? "none" : decision.reason;
+			string message =
+				$"[SafetyGate] stage={stageName}, decision={decision.type}, leadTimeMs={decision.leadTimeMs:F1}, dMin={decision.minPredictedClearanceMeters:F3}, throttleRatio={decision.throttleRatio:F2}, blockCategory={decision.blockCategory}, reason={reason}";
+			if (decision.type == SafetyGateDecisionType.Allow)
+			{
+				Debug.Log(message);
+			}
+			else
+			{
+				Debug.LogWarning(message);
+			}
+		}
+
+		private static string BuildSafetyGateFailureReason(RobotPlanningStage stage, SafetyGateDecision decision)
+		{
+			string stageName = RobotSimulationLocalization.PlanningStage(stage);
+			string category = decision != null ? decision.blockCategory.ToString() : SafetyGateBlockCategory.None.ToString();
+			string reason = decision != null && !string.IsNullOrWhiteSpace(decision.reason)
+				? decision.reason
+				: "Safety gate blocked execution.";
+			return $"SafetyGate[{stageName}/{category}] {reason}";
+		}
+
+		private void PushShadowPredictionPose(SafetyGateDecision decision)
+		{
+			if (manager == null || manager.shadowRobotVisualizer == null || decision == null)
+			{
+				return;
+			}
+
+			Vector3 predictedPosition = decision.predictorState.predictedBaseWorldPosition;
+			Quaternion predictedRotation = decision.predictorState.predictedBaseWorldRotation;
+			float holdSeconds = Mathf.Max(0.08f, decision.predictorState.predictedLeadTimeSeconds);
+			if (predictedRotation == default)
+			{
+				predictedRotation = manager.diffDriveController != null && manager.diffDriveController.rb != null
+					? manager.diffDriveController.rb.rotation
+					: Quaternion.identity;
+			}
+
+			manager.shadowRobotVisualizer.PushPredictedBasePose(predictedPosition, predictedRotation, holdSeconds);
+		}
+
+		private static bool IsStartupCommandTraceEnabled(RobotPlanRequest request)
+		{
+			return request == null || request.safetyGate == null || request.safetyGate.enableStartupCommandTrace;
+		}
+
+		private static int ResolveStartupPreviewMaxItems(RobotPlanRequest request)
+		{
+			if (request == null || request.safetyGate == null)
+			{
+				return 8;
+			}
+
+			return Mathf.Clamp(request.safetyGate.startupPreviewMaxItems, 1, 32);
+		}
+
+		private IEnumerator TraceStartupCommandBundleIfNeeded(
+			RobotPlanResult result,
+			RobotPlanRequest request,
+			SafetyGateRuntimeContext context,
+			Vector3 baseStartWorldPosition,
+			float baseTargetYawDeg,
+			IReadOnlyList<Vector3> baseWaypoints,
+			float[] armStartAnglesDeg,
+			IReadOnlyList<RobotPlanJointSample> armSamples)
+		{
+			if (_startupCommandTraceLogged || result == null || !IsStartupCommandTraceEnabled(request))
+			{
+				yield break;
+			}
+
+			if (!_startupTraceSeedInitialized)
+			{
+				_startupTraceSeedInitialized = true;
+				_startupTraceSequenceSeed = _safetyGateSequenceCounter + 1;
+				_startupTraceBaseStartWorldPosition = baseStartWorldPosition;
+				_startupTraceBaseTargetYawDeg = baseTargetYawDeg;
+				_startupTraceBaseWaypoints.Clear();
+				_startupTraceBaseWaypoints.AddRange(CloneWaypoints(baseWaypoints));
+			}
+			else if (_startupTraceBaseWaypoints.Count == 0 && baseWaypoints != null && baseWaypoints.Count > 0)
+			{
+				_startupTraceBaseWaypoints.AddRange(CloneWaypoints(baseWaypoints));
+			}
+
+			List<Vector3> effectiveBaseWaypoints = _startupTraceBaseWaypoints.Count > 0
+				? new List<Vector3>(_startupTraceBaseWaypoints)
+				: CloneWaypoints(baseWaypoints);
+			Vector3 effectiveBaseStart = _startupTraceSeedInitialized
+				? _startupTraceBaseStartWorldPosition
+				: baseStartWorldPosition;
+			float effectiveBaseYawDeg = _startupTraceSeedInitialized
+				? _startupTraceBaseTargetYawDeg
+				: baseTargetYawDeg;
+
+			MirrorSnapshot mirror = _mirrorStateProvider.Capture(manager != null ? manager.diffDriveController : null, manager != null ? manager.arm6DOFFKController : null);
+			float baseLeadSeconds = effectiveBaseWaypoints.Count > 0
+				? ComputeSafetyGateLeadSeconds(context, mirror, armMode: false, result)
+				: 0f;
+			float armLeadSeconds = armSamples != null && armSamples.Count > 0
+				? ComputeSafetyGateLeadSeconds(context, mirror, armMode: true, result)
+				: 0f;
+			int maxPreviewItems = ResolveStartupPreviewMaxItems(request);
+			float baseNominalSpeed = manager != null && manager.diffDriveController != null
+				? Mathf.Max(0.1f, manager.diffDriveController.vMax)
+				: 0.6f;
+			List<Vector3> baseWaypointsCopy = CloneWaypoints(effectiveBaseWaypoints);
+			List<RobotPlanJointSample> armSamplesCopy = CloneJointSamplesForPreview(armSamples);
+			float[] armStartCopy = armStartAnglesDeg != null ? (float[])armStartAnglesDeg.Clone() : new float[6];
+
+			StartupPreviewBuildResult previewResult = default;
+			yield return RunOfflineComputation(
+				token => BuildStartupPreviewItems(
+					effectiveBaseStart,
+					effectiveBaseYawDeg,
+					baseWaypointsCopy,
+					baseNominalSpeed,
+					baseLeadSeconds,
+					armStartCopy,
+					armSamplesCopy,
+					armLeadSeconds,
+					Math.Max(1L, _startupTraceSequenceSeed),
+					maxPreviewItems,
+					token),
+				value => previewResult = value,
+				"startup-command-preview");
+
+			if (previewResult.previewItems == null)
+			{
+				yield break;
+			}
+
+			result.startupCommandPreview = previewResult.previewItems;
+			result.startupCommandCount = previewResult.totalCount;
+			Debug.Log($"[SafetyGate] StartupCommandBundle: total={previewResult.totalCount}, preview={previewResult.previewItems.Count}, hasBase={previewResult.hasBaseCommands}, hasArm={previewResult.hasArmCommands}");
+			for (int i = 0; i < previewResult.previewItems.Count; i++)
+			{
+				SafetyGateStartupPreviewItem item = previewResult.previewItems[i];
+				Debug.Log($"[SafetyGate] StartupPreview[{i}] seq={item.sequenceId}, kind={item.kind}, t={item.plannedTimeSeconds:F3}s, lead={item.leadTimeSeconds:F3}s, throttle={item.throttleRatio:F2}, from={item.fromSummary}, to={item.toSummary}");
+			}
+
+			if (!previewResult.hasBaseCommands)
+			{
+				Debug.Log("[SafetyGate] Startup command preview contains no base commands (base movement may be unnecessary for this request).");
+			}
+
+			if (request != null && request.requireArmMove && !previewResult.hasArmCommands)
+			{
+				bool armSamplesPending = armSamples == null || armSamples.Count == 0;
+				if (armSamplesPending)
+				{
+					Debug.Log("[SafetyGate] Startup command preview currently contains no arm commands because arm trajectory samples are not available yet. The preview will retry after arm planning finishes.");
+				}
+				else
+				{
+					Debug.LogWarning("[SafetyGate] Startup command preview still contains no arm commands even though arm trajectory samples are already available. Please inspect arm command generation.");
+				}
+
+				yield break;
+			}
+
+			if (!previewResult.hasArmCommands && (request == null || !request.requireArmMove))
+			{
+				Debug.Log("[SafetyGate] Startup command preview contains no arm commands (arm movement is not required for this request).");
+			}
+
+			_startupCommandTraceLogged = true;
+		}
+
+		private static float ResolveTimelineCommandReadyRealtime(SafetyGateTimelineCommand command, float requiredLeadSeconds)
+		{
+			float required = Mathf.Max(Mathf.Max(0f, requiredLeadSeconds), command.predictedLeadSeconds);
+			float inferredReady = command.enqueueRealtime + required;
+			return command.readyRealtime > 0f ? Mathf.Max(command.readyRealtime, inferredReady) : inferredReady;
+		}
+
+		private static string FormatBaseCommandSummary(BaseGateCommand command)
+		{
+			return $"to=({command.toWorldPosition.x:F3},{command.toWorldPosition.y:F3},{command.toWorldPosition.z:F3}), yaw={command.targetYawDeg:F1}";
+		}
+
+		private static string FormatArmCommandSummary(ArmGateCommand command)
+		{
+			return command.toAnglesDeg == null || command.toAnglesDeg.Length < 6
+				? "to=j[n/a]"
+				: $"to=j[{command.toAnglesDeg[0]:F1},{command.toAnglesDeg[1]:F1},{command.toAnglesDeg[2]:F1},{command.toAnglesDeg[3]:F1},{command.toAnglesDeg[4]:F1},{command.toAnglesDeg[5]:F1}]";
+		}
+
+		private void LogTimelineQueueEnqueueIfNeeded(RobotPlanRequest request, bool armQueue, SafetyGateTimelineCommand command)
+		{
+			if (!IsStartupCommandTraceEnabled(request))
+			{
+				return;
+			}
+
+			float readyAt = ResolveTimelineCommandReadyRealtime(command, command.predictedLeadSeconds);
+			string queueName = armQueue ? "Arm" : "Base";
+			string targetSummary = armQueue ? FormatArmCommandSummary(command.armCommand) : FormatBaseCommandSummary(command.baseCommand);
+			Debug.Log($"[SafetyGate] {queueName} queue enqueue: pending={_safetyGateTimelineBuffer.Count}, seq={command.sequenceId}, readyIn={Mathf.Max(0f, readyAt - Time.realtimeSinceStartup):F3}s, {targetSummary}");
+		}
+
+		private void LogTimelineQueueWaitingIfNeeded(
+			RobotPlanRequest request,
+			bool armQueue,
+			SafetyGateTimelineCommand headCommand,
+			float requiredLeadSeconds)
+		{
+			if (!IsStartupCommandTraceEnabled(request))
+			{
+				return;
+			}
+
+			long lastWaitSequenceId = armQueue ? _lastArmQueueWaitSequenceId : _lastBaseQueueWaitSequenceId;
+			if (lastWaitSequenceId == headCommand.sequenceId)
+			{
+				return;
+			}
+
+			float now = Time.realtimeSinceStartup;
+			float readyAt = ResolveTimelineCommandReadyRealtime(headCommand, requiredLeadSeconds);
+			string queueName = armQueue ? "Arm" : "Base";
+			Debug.Log($"[SafetyGate] {queueName} queue waiting: pending={_safetyGateTimelineBuffer.Count}, headSeq={headCommand.sequenceId}, firstReadyIn={Mathf.Max(0f, readyAt - now):F3}s");
+			if (armQueue)
+			{
+				_lastArmQueueWaitSequenceId = headCommand.sequenceId;
+			}
+			else
+			{
+				_lastBaseQueueWaitSequenceId = headCommand.sequenceId;
+			}
+		}
+
+		private void LogTimelineQueueDequeuedIfNeeded(
+			RobotPlanRequest request,
+			bool armQueue,
+			SafetyGateTimelineCommand command)
+		{
+			if (!IsStartupCommandTraceEnabled(request))
+			{
+				return;
+			}
+
+			string queueName = armQueue ? "Arm" : "Base";
+			string targetSummary = armQueue ? FormatArmCommandSummary(command.armCommand) : FormatBaseCommandSummary(command.baseCommand);
+			Debug.Log($"[SafetyGate] {queueName} queue dequeue: pending={_safetyGateTimelineBuffer.Count}, seq={command.sequenceId}, throttle={command.throttleRatio:F2}, {targetSummary}");
+			if (armQueue)
+			{
+				_lastArmQueueWaitSequenceId = 0;
+			}
+			else
+			{
+				_lastBaseQueueWaitSequenceId = 0;
+			}
+		}
+
+		private IEnumerator ComputeArmExecutionTimingEstimateAsync(
+			Arm6DOFFKController armController,
+			List<RobotPlanJointSample> armSamples,
+			Action<ArmExecutionTimingEstimate> onComplete)
+		{
+			if (armController == null || armSamples == null || armSamples.Count == 0)
+			{
+				onComplete?.Invoke(new ArmExecutionTimingEstimate
+				{
+					executionTimeScale = 1f,
+					scaledExecutionSeconds = 0f
+				});
+				yield break;
+			}
+
+			ArmTimingSnapshot snapshot = CaptureArmTimingSnapshot(armController, armSamples);
+			ArmExecutionTimingEstimate estimate = default;
+			yield return RunOfflineComputation(
+				token => ComputeArmExecutionTimingEstimate(snapshot, token),
+				value => estimate = value,
+				"arm-execution-timing");
+
+			if (estimate.executionTimeScale <= 0f)
+			{
+				estimate.executionTimeScale = 1f;
+			}
+
+			if (estimate.scaledExecutionSeconds <= 0f)
+			{
+				estimate.scaledExecutionSeconds = ComputeArmScaledExecutionSeconds(armSamples, estimate.executionTimeScale);
+			}
+
+			onComplete?.Invoke(estimate);
+		}
+
+		private IEnumerator RunOfflineComputation<T>(
+			Func<CancellationToken, T> worker,
+			Action<T> onSuccess,
+			string label)
+		{
+			CancellationToken token = _offlineComputeCts != null ? _offlineComputeCts.Token : CancellationToken.None;
+			Task<T> task;
+			try
+			{
+				task = Task.Run(() =>
+				{
+					token.ThrowIfCancellationRequested();
+					_offlineComputeSemaphore.Wait(token);
+					try
+					{
+						token.ThrowIfCancellationRequested();
+						return worker(token);
+					}
+					finally
+					{
+						_offlineComputeSemaphore.Release();
+					}
+				}, token);
+			}
+			catch (Exception ex)
+			{
+				Debug.LogWarning($"[RobotTrajectoryPlanner] Failed to start offline computation '{label}': {ex.Message}");
+				yield break;
+			}
+
+			while (!task.IsCompleted)
+			{
+				yield return null;
+			}
+
+			if (task.IsCanceled || token.IsCancellationRequested)
+			{
+				yield break;
+			}
+
+			if (task.IsFaulted)
+			{
+				Debug.LogWarning($"[RobotTrajectoryPlanner] Offline computation '{label}' failed: {task.Exception?.GetBaseException().Message}");
+				yield break;
+			}
+
+			onSuccess?.Invoke(task.Result);
+		}
+
+		private static List<Vector3> CloneWaypoints(IReadOnlyList<Vector3> waypoints)
+		{
+			List<Vector3> copy = new List<Vector3>();
+			if (waypoints == null)
+			{
+				return copy;
+			}
+
+			for (int i = 0; i < waypoints.Count; i++)
+			{
+				copy.Add(waypoints[i]);
+			}
+
+			return copy;
+		}
+
+		private static List<RobotPlanJointSample> CloneJointSamplesForPreview(IReadOnlyList<RobotPlanJointSample> samples)
+		{
+			List<RobotPlanJointSample> copy = new List<RobotPlanJointSample>();
+			if (samples == null)
+			{
+				return copy;
+			}
+
+			for (int i = 0; i < samples.Count; i++)
+			{
+				RobotPlanJointSample sample = samples[i];
+				if (sample == null || sample.jointAnglesDeg == null || sample.jointAnglesDeg.Length < 6)
+				{
+					continue;
+				}
+
+				copy.Add(new RobotPlanJointSample
+				{
+					timeSeconds = sample.timeSeconds,
+					jointAnglesDeg = (float[])sample.jointAnglesDeg.Clone(),
+					clearance = sample.clearance,
+					singularityPenalty = sample.singularityPenalty
+				});
+			}
+
+			return copy;
+		}
+
+		private static ArmTimingSnapshot CaptureArmTimingSnapshot(
+			Arm6DOFFKController armController,
+			IReadOnlyList<RobotPlanJointSample> armSamples)
+		{
+			ArmTimingSnapshot snapshot = new ArmTimingSnapshot
+			{
+				startAnglesDeg = armController != null ? armController.CaptureMeasuredJointAngles() : new float[6],
+				maxJointSpeedDegPerSecond = new float[6],
+				samples = CloneJointSamplesForPreview(armSamples)
+			};
+
+			for (int i = 0; i < snapshot.maxJointSpeedDegPerSecond.Length; i++)
+			{
+				float maxSpeed = 60f;
+				if (armController != null
+					&& armController.coordinatedJointControllers != null
+					&& i < armController.coordinatedJointControllers.Length
+					&& armController.coordinatedJointControllers[i] != null)
+				{
+					maxSpeed = Mathf.Max(1f, armController.coordinatedJointControllers[i].vMaxDeg);
+				}
+
+				snapshot.maxJointSpeedDegPerSecond[i] = maxSpeed;
+			}
+
+			return snapshot;
+		}
+
+		private static ArmExecutionTimingEstimate ComputeArmExecutionTimingEstimate(ArmTimingSnapshot snapshot, CancellationToken token)
+		{
+			ArmExecutionTimingEstimate estimate = new ArmExecutionTimingEstimate
+			{
+				executionTimeScale = 1f,
+				scaledExecutionSeconds = 0f
+			};
+			if (snapshot.samples == null || snapshot.samples.Count == 0)
+			{
+				return estimate;
+			}
+
+			float[] previousAngles = snapshot.startAnglesDeg != null && snapshot.startAnglesDeg.Length >= 6
+				? (float[])snapshot.startAnglesDeg.Clone()
+				: new float[6];
+			float previousTime = 0f;
+			float requiredScale = 1f;
+			float lastSampleTime = 0f;
+			for (int sampleIndex = 0; sampleIndex < snapshot.samples.Count; sampleIndex++)
+			{
+				token.ThrowIfCancellationRequested();
+				RobotPlanJointSample sample = snapshot.samples[sampleIndex];
+				if (sample == null || sample.jointAnglesDeg == null || sample.jointAnglesDeg.Length < 6)
+				{
+					continue;
+				}
+
+				float plannedDeltaSeconds = Mathf.Max(ArmExecutionMinSegmentSeconds, sample.timeSeconds - previousTime);
+				float requiredSegmentSeconds = EstimateArmSegmentRequiredSecondsOffline(previousAngles, sample.jointAnglesDeg, snapshot.maxJointSpeedDegPerSecond);
+				requiredScale = Mathf.Max(requiredScale, requiredSegmentSeconds / plannedDeltaSeconds);
+				previousAngles = (float[])sample.jointAnglesDeg.Clone();
+				previousTime = sample.timeSeconds;
+				lastSampleTime = Mathf.Max(lastSampleTime, sample.timeSeconds);
+			}
+
+			estimate.executionTimeScale = Mathf.Clamp(requiredScale, 1f, 8f);
+			estimate.scaledExecutionSeconds = Mathf.Max(ArmExecutionMinSegmentSeconds, lastSampleTime * Mathf.Max(1f, estimate.executionTimeScale));
+			return estimate;
+		}
+
+		private static float EstimateArmSegmentRequiredSecondsOffline(float[] startAnglesDeg, float[] targetAnglesDeg, float[] maxJointSpeedDegPerSecond)
+		{
+			float worstSeconds = ArmExecutionMinSegmentSeconds;
+			for (int jointIndex = 0; jointIndex < 6; jointIndex++)
+			{
+				float maxSpeed = maxJointSpeedDegPerSecond != null && maxJointSpeedDegPerSecond.Length > jointIndex
+					? Mathf.Max(1f, maxJointSpeedDegPerSecond[jointIndex])
+					: 60f;
+				float startDeg = startAnglesDeg != null && startAnglesDeg.Length > jointIndex ? startAnglesDeg[jointIndex] : 0f;
+				float targetDeg = targetAnglesDeg != null && targetAnglesDeg.Length > jointIndex ? targetAnglesDeg[jointIndex] : startDeg;
+				float jointDeltaDeg = Mathf.Abs(Mathf.DeltaAngle(startDeg, targetDeg));
+				float jointRequiredSeconds = (jointDeltaDeg / maxSpeed) * ArmExecutionSpeedSafetyFactor;
+				worstSeconds = Mathf.Max(worstSeconds, jointRequiredSeconds);
+			}
+
+			return Mathf.Max(ArmExecutionMinSegmentSeconds, worstSeconds);
+		}
+
+		private static StartupPreviewBuildResult BuildStartupPreviewItems(
+			Vector3 baseStartWorldPosition,
+			float baseTargetYawDeg,
+			IReadOnlyList<Vector3> baseWaypoints,
+			float baseNominalSpeedMetersPerSecond,
+			float baseLeadSeconds,
+			float[] armStartAnglesDeg,
+			IReadOnlyList<RobotPlanJointSample> armSamples,
+			float armLeadSeconds,
+			long startingSequenceId,
+			int maxPreviewItems,
+			CancellationToken token)
+		{
+			StartupPreviewBuildResult result = new StartupPreviewBuildResult
+			{
+				totalCount = 0,
+				hasBaseCommands = false,
+				hasArmCommands = false,
+				previewItems = new List<SafetyGateStartupPreviewItem>()
+			};
+
+			long sequenceId = startingSequenceId;
+			float plannedTime = 0f;
+			Vector3 previousBase = baseStartWorldPosition;
+			if (baseWaypoints != null)
+			{
+				for (int i = 0; i < baseWaypoints.Count; i++)
+				{
+					token.ThrowIfCancellationRequested();
+					Vector3 target = baseWaypoints[i];
+					float planarDistance = Vector3.Distance(new Vector3(previousBase.x, 0f, previousBase.z), new Vector3(target.x, 0f, target.z));
+					float dt = Mathf.Max(0.02f, planarDistance / Mathf.Max(0.1f, baseNominalSpeedMetersPerSecond));
+					plannedTime += dt;
+					result.totalCount++;
+					result.hasBaseCommands = true;
+					if (result.previewItems.Count < maxPreviewItems)
+					{
+						result.previewItems.Add(new SafetyGateStartupPreviewItem
+						{
+							sequenceId = sequenceId,
+							kind = SafetyGateTimelineCommandKind.Base.ToString(),
+							plannedTimeSeconds = plannedTime,
+							leadTimeSeconds = baseLeadSeconds,
+							throttleRatio = 1f,
+							fromSummary = $"pos=({previousBase.x:F3},{previousBase.y:F3},{previousBase.z:F3})",
+							toSummary = $"pos=({target.x:F3},{target.y:F3},{target.z:F3}), yaw={baseTargetYawDeg:F1}"
+						});
+					}
+
+					sequenceId++;
+					previousBase = target;
+				}
+			}
+
+			float armTimelineOffset = plannedTime;
+			float[] previousArmAngles = armStartAnglesDeg != null && armStartAnglesDeg.Length >= 6
+				? (float[])armStartAnglesDeg.Clone()
+				: new float[6];
+			if (armSamples != null)
+			{
+				for (int i = 0; i < armSamples.Count; i++)
+				{
+					token.ThrowIfCancellationRequested();
+					RobotPlanJointSample sample = armSamples[i];
+					if (sample == null || sample.jointAnglesDeg == null || sample.jointAnglesDeg.Length < 6)
+					{
+						continue;
+					}
+
+					result.totalCount++;
+					result.hasArmCommands = true;
+					if (result.previewItems.Count < maxPreviewItems)
+					{
+						result.previewItems.Add(new SafetyGateStartupPreviewItem
+						{
+							sequenceId = sequenceId,
+							kind = SafetyGateTimelineCommandKind.Arm.ToString(),
+							plannedTimeSeconds = armTimelineOffset + Mathf.Max(0f, sample.timeSeconds),
+							leadTimeSeconds = armLeadSeconds,
+							throttleRatio = 1f,
+							fromSummary = FormatAnglesSummary(previousArmAngles),
+							toSummary = FormatAnglesSummary(sample.jointAnglesDeg)
+						});
+					}
+
+					previousArmAngles = (float[])sample.jointAnglesDeg.Clone();
+					sequenceId++;
+				}
+			}
+
+			return result;
+		}
+
+		private static string FormatAnglesSummary(float[] anglesDeg)
+		{
+			if (anglesDeg == null || anglesDeg.Length < 6)
+			{
+				return "j=[n/a]";
+			}
+
+			return $"j=[{anglesDeg[0]:F1},{anglesDeg[1]:F1},{anglesDeg[2]:F1},{anglesDeg[3]:F1},{anglesDeg[4]:F1},{anglesDeg[5]:F1}]";
 		}
 
 		private IEnumerator RetryDockingSearchAndMoveBaseIfNeeded(
@@ -1323,6 +2585,7 @@ namespace RobotSimulation
 			}
 
 			manager.diffDriveController.CompletePointGoal(state.ResolvedBaseGoal);
+			EnterShadowArmPreviewFromLiveBase();
 		}
 
 		private bool ValidateBasePathSegments(List<Vector3> waypoints, float baseRadius, List<Collider> obstacles, out ShadowValidationResult validation)
@@ -1444,6 +2707,30 @@ namespace RobotSimulation
 				&& Vector3.Distance(manager.arm6DOFFKController.EndEffectorWorldPosition, armTargetWorldPosition) <= Mathf.Max(0.001f, toleranceMeters);
 		}
 
+		private static float ComputeArmTrajectoryFinalWorldResidualMeters(
+			Arm6DOFFKController armController,
+			IReadOnlyList<RobotPlanJointSample> armSamples,
+			Vector3 targetWorldPosition)
+		{
+			if (armController == null || armSamples == null || armSamples.Count == 0)
+			{
+				return float.PositiveInfinity;
+			}
+
+			RobotPlanJointSample lastSample = armSamples[armSamples.Count - 1];
+			if (lastSample == null || lastSample.jointAnglesDeg == null || lastSample.jointAnglesDeg.Length < 6)
+			{
+				return float.PositiveInfinity;
+			}
+
+			Pose finalPoseBase = armController.ForwardPoe(lastSample.jointAnglesDeg);
+			Transform baseFrame = armController.BaseFrameTransform;
+			Vector3 finalWorldPosition = baseFrame != null
+				? baseFrame.TransformPoint(finalPoseBase.position)
+				: finalPoseBase.position;
+			return Vector3.Distance(finalWorldPosition, targetWorldPosition);
+		}
+
 		private static void AppendSummary(List<string> parts, string message)
 		{
 			if (parts == null || string.IsNullOrWhiteSpace(message))
@@ -1469,6 +2756,8 @@ namespace RobotSimulation
 		private void CompleteSuccess(RobotPlanResult result, List<string> summaryParts, Action<RobotPlanResult> onComplete)
 		{
 			currentStage = RobotPlanningStage.Completed;
+			_safetyGateTimelineBuffer.Clear();
+			CancelOfflineComputeSession();
 			result.success = true;
 			result.failedAtStage = RobotPlanningStage.None;
 			result.failureReason = string.Empty;
@@ -1476,12 +2765,15 @@ namespace RobotSimulation
 			lastSummary = result.summary;
 			isPlanning = false;
 			_planningRoutine = null;
+			ReturnShadowToMirror();
 			onComplete?.Invoke(result);
 		}
 
 		private void CompleteFailure(RobotPlanResult result, RobotPlanningStage stage, string reason, Action<RobotPlanResult> onComplete)
 		{
 			currentStage = RobotPlanningStage.Failed;
+			_safetyGateTimelineBuffer.Clear();
+			CancelOfflineComputeSession();
 			result.success = false;
 			result.failedAtStage = stage;
 			result.failureReason = reason;
@@ -1494,7 +2786,50 @@ namespace RobotSimulation
 			Debug.LogWarning($"[RobotTrajectoryPlanner] Failed at {RobotSimulationLocalization.PlanningStage(stage)}: {reason}");
 			isPlanning = false;
 			_planningRoutine = null;
+			ReturnShadowToMirror();
 			onComplete?.Invoke(result);
+		}
+
+		private void EnterShadowBasePreview()
+		{
+			if (_planOnly || manager == null || manager.shadowRobotVisualizer == null)
+			{
+				return;
+			}
+
+			manager.shadowRobotVisualizer.EnterBasePreview();
+		}
+
+		private void EnterShadowArmPreviewFromLiveBase()
+		{
+			if (_planOnly
+				|| manager == null
+				|| manager.shadowRobotVisualizer == null
+				|| manager.diffDriveController == null
+				|| manager.diffDriveController.rb == null)
+			{
+				return;
+			}
+
+			manager.shadowRobotVisualizer.EnterArmPreview(
+				manager.diffDriveController.rb.position,
+				manager.diffDriveController.rb.rotation);
+		}
+
+		private void ReturnShadowToMirror()
+		{
+			if (manager == null || manager.shadowRobotVisualizer == null)
+			{
+				return;
+			}
+
+			manager.shadowRobotVisualizer.ReturnToMirror();
+		}
+
+		private void OnDestroy()
+		{
+			CancelOfflineComputeSession();
+			_offlineComputeSemaphore.Dispose();
 		}
 
 		private void RemoveRobotOwnedObstacles(List<Collider> obstacles, Transform baseIgnoreRoot, Transform armIgnoreRoot)
@@ -1557,6 +2892,8 @@ namespace RobotSimulation
 		{
 			RobotPlanResult failed = BuildImmediateFailure(L($"规划器异常：{exception.Message}", $"Planner exception: {exception.Message}"));
 			currentStage = RobotPlanningStage.Failed;
+			_safetyGateTimelineBuffer.Clear();
+			CancelOfflineComputeSession();
 			isPlanning = false;
 			_planningRoutine = null;
 			lastSummary = failed.summary;
@@ -1566,6 +2903,7 @@ namespace RobotSimulation
 				message = failed.summary
 			};
 			Debug.LogError($"[RobotTrajectoryPlanner] {exception}");
+			ReturnShadowToMirror();
 			onComplete?.Invoke(failed);
 		}
 
@@ -1688,6 +3026,35 @@ namespace RobotSimulation
 			}
 
 			return Mathf.Max(0.001f, request.eePositionToleranceMeters > 0f ? request.eePositionToleranceMeters : ArmWorldTargetToleranceMeters);
+		}
+
+		private static float GetEffectiveEeTolerance(RobotPlanResult result, RobotPlanRequest request)
+		{
+			if (result != null && result.effectiveEePositionToleranceMeters > 0f)
+			{
+				return Mathf.Max(0.001f, result.effectiveEePositionToleranceMeters);
+			}
+
+			return GetRequestedEeTolerance(request);
+		}
+
+		private string BuildArmSettleDiagnosticReport(RobotPlanRequest request, float[] finalTargetAnglesDeg)
+		{
+			if (manager == null || manager.arm6DOFFKController == null)
+			{
+				return "[RobotTrajectoryPlanner] Arm coordinated diagnostics unavailable.";
+			}
+
+			Vector3? targetWorldPosition = request != null ? request.armTargetWorldPosition : (Vector3?)null;
+			return manager.arm6DOFFKController.BuildCoordinatedDiagnosticReport(
+				manager.armBinder,
+				targetWorldPosition,
+				finalTargetAnglesDeg);
+		}
+
+		private void LogArmSettleDiagnostics(RobotPlanRequest request, float[] finalTargetAnglesDeg)
+		{
+			Debug.LogWarning(BuildArmSettleDiagnosticReport(request, finalTargetAnglesDeg));
 		}
 
 		private static Vector3 ProjectXZ(Vector3 value)

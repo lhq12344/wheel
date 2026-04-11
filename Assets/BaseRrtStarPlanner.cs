@@ -343,6 +343,14 @@ namespace RobotSimulation
 
 	public sealed class BasePathFollower
 	{
+		public delegate bool BaseCommandInterceptor(
+			float linearVelocity,
+			float angularVelocity,
+			Vector3 trackingPoint,
+			out float adjustedLinearVelocity,
+			out float adjustedAngularVelocity,
+			out string blockReason);
+
 		private const float LookaheadDistance = 0.35f;
 		private const float DockingDistance = 0.40f;
 		private const float PositionTolerance = 0.02f;
@@ -371,7 +379,8 @@ namespace RobotSimulation
 			float finalYawDeg,
 			bool alignFinalYaw,
 			System.Func<bool> shouldCancel,
-			System.Action<bool, string> onComplete)
+			System.Action<bool, string> onComplete,
+			BaseCommandInterceptor commandInterceptor = null)
 		{
 			if (controller == null || controller.rb == null)
 			{
@@ -465,12 +474,22 @@ namespace RobotSimulation
 					if (remaining > DockingDistance)
 					{
 						ComputePurePursuitCommand(controller, trackingPoint, remaining, out float linearVelocity, out float angularVelocity);
-						controller.SetVelocityCommand(linearVelocity, angularVelocity, trackingPoint);
+						if (!TryApplyCommand(controller, commandInterceptor, linearVelocity, angularVelocity, trackingPoint, out string blockReason))
+						{
+							controller.ClearVelocityCommand(true);
+							onComplete?.Invoke(false, blockReason);
+							yield break;
+						}
 					}
 					else
 					{
 						ComputeDockingCommand(controller, finalGoal, remaining, out float linearVelocity, out float angularVelocity);
-						controller.SetVelocityCommand(linearVelocity, angularVelocity, finalGoal);
+						if (!TryApplyCommand(controller, commandInterceptor, linearVelocity, angularVelocity, finalGoal, out string blockReason))
+						{
+							controller.ClearVelocityCommand(true);
+							onComplete?.Invoke(false, blockReason);
+							yield break;
+						}
 					}
 				}
 
@@ -515,6 +534,32 @@ namespace RobotSimulation
 			float pursuitAngular = linearVelocity * curvature;
 			float headingAngular = controller.kYaw * headingError;
 			angularVelocity = Mathf.Clamp(Mathf.Lerp(headingAngular, pursuitAngular, 0.65f), -controller.wMax, controller.wMax);
+		}
+
+		private static bool TryApplyCommand(
+			DiffDriveTwinController controller,
+			BaseCommandInterceptor commandInterceptor,
+			float linearVelocity,
+			float angularVelocity,
+			Vector3 trackingPoint,
+			out string blockReason)
+		{
+			blockReason = string.Empty;
+			float adjustedLinear = linearVelocity;
+			float adjustedAngular = angularVelocity;
+			if (commandInterceptor != null
+				&& !commandInterceptor(linearVelocity, angularVelocity, trackingPoint, out adjustedLinear, out adjustedAngular, out blockReason))
+			{
+				if (string.IsNullOrWhiteSpace(blockReason))
+				{
+					blockReason = "Safety gate blocked the base command.";
+				}
+
+				return false;
+			}
+
+			controller.SetVelocityCommand(adjustedLinear, adjustedAngular, trackingPoint);
+			return true;
 		}
 
 		private static void ComputeDockingCommand(DiffDriveTwinController controller, Vector3 finalGoal, float remainingDistance, out float linearVelocity, out float angularVelocity)

@@ -29,6 +29,10 @@ namespace RobotSimulation
 		public RobotModelResidualTracker residualTracker;
 		public OnlineModelCalibration onlineCalibration;
 
+		[Header("Shadow Visualization")]
+		public ShadowRobotVisualizer shadowRobotVisualizer;
+		[SerializeField] private bool enableShadowRobotVisualization = true;
+
 		[Header("Robot State")]
 		[SerializeField] private RobotState _robotState;
 		[SerializeField] private ArmMoveResult _lastArmMoveResult = new ArmMoveResult();
@@ -83,6 +87,8 @@ namespace RobotSimulation
 		private bool _armWorldCoordinateCommandActive;
 		private bool _armWorldCoordinateCommandIssuedSinceUnlock;
 		private Coroutine _armHomeUnlockRoutine;
+		private bool _startupCoordinatedDiagnosticsLogged;
+		private bool _postBindCoordinatedDiagnosticsLogged;
 
 		void Awake()
 		{
@@ -135,6 +141,11 @@ namespace RobotSimulation
 				_lastPlanningSummary = trajectoryPlanner.LastSummary;
 				_lastShadowValidationResult = trajectoryPlanner.LastShadowValidationResult;
 				_isRobotTaskPlanningInProgress = trajectoryPlanner.IsPlanning;
+			}
+
+			if (shadowRobotVisualizer != null)
+			{
+				shadowRobotVisualizer.SetVisualizationEnabled(enableShadowRobotVisualization);
 			}
 
 			SyncArmWorldCoordinateCommandActivity();
@@ -228,6 +239,10 @@ namespace RobotSimulation
 				ResetRobotToCapturedStartPose();
 			}
 
+			SyncArmToCurrentBasePoseImmediate();
+			LogStartupCoordinatedDiagnosticsIfNeeded();
+			StartCoroutine(LogPostBindCoordinatedDiagnosticsAfterFirstFixedUpdate());
+
 			// Validate initialization
 			if (diffDriveController == null)
 			{
@@ -267,10 +282,24 @@ namespace RobotSimulation
 				}
 			}
 
+			if (shadowRobotVisualizer == null)
+			{
+				shadowRobotVisualizer = GetComponent<ShadowRobotVisualizer>();
+				if (shadowRobotVisualizer == null)
+				{
+					shadowRobotVisualizer = gameObject.AddComponent<ShadowRobotVisualizer>();
+				}
+			}
+
 			trajectoryPlanner.Configure(this);
 			residualTracker.Configure(this);
 			onlineCalibration.Configure(residualTracker);
-			return trajectoryPlanner != null && residualTracker != null && onlineCalibration != null;
+			shadowRobotVisualizer.Configure(this);
+			shadowRobotVisualizer.SetVisualizationEnabled(enableShadowRobotVisualization);
+			return trajectoryPlanner != null
+				&& residualTracker != null
+				&& onlineCalibration != null
+				&& shadowRobotVisualizer != null;
 		}
 
 		private bool EnsureArmCoordinateControllers()
@@ -1425,6 +1454,47 @@ namespace RobotSimulation
 			{
 				arm6DOFFKController.RefreshRuntimeState();
 			}
+		}
+
+		private void LogStartupCoordinatedDiagnosticsIfNeeded()
+		{
+			if (_startupCoordinatedDiagnosticsLogged || arm6DOFFKController == null)
+			{
+				return;
+			}
+
+			string report = arm6DOFFKController.BuildCoordinatedDiagnosticReport(armBinder);
+			if (string.IsNullOrWhiteSpace(report))
+			{
+				return;
+			}
+
+			Debug.Log(report);
+			_startupCoordinatedDiagnosticsLogged = true;
+		}
+
+		private IEnumerator LogPostBindCoordinatedDiagnosticsAfterFirstFixedUpdate()
+		{
+			if (_postBindCoordinatedDiagnosticsLogged)
+			{
+				yield break;
+			}
+
+			yield return new WaitForFixedUpdate();
+			SyncArmToCurrentBasePoseImmediate();
+			if (arm6DOFFKController == null)
+			{
+				yield break;
+			}
+
+			string report = arm6DOFFKController.BuildCoordinatedDiagnosticReport(armBinder);
+			if (string.IsNullOrWhiteSpace(report))
+			{
+				yield break;
+			}
+
+			Debug.Log(report.Replace("[Arm6DOF] Coordinated diagnostics", "[Arm6DOF] Coordinated diagnostics (post-bind)"));
+			_postBindCoordinatedDiagnosticsLogged = true;
 		}
 
 		/// <summary>

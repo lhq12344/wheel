@@ -72,6 +72,7 @@ namespace RobotSimulation
 
 		public float BaseLinearScale => baseLinearScale;
 		public float BaseAngularScale => baseAngularScale;
+		public float ArmZeroOffsetBlend => armZeroOffsetBlend;
 		public string CalibrationSummary => calibrationSummary;
 
 		public void Configure(RobotModelResidualTracker tracker)

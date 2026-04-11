@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using UnityEngine;
 
 namespace RobotSimulation
@@ -62,6 +63,7 @@ namespace RobotSimulation
 		private Arm6DOFKinematicsModel _kinematicsModel = new Arm6DOFKinematicsModel();
 		private ArmCollisionMonitor _collisionMonitor;
 		private ArmCollisionGuardResult _lastCollisionGuardResult = new ArmCollisionGuardResult();
+		private bool _initializationDiagnosticsLogged;
 
 		public float[] CurrentJointAngles => _currentJointAngles;
 		public Vector3 EndEffectorPosition => _measuredEndEffectorPosition;
@@ -145,6 +147,7 @@ namespace RobotSimulation
 			UpdateJointStates();
 			ComputeForwardKinematics();
 			Debug.Log("[Arm6DOF] Initialized successfully");
+			LogInitializationDiagnostics();
 		}
 
 		public bool InitializeKinematicsModel()
@@ -604,6 +607,107 @@ namespace RobotSimulation
 			}
 
 			return _kinematicsModel.BuildParameterReport();
+		}
+
+		public string BuildCoordinatedDiagnosticReport(
+			ArticulationArmBindToCar binder = null,
+			Vector3? targetWorldPosition = null,
+			float[] referenceJointAnglesDeg = null)
+		{
+			if (_isInitialized)
+			{
+				UpdateJointStates();
+				ComputeForwardKinematics();
+			}
+
+			Transform baseFrame = GetBaseFrameTransform();
+			Transform binderArmRoot = binder != null && binder.armRoot != null ? binder.armRoot.transform : null;
+			Transform binderCarMount = binder != null ? binder.carMount : null;
+			float[] currentAnglesDeg = CaptureMeasuredJointAngles();
+			Pose currentModelBasePose = _kinematicsReady
+				? _kinematicsModel.ForwardPoe(currentAnglesDeg)
+				: new Pose(_measuredEndEffectorPosition, _measuredEndEffectorRotation);
+			Pose currentModelWorldPose = TransformPose(baseFrame, currentModelBasePose);
+
+			StringBuilder builder = new StringBuilder(1024);
+			builder.AppendLine("[Arm6DOF] Coordinated diagnostics");
+			builder.AppendLine($"  initialized={_isInitialized}, kinematicsReady={_kinematicsReady}, sceneCalibration={(_kinematicsModel != null && _kinematicsModel.HasSceneCalibration)}");
+			builder.AppendLine($"  baseFrame={FormatTransform(baseFrame)}");
+			builder.AppendLine($"  binderArmRoot={FormatTransform(binderArmRoot)}");
+			builder.AppendLine($"  binderCarMount={FormatTransform(binderCarMount)}");
+			AppendFrameDelta(builder, "baseFrame vs binderArmRoot", baseFrame, binderArmRoot);
+			AppendFrameDelta(builder, "baseFrame vs binderCarMount", baseFrame, binderCarMount);
+			AppendFrameDelta(builder, "binderArmRoot vs binderCarMount", binderArmRoot, binderCarMount);
+			builder.AppendLine($"  measuredEeWorld={FormatPose(new Pose(_measuredEndEffectorWorldPosition, _measuredEndEffectorWorldRotation))}");
+			builder.AppendLine($"  modelEeWorld(current)={FormatPose(currentModelWorldPose)}");
+			builder.AppendLine($"  modelEeBase(current)={FormatPose(currentModelBasePose)}");
+			builder.AppendLine($"  modelVsMeasuredBaseError={_modelVsMeasuredPositionError:F4}m");
+			builder.AppendLine($"  modelVsMeasuredWorldError={Vector3.Distance(currentModelWorldPose.position, _measuredEndEffectorWorldPosition):F4}m");
+			builder.AppendLine($"  currentJointAnglesDeg={FormatAngles(currentAnglesDeg)}");
+
+			if (referenceJointAnglesDeg != null && referenceJointAnglesDeg.Length >= 6)
+			{
+				Pose referenceModelBasePose = _kinematicsReady
+					? _kinematicsModel.ForwardPoe(referenceJointAnglesDeg)
+					: currentModelBasePose;
+				Pose referenceModelWorldPose = TransformPose(baseFrame, referenceModelBasePose);
+				builder.AppendLine($"  targetJointAnglesDeg={FormatAngles(referenceJointAnglesDeg)}");
+				builder.AppendLine($"  targetJointResidualMaxDeg={GetMaxJointAngleError(referenceJointAnglesDeg):F4}");
+				builder.AppendLine($"  modelEeWorld(targetAngles)={FormatPose(referenceModelWorldPose)}");
+
+				if (targetWorldPosition.HasValue)
+				{
+					builder.AppendLine($"  modelTargetAnglesVsWorldTargetError={Vector3.Distance(referenceModelWorldPose.position, targetWorldPosition.Value):F4}m");
+				}
+			}
+
+			if (targetWorldPosition.HasValue)
+			{
+				Vector3 worldTarget = targetWorldPosition.Value;
+				builder.AppendLine($"  worldTarget={FormatVector3(worldTarget)}");
+				builder.AppendLine($"  measuredVsWorldTargetError={Vector3.Distance(_measuredEndEffectorWorldPosition, worldTarget):F4}m");
+				builder.AppendLine($"  modelCurrentVsWorldTargetError={Vector3.Distance(currentModelWorldPose.position, worldTarget):F4}m");
+
+				if (baseFrame != null)
+				{
+					builder.AppendLine($"  worldTargetInBaseFrame={FormatVector3(baseFrame.InverseTransformPoint(worldTarget))}");
+				}
+
+				if (binderCarMount != null)
+				{
+					Vector3 targetInMount = binderCarMount.InverseTransformPoint(worldTarget);
+					builder.AppendLine($"  worldTargetInCarMount={FormatVector3(targetInMount)}");
+					if (baseFrame != null)
+					{
+						Vector3 targetInBaseFrame = baseFrame.InverseTransformPoint(worldTarget);
+						builder.AppendLine($"  targetLocalDelta(baseFrame vs carMount)={Vector3.Distance(targetInBaseFrame, targetInMount):F4}m");
+					}
+				}
+			}
+
+			return builder.ToString().TrimEnd();
+		}
+
+		private void LogInitializationDiagnostics()
+		{
+			if (_initializationDiagnosticsLogged)
+			{
+				return;
+			}
+
+			ArticulationArmBindToCar binder = null;
+			if (RobotSimulationManager.Instance != null)
+			{
+				binder = RobotSimulationManager.Instance.armBinder;
+			}
+
+			if (binder == null)
+			{
+				binder = FindObjectOfType<ArticulationArmBindToCar>();
+			}
+
+			Debug.Log(BuildCoordinatedDiagnosticReport(binder));
+			_initializationDiagnosticsLogged = true;
 		}
 
 		private void AutoDetectJoints()
@@ -1090,6 +1194,78 @@ namespace RobotSimulation
 			}
 
 			return path.IndexOf("Zone.Identifier", System.StringComparison.OrdinalIgnoreCase) < 0;
+		}
+
+		private static Pose TransformPose(Transform reference, Pose localPose)
+		{
+			if (reference == null)
+			{
+				return localPose;
+			}
+
+			return new Pose(
+				reference.TransformPoint(localPose.position),
+				reference.rotation * localPose.rotation);
+		}
+
+		private static void AppendFrameDelta(StringBuilder builder, string label, Transform a, Transform b)
+		{
+			if (builder == null || a == null || b == null)
+			{
+				return;
+			}
+
+			builder.AppendLine(
+				$"  {label}: positionDelta={Vector3.Distance(a.position, b.position):F4}m, rotationDelta={Quaternion.Angle(a.rotation, b.rotation):F2}deg");
+		}
+
+		private static string FormatTransform(Transform value)
+		{
+			if (value == null)
+			{
+				return "null";
+			}
+
+			return $"{value.name} pos={FormatVector3(value.position)} rot={FormatEuler(value.rotation)}";
+		}
+
+		private static string FormatPose(Pose pose)
+		{
+			return $"pos={FormatVector3(pose.position)} rot={FormatEuler(pose.rotation)}";
+		}
+
+		private static string FormatVector3(Vector3 value)
+		{
+			return $"({value.x:F4}, {value.y:F4}, {value.z:F4})";
+		}
+
+		private static string FormatEuler(Quaternion value)
+		{
+			Vector3 euler = value.eulerAngles;
+			return $"({euler.x:F2}, {euler.y:F2}, {euler.z:F2})";
+		}
+
+		private static string FormatAngles(float[] values)
+		{
+			if (values == null || values.Length == 0)
+			{
+				return "[]";
+			}
+
+			StringBuilder builder = new StringBuilder(values.Length * 8);
+			builder.Append('[');
+			for (int i = 0; i < values.Length; i++)
+			{
+				if (i > 0)
+				{
+					builder.Append(", ");
+				}
+
+				builder.Append(values[i].ToString("F2"));
+			}
+
+			builder.Append(']');
+			return builder.ToString();
 		}
 	}
 }
