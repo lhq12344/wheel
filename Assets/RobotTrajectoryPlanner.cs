@@ -1565,7 +1565,7 @@ namespace RobotSimulation
 						yield break;
 					}
 
-					if (manager.armCollisionMonitor != null && manager.armCollisionMonitor.EvaluateCollisionState())
+					if (HasObservedArmCollision())
 					{
 						result.failedAtStage = RobotPlanningStage.ArmExecution;
 						result.failureReason = string.IsNullOrEmpty(manager.armCollisionMonitor.ActiveCollisionMessage)
@@ -1626,7 +1626,7 @@ namespace RobotSimulation
 							yield break;
 						}
 
-						if (manager.armCollisionMonitor != null && manager.armCollisionMonitor.EvaluateCollisionState())
+						if (HasObservedArmCollision())
 						{
 							result.failedAtStage = RobotPlanningStage.ArmExecution;
 							result.failureReason = string.IsNullOrEmpty(manager.armCollisionMonitor.ActiveCollisionMessage)
@@ -1680,7 +1680,7 @@ namespace RobotSimulation
 					yield break;
 				}
 
-				if (manager.armCollisionMonitor != null && manager.armCollisionMonitor.EvaluateCollisionState())
+				if (HasObservedArmCollision())
 				{
 					result.failedAtStage = RobotPlanningStage.ArmExecution;
 					result.failureReason = string.IsNullOrEmpty(manager.armCollisionMonitor.ActiveCollisionMessage)
@@ -1758,11 +1758,19 @@ namespace RobotSimulation
 				dynamicBaseLockWhenEeWithinTolerance = settings == null || settings.dynamicBaseLockWhenEeWithinTolerance,
 				decelFramesBeforeStop = settings != null ? Mathf.Max(1, settings.decelFramesBeforeStop) : SafetyGateBlockDecelFrames,
 				baseRadiusMeters = Mathf.Max(0.05f, baseRadius),
-				obstacles = obstacles
+				obstacles = obstacles,
+				obstacleLookup = _physicsQueries.GetObstacleLookup(obstacles)
 			};
 
 			RefreshSafetyGateLoadFactor(context);
 			return context;
+		}
+
+		private bool HasObservedArmCollision()
+		{
+			return manager != null
+				&& manager.armCollisionMonitor != null
+				&& manager.armCollisionMonitor.GetObservedCollisionState();
 		}
 
 		private void ResetSafetyGateTimelineState()

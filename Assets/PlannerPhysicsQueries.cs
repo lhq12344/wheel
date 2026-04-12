@@ -20,9 +20,42 @@ namespace RobotSimulation
 
 		private readonly Collider[] _overlapBuffer = new Collider[128];
 		private readonly Dictionary<int, BaseRadiusCacheEntry> _baseRadiusCache = new Dictionary<int, BaseRadiusCacheEntry>();
+		private IReadOnlyList<Collider> _cachedObstacleLookupSource;
+		private int _cachedObstacleLookupCount = -1;
+		private readonly HashSet<Collider> _cachedObstacleLookup = new HashSet<Collider>();
 
 		public float baseHalfHeight = 0.35f;
 		public float sampleSpacing = 0.25f;
+
+		public ISet<Collider> GetObstacleLookup(IReadOnlyList<Collider> obstacles)
+		{
+			if (obstacles == null)
+			{
+				_cachedObstacleLookupSource = null;
+				_cachedObstacleLookupCount = 0;
+				_cachedObstacleLookup.Clear();
+				return _cachedObstacleLookup;
+			}
+
+			if (!ReferenceEquals(_cachedObstacleLookupSource, obstacles) || _cachedObstacleLookupCount != obstacles.Count)
+			{
+				_cachedObstacleLookupSource = obstacles;
+				_cachedObstacleLookupCount = obstacles.Count;
+				_cachedObstacleLookup.Clear();
+				for (int i = 0; i < obstacles.Count; i++)
+				{
+					Collider obstacle = obstacles[i];
+					if (obstacle == null || !obstacle.enabled || !obstacle.gameObject.activeInHierarchy)
+					{
+						continue;
+					}
+
+					_cachedObstacleLookup.Add(obstacle);
+				}
+			}
+
+			return _cachedObstacleLookup;
+		}
 
 		public List<Collider> CollectObstacleColliders(params Transform[] ignoreRoots)
 		{
@@ -526,22 +559,14 @@ namespace RobotSimulation
 			return facesUp && (obviousFloorName || (looksFlat && looksLarge));
 		}
 
-		private static bool ContainsCollider(IReadOnlyList<Collider> colliders, Collider target)
+		private bool ContainsCollider(IReadOnlyList<Collider> colliders, Collider target)
 		{
 			if (colliders == null || target == null)
 			{
 				return false;
 			}
 
-			for (int i = 0; i < colliders.Count; i++)
-			{
-				if (colliders[i] == target)
-				{
-					return true;
-				}
-			}
-
-			return false;
+			return GetObstacleLookup(colliders).Contains(target);
 		}
 	}
 }

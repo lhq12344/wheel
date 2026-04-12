@@ -100,6 +100,7 @@ namespace RobotSimulation
 		public bool dynamicBaseLockWhenEeWithinTolerance = true;
 		public int decelFramesBeforeStop = 2;
 		public IReadOnlyList<Collider> obstacles;
+		public ISet<Collider> obstacleLookup;
 	}
 
 	public sealed class SafetyGateCommandBuffer<T>
@@ -309,7 +310,7 @@ namespace RobotSimulation
 					predictedPoseAssigned = true;
 				}
 
-				if (TryOverlapObstacle(samplePosition, inflatedBaseRadius, context.obstacles, out Collider sampleHitCollider))
+				if (TryOverlapObstacle(samplePosition, inflatedBaseRadius, context.obstacles, context.obstacleLookup, out Collider sampleHitCollider))
 				{
 					collisionDetected = true;
 					blockingCollider = sampleHitCollider;
@@ -477,7 +478,7 @@ namespace RobotSimulation
 					for (int poseIndex = 0; poseIndex < sampleLinkPoses.Length; poseIndex++)
 					{
 						Vector3 point = sampleLinkPoses[poseIndex].position;
-						if (TryOverlapObstacle(point, inflatedArmRadius, context.obstacles, out _))
+						if (TryOverlapObstacle(point, inflatedArmRadius, context.obstacles, context.obstacleLookup, out _))
 						{
 							sampleCollision = true;
 							break;
@@ -536,7 +537,7 @@ namespace RobotSimulation
 				for (int poseIndex = 0; poseIndex < linkWorldPoses.Length; poseIndex++)
 				{
 					Vector3 point = linkWorldPoses[poseIndex].position;
-					if (TryOverlapObstacle(point, inflatedArmRadius, context.obstacles, out Collider hitCollider))
+					if (TryOverlapObstacle(point, inflatedArmRadius, context.obstacles, context.obstacleLookup, out Collider hitCollider))
 					{
 						decision.type = SafetyGateDecisionType.Block;
 						decision.blockCategory = SafetyGateBlockCategory.GateBlockedByCollision;
@@ -647,6 +648,65 @@ namespace RobotSimulation
 						result.message = $"Shadow validation rejected base waypoint {i + 1}: clearance {clearance:F3}m is below the safety threshold.";
 						return result;
 					}
+				}
+			}
+
+			return result;
+		}
+
+		public ShadowValidationResult ValidateBaseSegment(
+			Vector3 from,
+			Vector3 to,
+			float baseRadius,
+			PlannerPhysicsQueries physicsQueries,
+			SceneDistanceFieldSampler sampler,
+			IReadOnlyList<Collider> obstacles,
+			bool allowInitialPoseOccupied = false)
+		{
+			ShadowValidationResult result = new ShadowValidationResult();
+			if (physicsQueries == null)
+			{
+				return result;
+			}
+
+			if (!allowInitialPoseOccupied && !physicsQueries.IsBasePoseCollisionFree(from, baseRadius, obstacles, out Collider blockedStart))
+			{
+				result.passed = false;
+				result.collisionDetected = true;
+				result.failedSampleIndex = 0;
+				result.message = $"Shadow validation blocked base waypoint 1 by '{blockedStart?.name}'.";
+				return result;
+			}
+
+			if (!physicsQueries.IsBasePoseCollisionFree(to, baseRadius, obstacles, out Collider blockedEnd))
+			{
+				result.passed = false;
+				result.collisionDetected = true;
+				result.failedSampleIndex = 1;
+				result.message = $"Shadow validation blocked base waypoint 2 by '{blockedEnd?.name}'.";
+				return result;
+			}
+
+			if (sampler != null && sampler.IsReady)
+			{
+				float fromClearance = sampler.SampleDistance(from);
+				if (!allowInitialPoseOccupied && fromClearance < requiredBaseClearance)
+				{
+					result.passed = false;
+					result.collisionDetected = true;
+					result.failedSampleIndex = 0;
+					result.message = $"Shadow validation rejected base waypoint 1: clearance {fromClearance:F3}m is below the safety threshold.";
+					return result;
+				}
+
+				float toClearance = sampler.SampleDistance(to);
+				if (toClearance < requiredBaseClearance)
+				{
+					result.passed = false;
+					result.collisionDetected = true;
+					result.failedSampleIndex = 1;
+					result.message = $"Shadow validation rejected base waypoint 2: clearance {toClearance:F3}m is below the safety threshold.";
+					return result;
 				}
 			}
 
@@ -951,6 +1011,7 @@ namespace RobotSimulation
 			Vector3 center,
 			float radius,
 			IReadOnlyList<Collider> obstacles,
+			ISet<Collider> obstacleLookup,
 			out Collider hitCollider)
 		{
 			hitCollider = null;
@@ -959,7 +1020,11 @@ namespace RobotSimulation
 				return false;
 			}
 
-			HashSet<Collider> obstacleLookup = BuildObstacleLookup(obstacles);
+			ISet<Collider> effectiveLookup = obstacleLookup;
+			if (effectiveLookup == null || effectiveLookup.Count == 0)
+			{
+				effectiveLookup = BuildObstacleLookup(obstacles);
+			}
 
 			int hitCount = Physics.OverlapSphereNonAlloc(center, Mathf.Max(0.001f, radius), OverlapBuffer, ~0, QueryTriggerInteraction.Ignore);
 			for (int hitIndex = 0; hitIndex < hitCount; hitIndex++)
@@ -970,7 +1035,7 @@ namespace RobotSimulation
 					continue;
 				}
 
-				if (obstacleLookup.Contains(collider))
+				if (effectiveLookup.Contains(collider))
 				{
 					hitCollider = collider;
 					return true;
@@ -1026,9 +1091,8 @@ namespace RobotSimulation
 			IReadOnlyList<Collider> obstacles,
 			out ShadowValidationResult result)
 		{
-			List<Vector3> preview = new List<Vector3> { from, to };
 			bool startOccupied = physicsQueries != null && !physicsQueries.IsBasePoseCollisionFree(from, baseRadius, obstacles, out _);
-			result = _gate.ValidateBasePath(preview, baseRadius, physicsQueries, sampler, obstacles, startOccupied);
+			result = _gate.ValidateBaseSegment(from, to, baseRadius, physicsQueries, sampler, obstacles, startOccupied);
 			return result == null || result.passed;
 		}
 

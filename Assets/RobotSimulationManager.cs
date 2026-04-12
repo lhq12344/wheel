@@ -14,6 +14,12 @@ namespace RobotSimulation
 	/// </summary>
 	public class RobotSimulationManager : MonoBehaviour
 	{
+		public enum BootstrapMode
+		{
+			AutoDiscover,
+			ExplicitContract
+		}
+
 		public static RobotSimulationManager Instance { get; private set; }
 
 		[Header("Robot Controllers")]
@@ -70,6 +76,10 @@ namespace RobotSimulation
 		public ManualPreviewSessionState CurrentManualPreviewState => _manualPreviewState;
 		public string ManualPreviewSummary => _manualPreviewSummary;
 
+		[Header("Bootstrap")]
+		public BootstrapMode bootstrapMode = BootstrapMode.AutoDiscover;
+		[SerializeField] private string _lastBootstrapValidationReport = string.Empty;
+
 		[Header("Simulation Settings")]
 		public bool enableSimulation = true;
 		public float simulationSpeed = 1.0f;
@@ -98,6 +108,8 @@ namespace RobotSimulation
 		private bool _postBindCoordinatedDiagnosticsLogged;
 		private int _manualPreviewSessionVersion;
 		private ManualPreviewSession _manualPreviewSession;
+
+		private bool UsesExplicitBootstrapContract => bootstrapMode == BootstrapMode.ExplicitContract;
 
 		private sealed class ManualPreviewSession
 		{
@@ -190,7 +202,7 @@ namespace RobotSimulation
 
 			if (armCollisionMonitor != null)
 			{
-				bool collided = armCollisionMonitor.EvaluateCollisionState();
+				bool collided = armCollisionMonitor.GetObservedCollisionState();
 				if (collided && !_armCollisionResponseLatched)
 				{
 					CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual preview cancelled after collision.");
@@ -233,43 +245,29 @@ namespace RobotSimulation
 		/// </summary>
 		public void InitializeRobot()
 		{
-			// Find controllers if not assigned
-			if (diffDriveController == null)
+			_lastBootstrapValidationReport = string.Empty;
+			if (!UsesExplicitBootstrapContract)
 			{
-				diffDriveController = FindObjectOfType<DiffDriveTwinController>();
-			}
-
-			if (armJointControllers == null || armJointControllers.Length == 0)
-			{
-				armJointControllers = FindObjectsOfType<OneJointTrapezoidController>();
+				DiscoverRobotReferencesIfNeeded();
 			}
 
 			armJointControllers = BuildOrderedArmJointControllerArray(armJointControllers);
-
-			if (armBinder == null)
+			if (UsesExplicitBootstrapContract && !ValidateExplicitBootstrapContract())
 			{
-				armBinder = FindObjectOfType<ArticulationArmBindToCar>();
-			}
-
-			// Find 6-DOF arm controllers
-			if (arm6DOFFKController == null)
-			{
-				arm6DOFFKController = FindObjectOfType<Arm6DOFFKController>();
-			}
-
-			if (arm6DOFIKController == null)
-			{
-				arm6DOFIKController = FindObjectOfType<Arm6DOFIKController>();
-			}
-
-			if (armCollisionMonitor == null)
-			{
-				armCollisionMonitor = FindObjectOfType<ArmCollisionMonitor>();
+				_isInitialized = false;
+				Debug.LogWarning("[RobotSimulation] InitializeRobot aborted because the explicit bootstrap contract is invalid.");
+				return;
 			}
 
 			CaptureRobotStartPoseIfNeeded();
-			EnsureArmCoordinateControllers();
-			EnsurePlanningSupportComponents();
+			bool armControllersReady = EnsureArmCoordinateControllers();
+			bool planningSupportReady = EnsurePlanningSupportComponents();
+			if (UsesExplicitBootstrapContract && (!armControllersReady || !planningSupportReady))
+			{
+				ReportBootstrapConfigurationFailure(armControllersReady, planningSupportReady);
+				_isInitialized = false;
+				return;
+			}
 
 			if (resetBaseToOriginOnPlay)
 			{
@@ -286,45 +284,56 @@ namespace RobotSimulation
 				Debug.LogWarning("[RobotSimulation] DiffDrive controller not found!");
 			}
 
-			_isInitialized = diffDriveController != null;
+			_isInitialized = diffDriveController != null
+				&& (!UsesExplicitBootstrapContract || (armControllersReady && planningSupportReady));
 			Debug.Log($"[RobotSimulation] Initialized: {_isInitialized}");
 		}
 
 		public bool EnsurePlanningSupportComponents()
 		{
-			if (trajectoryPlanner == null)
+			if (UsesExplicitBootstrapContract)
 			{
-				trajectoryPlanner = GetComponent<RobotTrajectoryPlanner>();
+				if (trajectoryPlanner == null || residualTracker == null || onlineCalibration == null || shadowRobotVisualizer == null)
+				{
+					return false;
+				}
+			}
+			else
+			{
 				if (trajectoryPlanner == null)
 				{
-					trajectoryPlanner = gameObject.AddComponent<RobotTrajectoryPlanner>();
+					trajectoryPlanner = GetComponent<RobotTrajectoryPlanner>();
+					if (trajectoryPlanner == null)
+					{
+						trajectoryPlanner = gameObject.AddComponent<RobotTrajectoryPlanner>();
+					}
 				}
-			}
 
-			if (residualTracker == null)
-			{
-				residualTracker = GetComponent<RobotModelResidualTracker>();
 				if (residualTracker == null)
 				{
-					residualTracker = gameObject.AddComponent<RobotModelResidualTracker>();
+					residualTracker = GetComponent<RobotModelResidualTracker>();
+					if (residualTracker == null)
+					{
+						residualTracker = gameObject.AddComponent<RobotModelResidualTracker>();
+					}
 				}
-			}
 
-			if (onlineCalibration == null)
-			{
-				onlineCalibration = GetComponent<OnlineModelCalibration>();
 				if (onlineCalibration == null)
 				{
-					onlineCalibration = gameObject.AddComponent<OnlineModelCalibration>();
+					onlineCalibration = GetComponent<OnlineModelCalibration>();
+					if (onlineCalibration == null)
+					{
+						onlineCalibration = gameObject.AddComponent<OnlineModelCalibration>();
+					}
 				}
-			}
 
-			if (shadowRobotVisualizer == null)
-			{
-				shadowRobotVisualizer = GetComponent<ShadowRobotVisualizer>();
 				if (shadowRobotVisualizer == null)
 				{
-					shadowRobotVisualizer = gameObject.AddComponent<ShadowRobotVisualizer>();
+					shadowRobotVisualizer = GetComponent<ShadowRobotVisualizer>();
+					if (shadowRobotVisualizer == null)
+					{
+						shadowRobotVisualizer = gameObject.AddComponent<ShadowRobotVisualizer>();
+					}
 				}
 			}
 
@@ -346,22 +355,29 @@ namespace RobotSimulation
 				return false;
 			}
 
-			if (arm6DOFFKController == null)
+			if (!UsesExplicitBootstrapContract)
 			{
-				arm6DOFFKController = FindObjectOfType<Arm6DOFFKController>();
-			}
+				if (arm6DOFFKController == null)
+				{
+					arm6DOFFKController = FindObjectOfType<Arm6DOFFKController>();
+				}
 
-			if (arm6DOFIKController == null)
-			{
-				arm6DOFIKController = FindObjectOfType<Arm6DOFIKController>();
-			}
+				if (arm6DOFIKController == null)
+				{
+					arm6DOFIKController = FindObjectOfType<Arm6DOFIKController>();
+				}
 
-			if (arm6DOFFKController == null || arm6DOFIKController == null)
+				if (arm6DOFFKController == null || arm6DOFIKController == null)
+				{
+					GameObject armControllerGo = new GameObject("Arm6DOFController");
+					arm6DOFFKController = armControllerGo.AddComponent<Arm6DOFFKController>();
+					arm6DOFIKController = armControllerGo.AddComponent<Arm6DOFIKController>();
+					Debug.Log("[RobotSimulation] Auto-created Arm6DOFController for coordinate-space arm control.");
+				}
+			}
+			else if (arm6DOFFKController == null || arm6DOFIKController == null)
 			{
-				GameObject armControllerGo = new GameObject("Arm6DOFController");
-				arm6DOFFKController = armControllerGo.AddComponent<Arm6DOFFKController>();
-				arm6DOFIKController = armControllerGo.AddComponent<Arm6DOFIKController>();
-				Debug.Log("[RobotSimulation] Auto-created Arm6DOFController for coordinate-space arm control.");
+				return false;
 			}
 
 			if (NeedsArmCoordinateControllerConfiguration())
@@ -473,6 +489,11 @@ namespace RobotSimulation
 
 			if (armCollisionMonitor == null)
 			{
+				if (UsesExplicitBootstrapContract)
+				{
+					return;
+				}
+
 				GameObject monitorGo = GameObject.Find("ArmCollisionMonitor");
 				if (monitorGo == null)
 				{
@@ -515,6 +536,80 @@ namespace RobotSimulation
 			armCollisionMonitor.Configure(armRoot, forbiddenRoot);
 			armCollisionMonitor.ignoreArmBaseColliders = true;
 			armCollisionMonitor.ignoredArmColliderNameContains = new[] { "Link_00" };
+		}
+
+		private void DiscoverRobotReferencesIfNeeded()
+		{
+			if (diffDriveController == null)
+			{
+				diffDriveController = FindObjectOfType<DiffDriveTwinController>();
+			}
+
+			if (armJointControllers == null || armJointControllers.Length == 0)
+			{
+				armJointControllers = FindObjectsOfType<OneJointTrapezoidController>();
+			}
+
+			if (armBinder == null)
+			{
+				armBinder = FindObjectOfType<ArticulationArmBindToCar>();
+			}
+
+			if (arm6DOFFKController == null)
+			{
+				arm6DOFFKController = FindObjectOfType<Arm6DOFFKController>();
+			}
+
+			if (arm6DOFIKController == null)
+			{
+				arm6DOFIKController = FindObjectOfType<Arm6DOFIKController>();
+			}
+
+			if (armCollisionMonitor == null)
+			{
+				armCollisionMonitor = FindObjectOfType<ArmCollisionMonitor>();
+			}
+		}
+
+		private bool ValidateExplicitBootstrapContract()
+		{
+			if (!UsesExplicitBootstrapContract)
+			{
+				_lastBootstrapValidationReport = string.Empty;
+				return true;
+			}
+
+			if (RobotSimulationBootstrapContract.TryValidateExplicitContract(this, out string report))
+			{
+				_lastBootstrapValidationReport = string.Empty;
+				return true;
+			}
+
+			_lastBootstrapValidationReport = report;
+			_lastPlanningSummary = report;
+			Debug.LogError(report);
+			return false;
+		}
+
+		private void ReportBootstrapConfigurationFailure(bool armControllersReady, bool planningSupportReady)
+		{
+			List<string> issues = new List<string>();
+			if (!armControllersReady)
+			{
+				issues.Add("Failed to configure explicit arm coordinate controllers from the serialized contract.");
+			}
+
+			if (!planningSupportReady)
+			{
+				issues.Add("Failed to configure serialized planning support components.");
+			}
+
+			string report = issues.Count > 0
+				? $"[RobotSimulation] Explicit bootstrap configuration failed: {string.Join(" ", issues)}"
+				: "[RobotSimulation] Explicit bootstrap configuration failed.";
+			_lastBootstrapValidationReport = report;
+			_lastPlanningSummary = report;
+			Debug.LogError(report);
 		}
 
 		private OneJointTrapezoidController[] BuildOrderedArmJointControllerArray(OneJointTrapezoidController[] controllers)

@@ -37,7 +37,7 @@ namespace RobotSimulation
 		public int maxRecoveryReplans = 3;
 		public bool dynamicBaseLockWhenEeWithinTolerance = true;
 		public int decelFramesBeforeStop = 2;
-		public bool enableStartupCommandTrace = true;
+		public bool enableStartupCommandTrace = false;
 		public int startupPreviewMaxItems = 8;
 	}
 

@@ -20,3 +20,6 @@ ProjectSettings/
 
 # Packages
 Packages/
+
+.codex
+AGENTS.md

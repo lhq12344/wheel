@@ -7857,6 +7857,7 @@ MonoBehaviour:
   residualTracker: {fileID: 1571701560}
   onlineCalibration: {fileID: 1571701559}
   shadowRobotVisualizer: {fileID: 1571701562}
+  bootstrapMode: 1
   enableShadowRobotVisualization: 1
   _robotState:
     position: {x: 0, y: 0, z: 0}
@@ -9237,7 +9238,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 5b077c1db3f61ef4cb484ff69b122294, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  rb: {fileID: 0}
+  rb: {fileID: 1923356631}
   wheelLF: {fileID: 1999748748}
   wheelLR: {fileID: 513548201}
   wheelRF: {fileID: 777727981}

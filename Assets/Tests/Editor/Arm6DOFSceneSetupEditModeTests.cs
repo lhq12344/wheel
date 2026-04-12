@@ -19,6 +19,7 @@ namespace RobotSimulation.Tests.Editor
 
 			GameObject managerGo = new GameObject("RobotSimulationManager");
 			RobotSimulationManager manager = managerGo.AddComponent<RobotSimulationManager>();
+			manager.bootstrapMode = RobotSimulationManager.BootstrapMode.AutoDiscover;
 			manager.InitializeRobot();
 
 			Assert.IsNotNull(manager.arm6DOFFKController, "FK controller should be auto-created or discovered.");

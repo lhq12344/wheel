@@ -1,4 +1,5 @@
 #if UNITY_EDITOR
+using System;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
@@ -37,6 +38,11 @@ namespace RobotSimulation.Editor
 			}
 
 			BuildScene(scene);
+			if (!SquareObstacleTestSceneContractValidator.TryValidateScene(scene, out string validationReport))
+			{
+				throw new InvalidOperationException(validationReport);
+			}
+
 			EditorSceneManager.SaveScene(scene);
 			AssetDatabase.SaveAssets();
 			AssetDatabase.Refresh();
@@ -53,7 +59,7 @@ namespace RobotSimulation.Editor
 			GameObject existingRoot = GameObject.Find(GeneratedRootName);
 			if (existingRoot != null)
 			{
-				Object.DestroyImmediate(existingRoot);
+				UnityEngine.Object.DestroyImmediate(existingRoot);
 			}
 
 			GameObject root = new GameObject(GeneratedRootName);

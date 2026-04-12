@@ -51,6 +51,7 @@ namespace RobotSimulation
 		private readonly List<PreviewColliderEntry> _previewColliders = new List<PreviewColliderEntry>();
 		private ArticulationBody _armRootBody;
 		private GameObject _previewRoot;
+		private float _lastCollisionEvaluationFixedTime = float.NegativeInfinity;
 
 		public bool HasCollision => _hasCollision;
 		public string ActiveCollisionMessage => _activeCollisionMessage;
@@ -73,7 +74,7 @@ namespace RobotSimulation
 		{
 			if (monitorInFixedUpdate)
 			{
-				EvaluateCollisionState();
+				GetObservedCollisionState();
 			}
 		}
 
@@ -143,7 +144,23 @@ namespace RobotSimulation
 				Debug.LogError($"[ArmCollision] {collisionMessage}");
 			}
 
+			_lastCollisionEvaluationFixedTime = Time.fixedTime;
 			return collided;
+		}
+
+		public bool GetObservedCollisionState()
+		{
+			if (!monitorInFixedUpdate)
+			{
+				return EvaluateCollisionState();
+			}
+
+			if (Mathf.Abs(_lastCollisionEvaluationFixedTime - Time.fixedTime) > 1e-5f)
+			{
+				return EvaluateCollisionState();
+			}
+
+			return _hasCollision;
 		}
 
 		public bool EvaluatePredictedCollision(Pose[] linkWorldPoses, out ArmCollisionGuardResult result)

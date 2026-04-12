@@ -555,7 +555,7 @@ namespace RobotSimulation
 
 				Vector3 currentWorldPosition = GetCurrentWorldEndEffectorPosition();
 				float error = Vector3.Distance(currentWorldPosition, safeRequest.worldPosition);
-				if (_collisionMonitor != null && _collisionMonitor.EvaluateCollisionState())
+				if (_collisionMonitor != null && _collisionMonitor.GetObservedCollisionState())
 				{
 					result.collided = true;
 					result.success = false;
