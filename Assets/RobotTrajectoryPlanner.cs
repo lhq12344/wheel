@@ -709,6 +709,37 @@ namespace RobotSimulation
 						lastShadowValidationResult = _shadowGate.ValidateArmTrajectory(manager.arm6DOFFKController, armSamples);
 						if (!lastShadowValidationResult.passed)
 						{
+							if (!_planOnly
+								&& request.autoResolveBaseDockingPose
+								&& request.allowReplan
+								&& armPlanningDockingRetryCount < MaxArmPlanningDockingRetries
+								&& lastShadowValidationResult.singularityRisk)
+							{
+								AppendSummary(summaryParts, L(
+									$"机械臂影子验证发现轨迹靠近奇异区（{lastShadowValidationResult.message}），开始重新搜索停靠位并重试。",
+									$"Arm shadow validation detected a singular trajectory ({lastShadowValidationResult.message}), so docking search will retry."));
+								armPlanningDockingRetryCount++;
+								float baseExecutionDeadline = Time.realtimeSinceStartup + Mathf.Max(4f, baseExecutionBudgetSeconds);
+								yield return RetryDockingSearchAndMoveBaseIfNeeded(
+									request,
+									result,
+									summaryParts,
+									obstacles,
+									baseRadius,
+									baseExecutionDeadline,
+									armStageState);
+								if (!string.IsNullOrEmpty(result.failureReason))
+								{
+									CompleteFailure(result, result.failedAtStage, result.failureReason, onComplete);
+									yield break;
+								}
+
+								manager.SyncArmToCurrentBasePoseImmediate();
+								manager.arm6DOFFKController?.RefreshRuntimeState();
+								yield return new WaitForFixedUpdate();
+								continue;
+							}
+
 							CompleteFailure(result, RobotPlanningStage.ArmShadowValidation, lastShadowValidationResult.message, onComplete);
 							yield break;
 						}
@@ -1199,7 +1230,6 @@ namespace RobotSimulation
 					SafetyGateDecision decision = _shadowGate.EvaluateBaseCommand(mirror, pendingCommand, gateContext);
 					ApplySafetyGateDecisionTelemetry(result, RobotPlanningStage.BaseExecution, decision);
 					LogSafetyGateDecision(RobotPlanningStage.BaseExecution, decision);
-					PushShadowPredictionPose(decision);
 					float leadSeconds = ComputeSafetyGateLeadSeconds(gateContext, mirror, armMode: false, result);
 					long sequenceId = NextSafetyGateSequenceId();
 
@@ -1234,7 +1264,6 @@ namespace RobotSimulation
 					};
 					_safetyGateTimelineBuffer.Enqueue(timelineCommand);
 					LogTimelineQueueEnqueueIfNeeded(request, armQueue: false, timelineCommand);
-					manager.shadowRobotVisualizer?.ApplyShadowStep(timelineCommand);
 
 					bool hasHeadCommand = false;
 					SafetyGateTimelineCommand headCommand = default;
@@ -1261,6 +1290,15 @@ namespace RobotSimulation
 						float executionRatio = Mathf.Clamp(executableCommand.throttleRatio, 0.2f, 1f);
 						adjustedLinearVelocity = linearVelocity * executionRatio;
 						adjustedAngularVelocity = angularVelocity * executionRatio;
+						SafetyGateTimelineCommand shadowPreviewCommand = new SafetyGateTimelineCommand
+						{
+							kind = SafetyGateTimelineCommandKind.Base,
+							baseCommand = pendingCommand,
+							baseLinearVelocity = adjustedLinearVelocity,
+							baseAngularVelocity = adjustedAngularVelocity,
+							predictedLeadSeconds = executableCommand.predictedLeadSeconds
+						};
+						manager.shadowRobotVisualizer?.ApplyShadowStep(shadowPreviewCommand);
 						LogTimelineQueueDequeuedIfNeeded(request, armQueue: false, executableCommand);
 						return true;
 					}

@@ -1,8 +1,28 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace RobotSimulation
 {
+	[Serializable]
+	public enum ManualPreviewSessionKind
+	{
+		None,
+		BaseYaw,
+		BasePoint,
+		ArmWorldMove
+	}
+
+	[Serializable]
+	public enum ManualPreviewSessionState
+	{
+		Idle,
+		PreviewPending,
+		Executing,
+		Completed,
+		Cancelled
+	}
+
 	[Serializable]
 	public class ArmCollisionGuardResult
 	{
@@ -40,5 +60,14 @@ namespace RobotSimulation
 		public bool blockedByCollisionGuard;
 		public ArmCollisionGuardResult collisionGuardResult;
 		public string summary;
+	}
+
+	[Serializable]
+	public class ArmTrajectoryPreviewPlan
+	{
+		public ArmMoveRequest request = new ArmMoveRequest();
+		public List<RobotPlanJointSample> samples = new List<RobotPlanJointSample>();
+		public ArmMoveResult planningResult = new ArmMoveResult();
+		public float totalDurationSeconds;
 	}
 }

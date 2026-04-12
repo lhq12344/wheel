@@ -4,7 +4,7 @@ using UnityEngine;
 
 public class DiffDriveTwinController : MonoBehaviour
 {
-	enum PointGoalPhase
+	public enum PointGoalPhase
 	{
 		Idle,
 		RotateInPlace,
@@ -17,6 +17,50 @@ public class DiffDriveTwinController : MonoBehaviour
 	{
 		TargetPoint,   // 点到点
 		TargetYaw      // 只对准角度
+	}
+
+	[System.Serializable]
+	public struct DrivePredictionState
+	{
+		public Vector3 worldPosition;
+		public Quaternion worldRotation;
+		public ControlMode mode;
+		public Vector3 targetPointWorld;
+		public bool hasTargetPoint;
+		public float targetYawDeg;
+		public Vector3 targetDirectionWorld;
+		public bool useVelocityCommandOverride;
+		public float overrideLinearVelocityTarget;
+		public float overrideAngularVelocityTarget;
+		public float currentLinearVelocity;
+		public float currentAngularVelocity;
+		public float lastLeftVelocity;
+		public float lastRightVelocity;
+		public bool goalReachedLatched;
+		public bool finalYawAlignmentActive;
+		public PointGoalPhase pointGoalPhase;
+	}
+
+	[System.Serializable]
+	public struct DrivePredictionStep
+	{
+		public DrivePredictionState nextState;
+		public float targetLinearVelocity;
+		public float targetAngularVelocity;
+		public float commandedLinearVelocity;
+		public float commandedAngularVelocity;
+		public float leftVelocity;
+		public float rightVelocity;
+		public float leftAcceleration;
+		public float rightAcceleration;
+		public Vector3 predictedWorldPosition;
+		public Quaternion predictedWorldRotation;
+		public bool applyPositionCorrection;
+		public Vector3 correctedWorldPosition;
+		public bool applyRotationCorrection;
+		public Quaternion correctedWorldRotation;
+		public bool hardStopped;
+		public bool arrived;
 	}
 
 	[Header("References")]
@@ -174,6 +218,14 @@ public class DiffDriveTwinController : MonoBehaviour
 	private float overrideAngularVelocityTarget = 0f;
 	[SerializeField] private PointGoalPhase pointGoalPhase = PointGoalPhase.Idle;
 
+	private struct PoseCorrection
+	{
+		public bool applyPosition;
+		public Vector3 correctedWorldPosition;
+		public bool applyRotation;
+		public Quaternion correctedWorldRotation;
+	}
+
 	void Reset()
 	{
 		rb = GetComponent<Rigidbody>();
@@ -229,6 +281,36 @@ public class DiffDriveTwinController : MonoBehaviour
 		}
 
 		// 1) 根据模式计算“目标”底盘速度 vTarget / wTarget
+		DrivePredictionState predictionState = CaptureDrivePredictionState();
+		if (TrySimulateDrivePredictionStep(ref predictionState, dt, out DrivePredictionStep predictionStep))
+		{
+			if (predictionStep.hardStopped)
+			{
+				HardStopAtGoal();
+			}
+			else
+			{
+				ApplyChassisMotion(predictionStep.commandedLinearVelocity, predictionStep.commandedAngularVelocity, dt);
+			}
+
+			if (rb != null)
+			{
+				if (predictionStep.applyPositionCorrection)
+				{
+					rb.MovePosition(predictionStep.correctedWorldPosition);
+				}
+
+				if (predictionStep.applyRotationCorrection)
+				{
+					rb.MoveRotation(predictionStep.correctedWorldRotation);
+				}
+			}
+
+			ApplyPredictedStateToController(predictionStep.nextState, predictionStep);
+			UpdateWheelOutputs(vLeft, vRight, dt);
+			return;
+		}
+
 		float vTarget = 0f;
 		float wTarget = 0f;
 
@@ -283,9 +365,379 @@ public class DiffDriveTwinController : MonoBehaviour
 		UpdateWheelOutputs(vLeft, vRight, dt);
 	}
 
+	public DrivePredictionState CaptureDrivePredictionState()
+	{
+		return new DrivePredictionState
+		{
+			worldPosition = rb != null ? rb.position : transform.position,
+			worldRotation = rb != null ? rb.rotation : transform.rotation,
+			mode = mode,
+			targetPointWorld = targetPointWorld,
+			hasTargetPoint = hasTargetPoint,
+			targetYawDeg = targetYawDeg,
+			targetDirectionWorld = targetDirectionWorld,
+			useVelocityCommandOverride = useVelocityCommandOverride,
+			overrideLinearVelocityTarget = overrideLinearVelocityTarget,
+			overrideAngularVelocityTarget = overrideAngularVelocityTarget,
+			currentLinearVelocity = vCmd,
+			currentAngularVelocity = wCmd,
+			lastLeftVelocity = lastVLeft,
+			lastRightVelocity = lastVRight,
+			goalReachedLatched = goalReachedLatched,
+			finalYawAlignmentActive = finalYawAlignmentActive,
+			pointGoalPhase = pointGoalPhase
+		};
+	}
+
+	public DrivePredictionState CreateDrivePreviewStateForTargetPoint(Vector3 point)
+	{
+		DrivePredictionState state = CaptureDrivePredictionState();
+		PrepareDrivePredictionStateForTargetPoint(ref state, point);
+		return state;
+	}
+
+	public DrivePredictionState CreateDrivePreviewStateForTargetYaw(float yawDegrees)
+	{
+		DrivePredictionState state = CaptureDrivePredictionState();
+		PrepareDrivePredictionStateForTargetYaw(ref state, yawDegrees);
+		return state;
+	}
+
+	public bool TrySimulateDrivePredictionStep(ref DrivePredictionState state, float dt, out DrivePredictionStep step)
+	{
+		step = new DrivePredictionStep
+		{
+			nextState = state,
+			predictedWorldPosition = state.worldPosition,
+			predictedWorldRotation = state.worldRotation,
+			correctedWorldPosition = state.worldPosition,
+			correctedWorldRotation = state.worldRotation
+		};
+
+		if (dt <= 1e-5f || !HasValidDriveGeometry)
+		{
+			return false;
+		}
+
+		float previousLeftVelocity = state.lastLeftVelocity;
+		float previousRightVelocity = state.lastRightVelocity;
+		EvaluatePredictionControlTargets(ref state, out float vTarget, out float wTarget, out PoseCorrection correction, out bool hardStop);
+		ApplyPoseCorrectionToState(ref state, correction);
+
+		if (hardStop)
+		{
+			state.currentLinearVelocity = 0f;
+			state.currentAngularVelocity = 0f;
+			state.lastLeftVelocity = 0f;
+			state.lastRightVelocity = 0f;
+			step.nextState = state;
+			step.targetLinearVelocity = vTarget;
+			step.targetAngularVelocity = wTarget;
+			step.commandedLinearVelocity = 0f;
+			step.commandedAngularVelocity = 0f;
+			step.leftVelocity = 0f;
+			step.rightVelocity = 0f;
+			step.leftAcceleration = (0f - previousLeftVelocity) / Mathf.Max(1e-5f, dt);
+			step.rightAcceleration = (0f - previousRightVelocity) / Mathf.Max(1e-5f, dt);
+			step.predictedWorldPosition = state.worldPosition;
+			step.predictedWorldRotation = state.worldRotation;
+			step.applyPositionCorrection = correction.applyPosition;
+			step.correctedWorldPosition = state.worldPosition;
+			step.applyRotationCorrection = correction.applyRotation;
+			step.correctedWorldRotation = state.worldRotation;
+			step.hardStopped = true;
+			step.arrived = true;
+			return true;
+		}
+
+		state.currentLinearVelocity = Ramp(state.currentLinearVelocity, vTarget, aMax, dt);
+		float angularAccelerationLimit = state.finalYawAlignmentActive
+			? alphaMax * Mathf.Max(1f, finalYawAccelerationScale)
+			: alphaMax;
+		state.currentAngularVelocity = Ramp(state.currentAngularVelocity, wTarget, angularAccelerationLimit, dt);
+
+		float leftVelocity = state.currentLinearVelocity - state.currentAngularVelocity * (trackWidth_b * 0.5f);
+		float rightVelocity = state.currentLinearVelocity + state.currentAngularVelocity * (trackWidth_b * 0.5f);
+		float leftAcceleration = (leftVelocity - previousLeftVelocity) / Mathf.Max(1e-5f, dt);
+		float rightAcceleration = (rightVelocity - previousRightVelocity) / Mathf.Max(1e-5f, dt);
+		state.lastLeftVelocity = leftVelocity;
+		state.lastRightVelocity = rightVelocity;
+		IntegratePredictedBasePose(ref state.worldPosition, ref state.worldRotation, state.currentLinearVelocity, state.currentAngularVelocity, dt);
+
+		step.nextState = state;
+		step.targetLinearVelocity = vTarget;
+		step.targetAngularVelocity = wTarget;
+		step.commandedLinearVelocity = state.currentLinearVelocity;
+		step.commandedAngularVelocity = state.currentAngularVelocity;
+		step.leftVelocity = leftVelocity;
+		step.rightVelocity = rightVelocity;
+		step.leftAcceleration = leftAcceleration;
+		step.rightAcceleration = rightAcceleration;
+		step.predictedWorldPosition = state.worldPosition;
+		step.predictedWorldRotation = state.worldRotation;
+		step.applyPositionCorrection = correction.applyPosition;
+		step.correctedWorldPosition = correction.applyPosition ? correction.correctedWorldPosition : state.worldPosition;
+		step.applyRotationCorrection = correction.applyRotation;
+		step.correctedWorldRotation = correction.applyRotation ? correction.correctedWorldRotation : state.worldRotation;
+		step.hardStopped = false;
+		step.arrived = state.mode == ControlMode.TargetPoint
+			? !state.hasTargetPoint && state.pointGoalPhase == PointGoalPhase.Arrived
+			: false;
+		return true;
+	}
+
+	private void ApplyPredictedStateToController(DrivePredictionState state, DrivePredictionStep step)
+	{
+		mode = state.mode;
+		targetPointWorld = state.targetPointWorld;
+		hasTargetPoint = state.hasTargetPoint;
+		targetYawDeg = state.targetYawDeg;
+		targetDirectionWorld = state.targetDirectionWorld;
+		useVelocityCommandOverride = state.useVelocityCommandOverride;
+		overrideLinearVelocityTarget = state.overrideLinearVelocityTarget;
+		overrideAngularVelocityTarget = state.overrideAngularVelocityTarget;
+		goalReachedLatched = state.goalReachedLatched;
+		finalYawAlignmentActive = state.finalYawAlignmentActive;
+		pointGoalPhase = state.pointGoalPhase;
+		vCmd = step.commandedLinearVelocity;
+		wCmd = step.commandedAngularVelocity;
+		vLeft = step.leftVelocity;
+		vRight = step.rightVelocity;
+		aLeft = step.leftAcceleration;
+		aRight = step.rightAcceleration;
+		lastVLeft = state.lastLeftVelocity;
+		lastVRight = state.lastRightVelocity;
+	}
+
+	private void PrepareDrivePredictionStateForTargetPoint(ref DrivePredictionState state, Vector3 point)
+	{
+		state.targetPointWorld = point;
+		state.hasTargetPoint = true;
+		state.goalReachedLatched = false;
+		state.finalYawAlignmentActive = false;
+		state.useVelocityCommandOverride = false;
+		state.overrideLinearVelocityTarget = 0f;
+		state.overrideAngularVelocityTarget = 0f;
+		state.pointGoalPhase = PointGoalPhase.Idle;
+		state.mode = ControlMode.TargetPoint;
+	}
+
+	private void PrepareDrivePredictionStateForTargetYaw(ref DrivePredictionState state, float yawDegrees)
+	{
+		state.targetYawDeg = yawDegrees;
+		state.hasTargetPoint = false;
+		state.goalReachedLatched = false;
+		state.finalYawAlignmentActive = false;
+		state.useVelocityCommandOverride = false;
+		state.overrideLinearVelocityTarget = 0f;
+		state.overrideAngularVelocityTarget = 0f;
+		state.pointGoalPhase = PointGoalPhase.Idle;
+		state.mode = ControlMode.TargetYaw;
+	}
+
 	// -------------------------
 	// Control: Point-to-Point
 	// -------------------------
+	private void EvaluatePredictionControlTargets(
+		ref DrivePredictionState state,
+		out float vTarget,
+		out float wTarget,
+		out PoseCorrection correction,
+		out bool hardStop)
+	{
+		correction = default;
+		hardStop = false;
+		vTarget = 0f;
+		wTarget = 0f;
+
+		if (state.useVelocityCommandOverride)
+		{
+			vTarget = Mathf.Clamp(state.overrideLinearVelocityTarget, -vMax, vMax);
+			wTarget = Mathf.Clamp(state.overrideAngularVelocityTarget, -wMax, wMax);
+			state.finalYawAlignmentActive = false;
+			return;
+		}
+
+		if (state.mode == ControlMode.TargetPoint)
+		{
+			if (!state.hasTargetPoint)
+			{
+				state.pointGoalPhase = state.goalReachedLatched ? PointGoalPhase.Arrived : PointGoalPhase.Idle;
+				hardStop = true;
+				return;
+			}
+
+			ComputePredictionPointToPointTargets(ref state, out vTarget, out wTarget, out correction, out hardStop);
+			return;
+		}
+
+		ComputePredictionYawOnlyTargets(ref state, out vTarget, out wTarget, out correction, out hardStop);
+	}
+
+	private void ComputePredictionPointToPointTargets(
+		ref DrivePredictionState state,
+		out float vTarget,
+		out float wTarget,
+		out PoseCorrection correction,
+		out bool hardStop)
+	{
+		correction = default;
+		hardStop = false;
+		Vector3 toGoal = state.targetPointWorld - state.worldPosition;
+		toGoal.y = 0f;
+
+		float dist = toGoal.magnitude;
+		float arrivalDistance = Mathf.Max(posTolerance, arrivalSnapDistance);
+		float desiredYaw = Mathf.Atan2(toGoal.x, toGoal.z);
+		float yaw = CurrentYawRad(state.worldRotation);
+		float yawError = WrapPi(desiredYaw - yaw);
+		float yawErrorDeg = Mathf.Abs(yawError) * Mathf.Rad2Deg;
+
+		if (state.goalReachedLatched && dist <= Mathf.Max(goalReleaseDistance, arrivalDistance))
+		{
+			state.pointGoalPhase = PointGoalPhase.Arrived;
+			vTarget = 0f;
+			wTarget = 0f;
+			return;
+		}
+
+		if (state.goalReachedLatched && dist > Mathf.Max(goalReleaseDistance, arrivalDistance))
+		{
+			state.goalReachedLatched = false;
+		}
+
+		if (dist <= arrivalDistance)
+		{
+			FinishPredictionPointGoal(ref state, out vTarget, out wTarget, out correction, out hardStop);
+			return;
+		}
+
+		UpdatePredictionPointGoalPhase(ref state, dist, arrivalDistance, yawErrorDeg);
+		wTarget = Mathf.Clamp(kYaw * yawError, -wMax, wMax);
+
+		switch (state.pointGoalPhase)
+		{
+			case PointGoalPhase.RotateInPlace:
+				vTarget = 0f;
+				break;
+
+			case PointGoalPhase.Cruise:
+				vTarget = vMax * Mathf.Max(cruiseHeadingFloor, Mathf.Clamp01(Mathf.Cos(yawError)));
+				break;
+
+			case PointGoalPhase.Brake:
+			{
+				float remainingForBrake = Mathf.Max(0f, dist - arrivalDistance);
+				float brakeEnvelope = Mathf.Sqrt(Mathf.Max(0f, 2f * aMax * remainingForBrake));
+				float headingScale = Mathf.Max(brakeHeadingFloor, Mathf.Clamp01(Mathf.Cos(yawError)));
+				vTarget = Mathf.Min(vMax, brakeEnvelope) * headingScale;
+				if (remainingForBrake > 0.15f && headingScale > 0.25f)
+				{
+					vTarget = Mathf.Max(vTarget, brakeMinSpeed);
+				}
+				break;
+			}
+
+			case PointGoalPhase.Arrived:
+				FinishPredictionPointGoal(ref state, out vTarget, out wTarget, out correction, out hardStop);
+				return;
+
+			default:
+				vTarget = 0f;
+				break;
+		}
+	}
+
+	private void UpdatePredictionPointGoalPhase(ref DrivePredictionState state, float dist, float arrivalDistance, float yawErrorDeg)
+	{
+		float rotateEnter = Mathf.Max(rotateInPlaceAngleDeg, rotateExitAngleDeg);
+		float rotateExit = Mathf.Min(rotateEnter - 1f, rotateExitAngleDeg);
+		float stopDistance = (state.currentLinearVelocity * state.currentLinearVelocity) / (2f * Mathf.Max(aMax, 1e-4f));
+		float brakeDistance = Mathf.Max(arrivalDistance + brakingDistancePadding, stopDistance + brakingDistancePadding);
+
+		switch (state.pointGoalPhase)
+		{
+			case PointGoalPhase.Idle:
+				state.pointGoalPhase = yawErrorDeg > rotateEnter ? PointGoalPhase.RotateInPlace : PointGoalPhase.Cruise;
+				break;
+
+			case PointGoalPhase.RotateInPlace:
+				if (yawErrorDeg <= rotateExit)
+				{
+					state.pointGoalPhase = PointGoalPhase.Cruise;
+				}
+				break;
+
+			case PointGoalPhase.Cruise:
+				if (yawErrorDeg > rotateEnter)
+				{
+					state.pointGoalPhase = PointGoalPhase.RotateInPlace;
+				}
+				else if (dist <= brakeDistance)
+				{
+					state.pointGoalPhase = PointGoalPhase.Brake;
+				}
+				break;
+
+			case PointGoalPhase.Brake:
+				if (dist <= arrivalDistance)
+				{
+					state.pointGoalPhase = PointGoalPhase.Arrived;
+				}
+				break;
+
+			case PointGoalPhase.Arrived:
+				if (dist > Mathf.Max(goalReleaseDistance, arrivalDistance))
+				{
+					state.pointGoalPhase = PointGoalPhase.Idle;
+				}
+				break;
+		}
+	}
+
+	private void FinishPredictionPointGoal(
+		ref DrivePredictionState state,
+		out float vTarget,
+		out float wTarget,
+		out PoseCorrection correction,
+		out bool hardStop)
+	{
+		correction = default;
+		hardStop = false;
+		state.goalReachedLatched = true;
+		state.pointGoalPhase = PointGoalPhase.Arrived;
+		state.hasTargetPoint = false;
+		state.mode = ControlMode.TargetPoint;
+		state.finalYawAlignmentActive = false;
+
+		if (!preserveArrivalHeading && alignYawAtGoal && rotateAtGoal)
+		{
+			state.mode = ControlMode.TargetYaw;
+			state.finalYawAlignmentActive = true;
+			vTarget = 0f;
+			if (useTargetDirectionAtGoal)
+			{
+				state.targetYawDeg = DirectionToYawDegFromVector(state.targetDirectionWorld, state.targetYawDeg);
+			}
+
+			wTarget = Mathf.Clamp(ComputeYawRateToTargetYawFromRotation(state.worldRotation, state.targetYawDeg), -wMax, wMax);
+			return;
+		}
+
+		if (snapPositionToGoalOnArrival)
+		{
+			Vector3 snappedPosition = state.worldPosition;
+			snappedPosition.x = state.targetPointWorld.x;
+			snappedPosition.z = state.targetPointWorld.z;
+			correction.applyPosition = true;
+			correction.correctedWorldPosition = snappedPosition;
+		}
+
+		vTarget = 0f;
+		wTarget = 0f;
+		hardStop = true;
+	}
+
 	void ComputePointToPointTargets(out float vTarget, out float wTarget, float dt)
 	{
 		Vector3 pos = rb.position;
@@ -434,6 +886,133 @@ public class DiffDriveTwinController : MonoBehaviour
 	// -------------------------
 	// Control: Yaw Only
 	// -------------------------
+	private void ComputePredictionYawOnlyTargets(
+		ref DrivePredictionState state,
+		out float vTarget,
+		out float wTarget,
+		out PoseCorrection correction,
+		out bool hardStop)
+	{
+		correction = default;
+		hardStop = false;
+		vTarget = 0f;
+		float yawErrorRad = WrapPi(TargetYawRad(state.targetYawDeg) - CurrentYawRad(state.worldRotation));
+		float yawErrorDeg = Mathf.Abs(yawErrorRad) * Mathf.Rad2Deg;
+		if (yawErrorDeg <= yawToleranceDeg)
+		{
+			if (snapYawToTargetWhenAligned)
+			{
+				correction.applyRotation = true;
+				correction.correctedWorldRotation = Quaternion.Euler(0f, state.targetYawDeg - headingOffsetDeg, 0f);
+			}
+
+			state.finalYawAlignmentActive = false;
+			wTarget = 0f;
+			hardStop = true;
+			return;
+		}
+
+		float yawGain = state.finalYawAlignmentActive ? Mathf.Max(kYaw, finalYawGain) : kYaw;
+		wTarget = Mathf.Clamp(yawGain * yawErrorRad, -wMax, wMax);
+		if (state.finalYawAlignmentActive && Mathf.Abs(wTarget) < finalYawMinRate)
+		{
+			wTarget = finalYawMinRate * Mathf.Sign(yawErrorRad);
+		}
+	}
+
+	private static void ApplyPoseCorrectionToState(ref DrivePredictionState state, PoseCorrection correction)
+	{
+		if (correction.applyPosition)
+		{
+			state.worldPosition = correction.correctedWorldPosition;
+		}
+
+		if (correction.applyRotation)
+		{
+			state.worldRotation = correction.correctedWorldRotation;
+		}
+	}
+
+	private static void IntegratePredictedBasePose(
+		ref Vector3 worldPosition,
+		ref Quaternion worldRotation,
+		float linearVelocity,
+		float angularVelocity,
+		float dt)
+	{
+		if (dt <= 1e-5f)
+		{
+			return;
+		}
+
+		Quaternion planarRotation = Quaternion.Euler(0f, worldRotation.eulerAngles.y, 0f);
+		Vector3 startPosition = worldPosition;
+		Vector3 planarForward = planarRotation * Vector3.forward;
+		planarForward.y = 0f;
+		if (planarForward.sqrMagnitude <= 1e-6f)
+		{
+			planarForward = Vector3.forward;
+		}
+		else
+		{
+			planarForward.Normalize();
+		}
+
+		if (Mathf.Abs(angularVelocity) <= 1e-4f)
+		{
+			worldPosition = startPosition + planarForward * linearVelocity * dt;
+			worldPosition.y = startPosition.y;
+			worldRotation = planarRotation;
+			return;
+		}
+
+		Vector3 planarRight = new Vector3(planarForward.z, 0f, -planarForward.x);
+		float deltaYaw = angularVelocity * dt;
+		float radius = linearVelocity / angularVelocity;
+		Vector3 planarDisplacement =
+			planarForward * (radius * Mathf.Sin(deltaYaw))
+			+ planarRight * (radius * (1f - Mathf.Cos(deltaYaw)));
+		worldPosition = startPosition + planarDisplacement;
+		worldPosition.y = startPosition.y;
+		worldRotation = planarRotation * Quaternion.Euler(0f, deltaYaw * Mathf.Rad2Deg, 0f);
+	}
+
+	private float ComputeYawRateToTargetYawFromRotation(Quaternion worldRotation, float yawDeg)
+	{
+		float yaw = CurrentYawRad(worldRotation);
+		float yawT = TargetYawRad(yawDeg);
+		float e = WrapPi(yawT - yaw);
+		return kYaw * e;
+	}
+
+	private float CurrentYawRad(Quaternion worldRotation)
+	{
+		Vector3 forward = worldRotation * Vector3.forward;
+		forward.y = 0f;
+		if (forward.sqrMagnitude <= 1e-8f)
+		{
+			forward = Vector3.forward;
+		}
+		else
+		{
+			forward.Normalize();
+		}
+
+		return WrapPi(Mathf.Atan2(forward.x, forward.z) + headingOffsetDeg * Mathf.Deg2Rad);
+	}
+
+	private float DirectionToYawDegFromVector(Vector3 dirWorld, float fallbackYawDeg)
+	{
+		dirWorld.y = 0f;
+		if (dirWorld.sqrMagnitude <= 1e-8f)
+		{
+			return fallbackYawDeg;
+		}
+
+		dirWorld.Normalize();
+		return Mathf.Atan2(dirWorld.x, dirWorld.z) * Mathf.Rad2Deg;
+	}
+
 	void ComputeYawOnlyTargets(out float vTarget, out float wTarget)
 	{
 		vTarget = 0f;

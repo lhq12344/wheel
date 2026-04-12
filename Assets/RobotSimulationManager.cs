@@ -32,6 +32,10 @@ namespace RobotSimulation
 		[Header("Shadow Visualization")]
 		public ShadowRobotVisualizer shadowRobotVisualizer;
 		[SerializeField] private bool enableShadowRobotVisualization = true;
+		[SerializeField] private float manualPreviewAutoExecuteDelaySeconds = 0.35f;
+		[SerializeField] private ManualPreviewSessionKind _manualPreviewKind = ManualPreviewSessionKind.None;
+		[SerializeField] private ManualPreviewSessionState _manualPreviewState = ManualPreviewSessionState.Idle;
+		[SerializeField] private string _manualPreviewSummary = "Manual preview idle.";
 
 		[Header("Robot State")]
 		[SerializeField] private RobotState _robotState;
@@ -62,6 +66,9 @@ namespace RobotSimulation
 		public ShadowValidationResult LastShadowValidationResult => _lastShadowValidationResult;
 		public string LastPlanningSummary => _lastPlanningSummary;
 		public string LastResidualCalibrationSummary => _lastResidualCalibrationSummary;
+		public ManualPreviewSessionKind CurrentManualPreviewKind => _manualPreviewKind;
+		public ManualPreviewSessionState CurrentManualPreviewState => _manualPreviewState;
+		public string ManualPreviewSummary => _manualPreviewSummary;
 
 		[Header("Simulation Settings")]
 		public bool enableSimulation = true;
@@ -89,6 +96,25 @@ namespace RobotSimulation
 		private Coroutine _armHomeUnlockRoutine;
 		private bool _startupCoordinatedDiagnosticsLogged;
 		private bool _postBindCoordinatedDiagnosticsLogged;
+		private int _manualPreviewSessionVersion;
+		private ManualPreviewSession _manualPreviewSession;
+
+		private sealed class ManualPreviewSession
+		{
+			public int version;
+			public ManualPreviewSessionKind kind;
+			public ManualPreviewSessionState state;
+			public float previewStartRealtime;
+			public float executeAtRealtime;
+			public DiffDriveTwinController.DrivePredictionState basePreviewState;
+			public Vector3 baseTargetPointWorld;
+			public float baseTargetYawDeg;
+			public ArmTrajectoryPreviewPlan armPreviewPlan;
+			public float armPreviewElapsed;
+			public int armPreviewSampleIndex;
+			public bool holdToRun;
+			public System.Action<ArmMoveResult> armOnComplete;
+		}
 
 		void Awake()
 		{
@@ -148,6 +174,13 @@ namespace RobotSimulation
 				shadowRobotVisualizer.SetVisualizationEnabled(enableShadowRobotVisualization);
 			}
 
+			if (_manualPreviewState != ManualPreviewSessionState.Idle
+				&& trajectoryPlanner != null
+				&& trajectoryPlanner.IsPlanning)
+			{
+				CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual preview cancelled because coordinated planning started.");
+			}
+
 			SyncArmWorldCoordinateCommandActivity();
 		}
 
@@ -160,6 +193,8 @@ namespace RobotSimulation
 				bool collided = armCollisionMonitor.EvaluateCollisionState();
 				if (collided && !_armCollisionResponseLatched)
 				{
+					CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual preview cancelled after collision.");
+
 					if (arm6DOFIKController != null)
 					{
 						arm6DOFIKController.StopCurrentMove(false);
@@ -189,6 +224,8 @@ namespace RobotSimulation
 					_armCollisionResponseLatched = false;
 				}
 			}
+
+			TickManualPreviewSession();
 		}
 
 		/// <summary>
@@ -731,17 +768,136 @@ namespace RobotSimulation
 		/// <summary>
 		/// Set target point for navigation
 		/// </summary>
+		public bool StartBasePointPreviewThenExecute(Vector3 point)
+		{
+			if (!Application.isPlaying || diffDriveController == null || diffDriveController.rb == null)
+			{
+				return false;
+			}
+
+			if (!diffDriveController.EnsureDriveGeometryReady())
+			{
+				Debug.LogWarning("[RobotSimulation] Base preview could not start because diff-drive geometry is not ready.");
+				return false;
+			}
+
+			EnsurePlanningSupportComponents();
+			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual base preview replaced by a new base point command.");
+
+			point.y = diffDriveController.rb.position.y;
+			int version = ++_manualPreviewSessionVersion;
+			_manualPreviewSession = new ManualPreviewSession
+			{
+				version = version,
+				kind = ManualPreviewSessionKind.BasePoint,
+				state = ManualPreviewSessionState.PreviewPending,
+				previewStartRealtime = Time.realtimeSinceStartup,
+				executeAtRealtime = Time.realtimeSinceStartup + Mathf.Max(0.05f, manualPreviewAutoExecuteDelaySeconds),
+				baseTargetPointWorld = point,
+				basePreviewState = diffDriveController.CreateDrivePreviewStateForTargetPoint(point)
+			};
+			_manualPreviewKind = _manualPreviewSession.kind;
+			_manualPreviewState = _manualPreviewSession.state;
+			_manualPreviewSummary = $"Base target previewing toward ({point.x:F3}, {point.y:F3}, {point.z:F3}).";
+			shadowRobotVisualizer?.EnterBasePreview();
+			return true;
+		}
+
+		public bool StartBaseYawPreviewThenExecute(float yawDeg)
+		{
+			if (!Application.isPlaying || diffDriveController == null || diffDriveController.rb == null)
+			{
+				return false;
+			}
+
+			if (!diffDriveController.EnsureDriveGeometryReady())
+			{
+				Debug.LogWarning("[RobotSimulation] Base preview could not start because diff-drive geometry is not ready.");
+				return false;
+			}
+
+			EnsurePlanningSupportComponents();
+			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual base preview replaced by a new yaw command.");
+
+			int version = ++_manualPreviewSessionVersion;
+			_manualPreviewSession = new ManualPreviewSession
+			{
+				version = version,
+				kind = ManualPreviewSessionKind.BaseYaw,
+				state = ManualPreviewSessionState.PreviewPending,
+				previewStartRealtime = Time.realtimeSinceStartup,
+				executeAtRealtime = Time.realtimeSinceStartup + Mathf.Max(0.05f, manualPreviewAutoExecuteDelaySeconds),
+				baseTargetYawDeg = yawDeg,
+				basePreviewState = diffDriveController.CreateDrivePreviewStateForTargetYaw(yawDeg)
+			};
+			_manualPreviewKind = _manualPreviewSession.kind;
+			_manualPreviewState = _manualPreviewSession.state;
+			_manualPreviewSummary = $"Base yaw previewing toward {yawDeg:F1} deg.";
+			shadowRobotVisualizer?.EnterBasePreview();
+			return true;
+		}
+
+		public bool StartArmWorldMovePreviewThenExecute(
+			ArmMoveRequest request,
+			bool holdToRun,
+			System.Action<ArmMoveResult> onComplete = null)
+		{
+			Vector3 targetPosition = request != null ? request.worldPosition : Vector3.zero;
+			if (_isArmWorldCoordinateMotionLocked)
+			{
+				_lastArmMoveResult = CreateLockedArmMoveResult(targetPosition);
+				onComplete?.Invoke(_lastArmMoveResult);
+				return false;
+			}
+
+			if (!Application.isPlaying || !EnsureArmCoordinateControllers() || arm6DOFIKController == null || arm6DOFFKController == null)
+			{
+				Debug.LogError("[RobotSimulation] Arm preview could not start because the IK/FK controllers are unavailable.");
+				return false;
+			}
+
+			EnsurePlanningSupportComponents();
+			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual arm preview replaced by a new world-coordinate arm command.");
+
+			if (!arm6DOFIKController.TryBuildPreviewPlan(request, out ArmTrajectoryPreviewPlan previewPlan))
+			{
+				_lastArmMoveResult = previewPlan != null ? previewPlan.planningResult : new ArmMoveResult();
+				_lastArmCollisionGuardResult = arm6DOFIKController.LastCollisionGuardResult;
+				if (_lastArmCollisionGuardResult != null && _lastArmCollisionGuardResult.blockedByForbiddenCollision)
+				{
+					EngageArmWorldCoordinateMotionLock(_lastArmCollisionGuardResult.message);
+				}
+				onComplete?.Invoke(_lastArmMoveResult);
+				return false;
+			}
+
+			_lastArmMoveResult = previewPlan.planningResult;
+			_lastArmCollisionGuardResult = arm6DOFIKController.LastCollisionGuardResult;
+
+			int version = ++_manualPreviewSessionVersion;
+			_manualPreviewSession = new ManualPreviewSession
+			{
+				version = version,
+				kind = ManualPreviewSessionKind.ArmWorldMove,
+				state = ManualPreviewSessionState.PreviewPending,
+				previewStartRealtime = Time.realtimeSinceStartup,
+				executeAtRealtime = Time.realtimeSinceStartup + Mathf.Max(0.05f, manualPreviewAutoExecuteDelaySeconds),
+				armPreviewPlan = previewPlan,
+				holdToRun = holdToRun,
+				armOnComplete = onComplete
+			};
+			_manualPreviewKind = _manualPreviewSession.kind;
+			_manualPreviewState = _manualPreviewSession.state;
+			_manualPreviewSummary = $"Arm previewing toward ({targetPosition.x:F3}, {targetPosition.y:F3}, {targetPosition.z:F3}).";
+			shadowRobotVisualizer?.EnterArmPreview(
+				diffDriveController != null && diffDriveController.rb != null ? diffDriveController.rb.position : Vector3.zero,
+				diffDriveController != null && diffDriveController.rb != null ? diffDriveController.rb.rotation : Quaternion.identity);
+			return true;
+		}
+
 		public void SetTargetPoint(Vector3 point)
 		{
-			if (diffDriveController != null)
-			{
-				if (diffDriveController.rb != null)
-				{
-					point.y = diffDriveController.rb.position.y;
-				}
-
-				diffDriveController.SetTargetPointGoal(point);
-			}
+			StartBasePointPreviewThenExecute(point);
 		}
 
 		/// <summary>
@@ -749,10 +905,7 @@ namespace RobotSimulation
 		/// </summary>
 		public void SetTargetYaw(float yawDegrees)
 		{
-			if (diffDriveController != null)
-			{
-				diffDriveController.SetTargetYawGoal(yawDegrees);
-			}
+			StartBaseYawPreviewThenExecute(yawDegrees);
 		}
 
 		/// <summary>
@@ -760,6 +913,8 @@ namespace RobotSimulation
 		/// </summary>
 		public void SetJointTarget(int jointIndex, float angleDegrees)
 		{
+			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: true, reason: "Manual preview cancelled by direct joint controller command.");
+
 			if (armJointControllers != null && jointIndex >= 0 && jointIndex < armJointControllers.Length)
 			{
 				armJointControllers[jointIndex].goalDeg = angleDegrees;
@@ -776,6 +931,8 @@ namespace RobotSimulation
 
 		public bool TrySetArmJointTarget(int jointIndex, float angleDegrees)
 		{
+			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: true, reason: "Manual preview cancelled by direct joint command.");
+
 			if (!EnsureArmCoordinateControllers() || arm6DOFFKController == null)
 			{
 				return false;
@@ -792,39 +949,20 @@ namespace RobotSimulation
 		/// </summary>
 		public bool MoveArmToPosition(Vector3 position)
 		{
-			if (_isArmWorldCoordinateMotionLocked)
+			return StartArmWorldMovePreviewThenExecute(new ArmMoveRequest
 			{
-				_lastArmMoveResult = CreateLockedArmMoveResult(position);
-				return false;
-			}
-
-			if (!EnsureArmCoordinateControllers() || arm6DOFIKController == null)
-			{
-				Debug.LogError("[RobotSimulation] IK Controller not found!");
-				return false;
-			}
-
-			bool success = arm6DOFIKController.TryStartMoveToWorldPosition(position);
-			_lastArmCollisionGuardResult = arm6DOFIKController.LastCollisionGuardResult;
-			if (success)
-			{
-				_armWorldCoordinateCommandActive = true;
-				_armWorldCoordinateCommandIssuedSinceUnlock = true;
-			}
-			if (!success)
-			{
-				_lastArmMoveResult = arm6DOFIKController.LastMoveResult;
-				if (_lastArmCollisionGuardResult != null && _lastArmCollisionGuardResult.blockedByForbiddenCollision)
-				{
-					EngageArmWorldCoordinateMotionLock(_lastArmCollisionGuardResult.message);
-				}
-			}
-
-			return success;
+				worldPosition = position,
+				positionToleranceMeters = arm6DOFIKController != null ? arm6DOFIKController.tolerance : 0.01f,
+				stableFixedFrames = 1,
+				timeoutSeconds = arm6DOFIKController != null ? Mathf.Max(1f, arm6DOFIKController.maxIterations * Time.fixedDeltaTime * 2f) : 5f,
+				speedScale = 1f
+			}, holdToRun: false);
 		}
 
 		public Coroutine MoveArmToWorldPositionAndWait(ArmMoveRequest request, System.Action<ArmMoveResult> onComplete = null)
 		{
+			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: true, reason: "Manual preview cancelled by direct world-coordinate arm execution.");
+
 			Vector3 targetPosition = request != null ? request.worldPosition : Vector3.zero;
 			if (_isArmWorldCoordinateMotionLocked)
 			{
@@ -871,6 +1009,8 @@ namespace RobotSimulation
 
 		public void StopArmMove(bool emergencyStopArm = true)
 		{
+			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: false, reason: "Manual preview cancelled by stop-arm request.");
+
 			if (arm6DOFIKController != null)
 			{
 				arm6DOFIKController.StopCurrentMove(emergencyStopArm);
@@ -883,8 +1023,242 @@ namespace RobotSimulation
 			_armWorldCoordinateCommandActive = false;
 		}
 
+		private void TickManualPreviewSession()
+		{
+			if (_manualPreviewSession == null || _manualPreviewState == ManualPreviewSessionState.Idle)
+			{
+				return;
+			}
+
+			if (!Application.isPlaying)
+			{
+				CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual preview cancelled because play mode is not active.");
+				return;
+			}
+
+			switch (_manualPreviewSession.kind)
+			{
+				case ManualPreviewSessionKind.BasePoint:
+				case ManualPreviewSessionKind.BaseYaw:
+					TickManualBasePreviewSession(_manualPreviewSession);
+					break;
+
+				case ManualPreviewSessionKind.ArmWorldMove:
+					TickManualArmPreviewSession(_manualPreviewSession);
+					break;
+			}
+		}
+
+		private void TickManualBasePreviewSession(ManualPreviewSession session)
+		{
+			if (session == null || diffDriveController == null || diffDriveController.rb == null || shadowRobotVisualizer == null)
+			{
+				CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: false, reason: "Manual base preview cancelled because required references are missing.");
+				return;
+			}
+
+			if (!diffDriveController.TrySimulateDrivePredictionStep(ref session.basePreviewState, Time.fixedDeltaTime, out DiffDriveTwinController.DrivePredictionStep step))
+			{
+				CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: false, reason: "Manual base preview cancelled because the predictor could not advance.");
+				return;
+			}
+
+			SafetyGateTimelineCommand previewCommand = new SafetyGateTimelineCommand
+			{
+				kind = SafetyGateTimelineCommandKind.Base,
+				baseLinearVelocity = step.commandedLinearVelocity,
+				baseAngularVelocity = step.commandedAngularVelocity,
+				predictedLeadSeconds = manualPreviewAutoExecuteDelaySeconds
+			};
+			shadowRobotVisualizer.ApplyManualBasePreviewStep(previewCommand, step.predictedWorldPosition, step.predictedWorldRotation);
+
+			if (_manualPreviewState == ManualPreviewSessionState.PreviewPending
+				&& Time.realtimeSinceStartup + 1e-4f >= session.executeAtRealtime)
+			{
+				if (session.kind == ManualPreviewSessionKind.BasePoint)
+				{
+					diffDriveController.SetTargetPointGoal(session.baseTargetPointWorld);
+				}
+				else
+				{
+					diffDriveController.SetTargetYawGoal(session.baseTargetYawDeg);
+				}
+
+				session.state = ManualPreviewSessionState.Executing;
+				_manualPreviewState = session.state;
+				_manualPreviewSummary = session.kind == ManualPreviewSessionKind.BasePoint
+					? "Base target preview committed to the live robot."
+					: "Base yaw preview committed to the live robot.";
+			}
+
+			if (_manualPreviewState == ManualPreviewSessionState.Executing && IsBaseManualExecutionComplete(session))
+			{
+				CompleteManualPreviewSession("Manual base preview finished.");
+			}
+		}
+
+		private void TickManualArmPreviewSession(ManualPreviewSession session)
+		{
+			if (session == null || session.armPreviewPlan == null || shadowRobotVisualizer == null)
+			{
+				CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: true, reason: "Manual arm preview cancelled because the preview plan is missing.");
+				return;
+			}
+
+			float speedScale = session.armPreviewPlan.request != null ? Mathf.Max(0.1f, session.armPreviewPlan.request.speedScale) : 1f;
+			session.armPreviewElapsed += Time.fixedDeltaTime * speedScale;
+			List<RobotPlanJointSample> samples = session.armPreviewPlan.samples ?? new List<RobotPlanJointSample>();
+			while (session.armPreviewSampleIndex < samples.Count
+				&& session.armPreviewElapsed + 1e-4f >= samples[session.armPreviewSampleIndex].timeSeconds)
+			{
+				shadowRobotVisualizer.ApplyManualArmPreviewSample(samples[session.armPreviewSampleIndex], manualPreviewAutoExecuteDelaySeconds);
+				session.armPreviewSampleIndex++;
+			}
+
+			if (session.armPreviewSampleIndex <= 0 && samples.Count > 0)
+			{
+				shadowRobotVisualizer.ApplyManualArmPreviewSample(samples[0], manualPreviewAutoExecuteDelaySeconds);
+			}
+
+			if (_manualPreviewState == ManualPreviewSessionState.PreviewPending
+				&& Time.realtimeSinceStartup + 1e-4f >= session.executeAtRealtime)
+			{
+				TryStartManualArmExecution(session);
+			}
+		}
+
+		private void TryStartManualArmExecution(ManualPreviewSession session)
+		{
+			if (session == null || arm6DOFIKController == null || session.armPreviewPlan == null)
+			{
+				CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: true, reason: "Manual arm preview could not transition into execution.");
+				return;
+			}
+
+			int version = session.version;
+			_isArmMoveInProgress = true;
+			_armWorldCoordinateCommandActive = true;
+			_armWorldCoordinateCommandIssuedSinceUnlock = true;
+			session.state = ManualPreviewSessionState.Executing;
+			_manualPreviewState = session.state;
+			_manualPreviewSummary = "Arm preview committed to the live robot.";
+			_armMoveRoutine = arm6DOFIKController.ExecutePreviewPlan(session.armPreviewPlan, result =>
+			{
+				if (_manualPreviewSession == null || _manualPreviewSession.version != version)
+				{
+					return;
+				}
+
+				_lastArmMoveResult = result;
+				_lastArmCollisionGuardResult = result != null
+					? result.collisionGuardResult ?? arm6DOFIKController.LastCollisionGuardResult
+					: arm6DOFIKController.LastCollisionGuardResult;
+				_isArmMoveInProgress = false;
+				_armMoveRoutine = null;
+				if (result != null && (result.collided || result.blockedByCollisionGuard))
+				{
+					EngageArmWorldCoordinateMotionLock(!string.IsNullOrEmpty(result.summary)
+						? result.summary
+						: "World-coordinate arm motion was locked after a collision.");
+				}
+				else
+				{
+					_armWorldCoordinateCommandActive = false;
+				}
+
+				session.armOnComplete?.Invoke(result);
+				CompleteManualPreviewSession(result != null && !string.IsNullOrEmpty(result.summary)
+					? result.summary
+					: "Manual arm preview finished.");
+			});
+		}
+
+		private bool IsBaseManualExecutionComplete(ManualPreviewSession session)
+		{
+			if (session == null || diffDriveController == null || diffDriveController.rb == null)
+			{
+				return true;
+			}
+
+			if (session.kind == ManualPreviewSessionKind.BasePoint)
+			{
+				Vector3 livePosition = diffDriveController.rb.position;
+				Vector3 goal = session.baseTargetPointWorld;
+				return Vector3.Distance(new Vector3(livePosition.x, 0f, livePosition.z), new Vector3(goal.x, 0f, goal.z))
+					<= Mathf.Max(diffDriveController.posTolerance, diffDriveController.arrivalSnapDistance)
+					&& diffDriveController.CurrentPlanarSpeedMeasured <= Mathf.Max(0.02f, diffDriveController.brakeMinSpeed * 0.5f);
+			}
+
+			float yawError = Mathf.Abs(Mathf.DeltaAngle(diffDriveController.rb.rotation.eulerAngles.y + diffDriveController.headingOffsetDeg, session.baseTargetYawDeg));
+			return yawError <= diffDriveController.yawToleranceDeg
+				&& diffDriveController.CurrentYawRateMeasured <= diffDriveController.yawRateStopTolerance;
+		}
+
+		public void CancelManualPreviewSession(
+			bool returnShadowToMirror,
+			bool stopBaseMotion = false,
+			bool stopArmMotion = false,
+			string reason = null)
+		{
+			if (_manualPreviewSession == null && _manualPreviewState == ManualPreviewSessionState.Idle)
+			{
+				return;
+			}
+
+			_manualPreviewSessionVersion++;
+			ManualPreviewSession previousSession = _manualPreviewSession;
+			_manualPreviewSession = null;
+			_manualPreviewKind = ManualPreviewSessionKind.None;
+			_manualPreviewState = ManualPreviewSessionState.Cancelled;
+			_manualPreviewSummary = string.IsNullOrEmpty(reason) ? "Manual preview cancelled." : reason;
+
+			if (stopBaseMotion && diffDriveController != null)
+			{
+				diffDriveController.hasTargetPoint = false;
+				diffDriveController.targetPointWorld = diffDriveController.rb != null ? diffDriveController.rb.position : Vector3.zero;
+				diffDriveController.mode = DiffDriveTwinController.ControlMode.TargetPoint;
+				diffDriveController.HardStopAtGoal();
+			}
+
+			bool shouldStopArmMotion = stopArmMotion
+				&& arm6DOFIKController != null
+				&& (_isArmMoveInProgress || (previousSession != null && previousSession.kind == ManualPreviewSessionKind.ArmWorldMove));
+			if (shouldStopArmMotion)
+			{
+				arm6DOFIKController.StopCurrentMove(true);
+				_lastArmMoveResult = arm6DOFIKController.LastMoveResult;
+				_lastArmCollisionGuardResult = arm6DOFIKController.LastCollisionGuardResult;
+			}
+
+			if (returnShadowToMirror)
+			{
+				shadowRobotVisualizer?.ReturnToMirror();
+			}
+
+			if (previousSession != null && previousSession.holdToRun && previousSession.kind == ManualPreviewSessionKind.ArmWorldMove)
+			{
+				_armWorldCoordinateCommandActive = false;
+				_isArmMoveInProgress = false;
+				_armMoveRoutine = null;
+			}
+
+			_manualPreviewState = ManualPreviewSessionState.Idle;
+		}
+
+		private void CompleteManualPreviewSession(string summary)
+		{
+			_manualPreviewSession = null;
+			_manualPreviewKind = ManualPreviewSessionKind.None;
+			_manualPreviewState = ManualPreviewSessionState.Completed;
+			_manualPreviewSummary = string.IsNullOrEmpty(summary) ? "Manual preview completed." : summary;
+			shadowRobotVisualizer?.ReturnToMirror();
+			_manualPreviewState = ManualPreviewSessionState.Idle;
+		}
+
 		public Coroutine PlanAndExecuteRobotTask(RobotPlanRequest request, System.Action<RobotPlanResult> onComplete = null)
 		{
+			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual preview cancelled by coordinated plan-and-execute request.");
+
 			if (!Application.isPlaying)
 			{
 				_lastPlanningSummary = "PlanAndExecuteRobotTask can only run in Play Mode.";
@@ -921,6 +1295,8 @@ namespace RobotSimulation
 
 		public Coroutine PlanRobotTaskOnly(RobotPlanRequest request, System.Action<RobotPlanResult> onComplete = null)
 		{
+			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual preview cancelled by plan-only request.");
+
 			if (!Application.isPlaying)
 			{
 				_lastPlanningSummary = RobotSimulationLocalization.Text("仅规划模式只能在 Play Mode 下运行。", "PlanRobotTaskOnly can only run in Play Mode.");
@@ -1110,6 +1486,8 @@ namespace RobotSimulation
 
 		public bool TryMoveArmHome()
 		{
+			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: true, reason: "Manual preview cancelled by Go Home.");
+
 			if (!EnsureArmCoordinateControllers() || arm6DOFFKController == null)
 			{
 				return false;
@@ -1248,6 +1626,8 @@ namespace RobotSimulation
 		/// </summary>
 		public void ClearTarget()
 		{
+			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: true, reason: "Manual preview cancelled by clear-target request.");
+
 			if (diffDriveController != null)
 			{
 				diffDriveController.hasTargetPoint = false;
@@ -1374,6 +1754,8 @@ namespace RobotSimulation
 		/// </summary>
 		public void EmergencyStop()
 		{
+			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: false, reason: "Manual preview cancelled by emergency stop.");
+
 			if (diffDriveController != null)
 			{
 				diffDriveController.HardStopAtGoal();
@@ -1390,6 +1772,8 @@ namespace RobotSimulation
 		/// </summary>
 		public void ResetRobot(Vector3 position, Quaternion rotation)
 		{
+			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual preview cancelled by robot reset.");
+
 			if (diffDriveController?.rb != null)
 			{
 				diffDriveController.rb.position = position;

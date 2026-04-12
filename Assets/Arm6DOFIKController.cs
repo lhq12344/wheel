@@ -104,6 +104,47 @@ namespace RobotSimulation
 			return _moveWaitRoutine;
 		}
 
+		public bool TryBuildPreviewPlan(ArmMoveRequest request, out ArmTrajectoryPreviewPlan previewPlan)
+		{
+			ArmMoveRequest safeRequest = SanitizeArmMoveRequest(request);
+			previewPlan = new ArmTrajectoryPreviewPlan
+			{
+				request = safeRequest,
+				planningResult = new ArmMoveResult
+				{
+					targetWorldPosition = safeRequest.worldPosition
+				}
+			};
+
+			if (!TryBeginPlannedMove(safeRequest.worldPosition, out ArmMoveResult startResult, out List<RobotPlanJointSample> plannedSamples))
+			{
+				startResult.timedOut = false;
+				startResult.success = false;
+				previewPlan.planningResult = startResult;
+				previewPlan.samples = new List<RobotPlanJointSample>();
+				previewPlan.totalDurationSeconds = 0f;
+				return false;
+			}
+
+			previewPlan.planningResult = startResult;
+			previewPlan.samples = plannedSamples ?? new List<RobotPlanJointSample>();
+			previewPlan.totalDurationSeconds = previewPlan.samples.Count > 0
+				? previewPlan.samples[previewPlan.samples.Count - 1].timeSeconds
+				: 0f;
+			return true;
+		}
+
+		public Coroutine ExecutePreviewPlan(ArmTrajectoryPreviewPlan previewPlan, Action<ArmMoveResult> onComplete = null)
+		{
+			if (_moveWaitRoutine != null)
+			{
+				StopCoroutine(_moveWaitRoutine);
+			}
+
+			_moveWaitRoutine = StartCoroutine(ExecutePlannedMoveCoroutine(previewPlan, onComplete));
+			return _moveWaitRoutine;
+		}
+
 		public void StopCurrentMove(bool emergencyStop = true)
 		{
 			StopActiveCoroutines();
@@ -311,6 +352,19 @@ namespace RobotSimulation
 			_motionPlanner.settings.sampleTimeStepSeconds = Mathf.Max(0.02f, 0.08f / Mathf.Max(0.1f, _activeMoveSpeedScale));
 		}
 
+		private ArmMoveRequest SanitizeArmMoveRequest(ArmMoveRequest request)
+		{
+			ArmMoveRequest safeRequest = request ?? new ArmMoveRequest();
+			return new ArmMoveRequest
+			{
+				worldPosition = safeRequest.worldPosition,
+				positionToleranceMeters = Mathf.Max(0.001f, safeRequest.positionToleranceMeters),
+				stableFixedFrames = Mathf.Max(1, safeRequest.stableFixedFrames),
+				timeoutSeconds = safeRequest.timeoutSeconds > 0f ? safeRequest.timeoutSeconds : 5f,
+				speedScale = Mathf.Clamp(safeRequest.speedScale, 0.1f, 3f)
+			};
+		}
+
 		private void StartSolveRoutine()
 		{
 			if (_solveRoutine != null)
@@ -408,33 +462,49 @@ namespace RobotSimulation
 
 		private IEnumerator MoveToWorldPositionAndWaitCoroutine(ArmMoveRequest request, Action<ArmMoveResult> onComplete)
 		{
-			ArmMoveRequest safeRequest = request ?? new ArmMoveRequest();
-			if (safeRequest.stableFixedFrames <= 0)
+			if (!TryBuildPreviewPlan(request, out ArmTrajectoryPreviewPlan previewPlan))
 			{
-				safeRequest.stableFixedFrames = 1;
-			}
-
-			if (safeRequest.timeoutSeconds <= 0f)
-			{
-				safeRequest.timeoutSeconds = 5f;
-			}
-
-			safeRequest.speedScale = Mathf.Clamp(safeRequest.speedScale, 0.1f, 3f);
-			_activeMoveSpeedScale = safeRequest.speedScale;
-
-			_isMoveInProgress = true;
-			StopSolveRoutine();
-			if (!TryBeginPlannedMove(safeRequest.worldPosition, out ArmMoveResult startResult, out List<RobotPlanJointSample> plannedSamples))
-			{
-				_isMoveInProgress = false;
-				startResult.timedOut = false;
-				startResult.success = false;
+				ArmMoveResult failedResult = previewPlan != null ? previewPlan.planningResult : new ArmMoveResult();
 				_moveWaitRoutine = null;
-				_activeMoveSpeedScale = 1f;
-				_lastMoveResult = startResult;
-				onComplete?.Invoke(startResult);
+				_lastMoveResult = failedResult;
+				onComplete?.Invoke(failedResult);
 				yield break;
 			}
+
+			yield return ExecutePlannedMoveCoroutine(previewPlan, onComplete);
+		}
+
+		private IEnumerator ExecutePlannedMoveCoroutine(ArmTrajectoryPreviewPlan previewPlan, Action<ArmMoveResult> onComplete)
+		{
+			ArmTrajectoryPreviewPlan safePlan = previewPlan ?? new ArmTrajectoryPreviewPlan();
+			ArmMoveRequest safeRequest = SanitizeArmMoveRequest(safePlan.request);
+			List<RobotPlanJointSample> plannedSamples = safePlan.samples ?? new List<RobotPlanJointSample>();
+			if (plannedSamples.Count <= 0)
+			{
+				ArmMoveResult invalidResult = safePlan.planningResult ?? new ArmMoveResult
+				{
+					targetWorldPosition = safeRequest.worldPosition
+				};
+				invalidResult.accepted = false;
+				invalidResult.success = false;
+				if (string.IsNullOrEmpty(invalidResult.summary))
+				{
+					invalidResult.summary = "Arm preview plan is empty.";
+				}
+
+				_lastMoveResult = invalidResult;
+				_isMoveInProgress = false;
+				_activeMoveSpeedScale = 1f;
+				_moveWaitRoutine = null;
+				onComplete?.Invoke(invalidResult);
+				yield break;
+			}
+
+			_activeMoveSpeedScale = safeRequest.speedScale;
+			_isMoveInProgress = true;
+			StopSolveRoutine();
+			_solveBlockedByCollisionGuard = false;
+			_lastCollisionGuardResult = new ArmCollisionGuardResult { allowed = true };
 
 			int stableFrames = 0;
 			float elapsed = 0f;
@@ -454,7 +524,7 @@ namespace RobotSimulation
 				elapsed += Time.fixedDeltaTime;
 				trajectoryElapsed += Time.fixedDeltaTime * Mathf.Max(0.1f, safeRequest.speedScale);
 
-				if (armController != null && plannedSamples != null)
+				if (armController != null)
 				{
 					while (sampleIndex < plannedSamples.Count && trajectoryElapsed + 1e-4f >= plannedSamples[sampleIndex].timeSeconds)
 					{
@@ -527,7 +597,7 @@ namespace RobotSimulation
 						result.success = true;
 						result.finalWorldPosition = currentWorldPosition;
 						result.finalPositionError = error;
-						result.iterations = Mathf.Max(_lastSolveIterations, plannedSamples != null ? plannedSamples.Count : 0);
+						result.iterations = Mathf.Max(_lastSolveIterations, plannedSamples.Count);
 						result.summary = $"Reached target in {elapsed:F2}s.";
 						_lastSolveSuccess = true;
 						_lastSolveError = error;
@@ -547,16 +617,13 @@ namespace RobotSimulation
 			if (!result.success)
 			{
 				_lastSolveSuccess = false;
-				if (!result.collided)
+				if (!result.collided && !result.blockedByCollisionGuard)
 				{
-					if (!result.blockedByCollisionGuard)
-					{
-						result.finalWorldPosition = GetCurrentWorldEndEffectorPosition();
-						result.finalPositionError = Vector3.Distance(result.finalWorldPosition, safeRequest.worldPosition);
-						result.iterations = Mathf.Max(_lastSolveIterations, plannedSamples != null ? plannedSamples.Count : 0);
-						result.timedOut = true;
-						result.summary = "Timed out while waiting for the end effector to settle at the target position.";
-					}
+					result.finalWorldPosition = GetCurrentWorldEndEffectorPosition();
+					result.finalPositionError = Vector3.Distance(result.finalWorldPosition, safeRequest.worldPosition);
+					result.iterations = Mathf.Max(_lastSolveIterations, plannedSamples.Count);
+					result.timedOut = true;
+					result.summary = "Timed out while waiting for the end effector to settle at the target position.";
 				}
 
 				_lastSolveError = result.finalPositionError;

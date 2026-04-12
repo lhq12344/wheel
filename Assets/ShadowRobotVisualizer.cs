@@ -164,6 +164,7 @@ namespace RobotSimulation
 			RebuildIfNeeded(forceRebuild: false);
 			previewMode = PreviewMode.BasePreview;
 			_hasArmPreviewBaseReferencePose = false;
+			ClearPredictedBasePose();
 			ClearPredictedArmPose();
 			EnsureSimulatedBasePose(Time.realtimeSinceStartup);
 		}
@@ -239,20 +240,6 @@ namespace RobotSimulation
 				}
 
 				float visualizationLeadSeconds = GetVisualizationLeadSeconds(command.predictedLeadSeconds);
-				bool hasCommandPredictedPose = command.predictedBaseWorldRotation != default;
-				if (hasCommandPredictedPose)
-				{
-					// Base execution is driven by a live tracking point that is recomputed every frame.
-					// Reuse the planner / safety-gate prediction directly so the shadow preview does not
-					// drift away using a second, independent velocity integrator.
-					SetSimulatedBasePose(command.predictedBaseWorldPosition, command.predictedBaseWorldRotation);
-					PushPredictedBasePose(
-						command.predictedBaseWorldPosition,
-						command.predictedBaseWorldRotation,
-						visualizationLeadSeconds);
-					return;
-				}
-
 				SetSimulatedBaseCommand(
 					command.baseLinearVelocity,
 					command.baseAngularVelocity,
@@ -267,6 +254,7 @@ namespace RobotSimulation
 					return;
 				}
 
+				bool hasCommandPredictedPose = command.predictedBaseWorldRotation != default;
 				bool hasPredictedPose = command.predictedBaseWorldRotation != default;
 				PushPredictedBasePose(
 					hasPredictedPose ? command.predictedBaseWorldPosition : command.baseCommand.toWorldPosition,
@@ -279,6 +267,61 @@ namespace RobotSimulation
 			{
 				SetPredictedArmAngles(command.armCommand.toAnglesDeg, GetVisualizationLeadSeconds(command.predictedLeadSeconds));
 			}
+		}
+
+		public void ApplyManualBasePreviewStep(
+			SafetyGateTimelineCommand command,
+			Vector3 predictedBaseWorldPosition,
+			Quaternion predictedBaseWorldRotation)
+		{
+			if (_activeInstance != null && _activeInstance != this)
+			{
+				_activeInstance.ApplyManualBasePreviewStep(command, predictedBaseWorldPosition, predictedBaseWorldRotation);
+				return;
+			}
+
+			if (previewMode != PreviewMode.BasePreview)
+			{
+				return;
+			}
+
+			float holdSeconds = GetVisualizationLeadSeconds(command.predictedLeadSeconds);
+			SetSimulatedBaseCommand(command.baseLinearVelocity, command.baseAngularVelocity, holdSeconds);
+			SetSimulatedBasePose(predictedBaseWorldPosition, predictedBaseWorldRotation);
+			PushPredictedBasePose(predictedBaseWorldPosition, predictedBaseWorldRotation, holdSeconds);
+		}
+
+		public void ApplyManualArmPreviewSample(RobotPlanJointSample sample, float holdSeconds = -1f)
+		{
+			if (_activeInstance != null && _activeInstance != this)
+			{
+				_activeInstance.ApplyManualArmPreviewSample(sample, holdSeconds);
+				return;
+			}
+
+			if (sample == null)
+			{
+				return;
+			}
+
+			ApplyManualArmPreviewAngles(sample.jointAnglesDeg, holdSeconds);
+		}
+
+		public void ApplyManualArmPreviewAngles(float[] armAnglesDeg, float holdSeconds = -1f)
+		{
+			if (_activeInstance != null && _activeInstance != this)
+			{
+				_activeInstance.ApplyManualArmPreviewAngles(armAnglesDeg, holdSeconds);
+				return;
+			}
+
+			if (previewMode != PreviewMode.ArmPreview)
+			{
+				return;
+			}
+
+			float resolvedHoldSeconds = holdSeconds > 0f ? holdSeconds : fallbackLeadSeconds;
+			SetPredictedArmAngles(armAnglesDeg, Mathf.Max(0.05f, resolvedHoldSeconds));
 		}
 
 		public void RebuildIfNeeded(bool forceRebuild = false)

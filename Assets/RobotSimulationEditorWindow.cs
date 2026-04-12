@@ -353,7 +353,14 @@ namespace RobotSimulation.Editor
 							{
 								if (_manager != null)
 								{
-									bool success = _manager.MoveArmToPosition(_armTargetPosition);
+									bool success = _manager.StartArmWorldMovePreviewThenExecute(new ArmMoveRequest
+									{
+										worldPosition = _armTargetPosition,
+										positionToleranceMeters = Mathf.Max(0.001f, _armPositionTolerance),
+										stableFixedFrames = Mathf.Max(1, _armStableFrames),
+										timeoutSeconds = Mathf.Max(1f, _armTimeoutSeconds),
+										speedScale = _armMoveSpeedScale
+									}, holdToRun: false);
 									if (!success)
 									{
 										_armMoveSummary = _manager.LastArmCollisionGuardResult != null && _manager.LastArmCollisionGuardResult.blockedByForbiddenCollision
@@ -365,7 +372,7 @@ namespace RobotSimulation.Editor
 									}
 									else
 									{
-										_armMoveSummary = T("移动命令已接受。", "Move command accepted.");
+										_armMoveSummary = T("影子预演已开始，随后会自动下发到真机。", "Shadow preview started and will auto-execute on the live robot.");
 									}
 								}
 							}
@@ -760,20 +767,27 @@ namespace RobotSimulation.Editor
 			}
 
 			_moveAndWaitHoldActive = true;
-			_armMoveSummary = "Holding Move And Wait... release to stop.";
-			_manager.MoveArmToWorldPositionAndWait(new ArmMoveRequest
+			_armMoveSummary = "Previewing Move And Wait... keep holding to let it execute.";
+			bool started = _manager.StartArmWorldMovePreviewThenExecute(new ArmMoveRequest
 			{
 				worldPosition = _armTargetPosition,
 				positionToleranceMeters = Mathf.Max(0.001f, _armPositionTolerance),
 				stableFixedFrames = Mathf.Max(1, _armStableFrames),
-				timeoutSeconds = 3600f,
+				timeoutSeconds = Mathf.Max(1f, _armTimeoutSeconds),
 				speedScale = _armMoveSpeedScale
-			}, result =>
+			}, holdToRun: true, onComplete: result =>
 			{
 				_moveAndWaitHoldActive = false;
 				_armMoveSummary = $"{(result.success ? "Success" : result.blockedByCollisionGuard ? "Guard Blocked" : result.collided ? "Collision" : result.timedOut ? "Timeout" : result.unreachable ? "Unreachable" : "Failed")} | err={result.finalPositionError:F4} | final=({result.finalWorldPosition.x:F3}, {result.finalWorldPosition.y:F3}, {result.finalWorldPosition.z:F3})";
 				Repaint();
 			});
+			if (!started)
+			{
+				_moveAndWaitHoldActive = false;
+				_armMoveSummary = _manager.LastArmMoveResult != null && !string.IsNullOrEmpty(_manager.LastArmMoveResult.summary)
+					? _manager.LastArmMoveResult.summary
+					: "Move And Wait preview failed to start.";
+			}
 		}
 
 		private void StopHeldMoveAndWait(bool updateSummary)
@@ -786,13 +800,26 @@ namespace RobotSimulation.Editor
 			_moveAndWaitHoldActive = false;
 			if (_manager != null)
 			{
-				_manager.StopArmMove(true);
-			}
-
-			if (updateSummary)
-			{
-				_armMoveSummary = "Move stopped by button release.";
-				Repaint();
+				bool handledByPendingPreviewCancel = false;
+				if (_manager.CurrentManualPreviewKind == ManualPreviewSessionKind.ArmWorldMove
+					&& _manager.CurrentManualPreviewState == ManualPreviewSessionState.PreviewPending)
+				{
+					_manager.CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: false, reason: "Arm preview cancelled before live execution.");
+					handledByPendingPreviewCancel = true;
+					if (updateSummary)
+					{
+						_armMoveSummary = "Move And Wait preview cancelled before live execution.";
+					}
+				}
+				else
+				{
+					_manager.StopArmMove(true);
+				}
+				if (updateSummary && !handledByPendingPreviewCancel)
+				{
+					_armMoveSummary = "Move stopped by button release.";
+					Repaint();
+				}
 			}
 		}
 
