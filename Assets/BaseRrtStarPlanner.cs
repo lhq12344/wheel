@@ -380,7 +380,9 @@ namespace RobotSimulation
 			bool alignFinalYaw,
 			System.Func<bool> shouldCancel,
 			System.Action<bool, string> onComplete,
-			BaseCommandInterceptor commandInterceptor = null)
+			BaseCommandInterceptor commandInterceptor = null,
+			System.Action<Vector3> onControllerGoalHandoff = null,
+			System.Action onControllerGoalStep = null)
 		{
 			if (controller == null || controller.rb == null)
 			{
@@ -407,6 +409,20 @@ namespace RobotSimulation
 			float stallElapsed = 0f;
 			float bestRemaining = path.totalLength;
 			Vector3 finalGoal = path.points[path.points.Count - 1];
+			float controllerArrivalDistance = Mathf.Max(controller.posTolerance, controller.arrivalSnapDistance);
+			bool handedOffToControllerGoal = false;
+
+			void BeginControllerGoalHandoff()
+			{
+				if (handedOffToControllerGoal)
+				{
+					return;
+				}
+
+				controller.SetTargetPointGoal(finalGoal);
+				onControllerGoalHandoff?.Invoke(finalGoal);
+				handedOffToControllerGoal = true;
+			}
 
 			while (elapsed < timeout)
 			{
@@ -421,6 +437,24 @@ namespace RobotSimulation
 				float progress = FindProgressAlongPath(current, path, out _, out _);
 				float remaining = ComputeRemainingDistance(path, progress);
 				float planarGoalError = Vector3.Distance(ProjectXZ(current), ProjectXZ(finalGoal));
+
+				if (handedOffToControllerGoal)
+				{
+					onControllerGoalStep?.Invoke();
+					bool controllerSettled = !controller.hasTargetPoint
+						&& controller.CurrentPlanarSpeedMeasured <= HandoffSpeedTolerance
+						&& controller.CurrentYawRateMeasured <= HandoffYawRateTolerance;
+					if (controllerSettled)
+					{
+						onComplete?.Invoke(true, "Base controller settled at the terminal goal.");
+						yield break;
+					}
+
+					elapsed += Time.fixedDeltaTime;
+					yield return new WaitForFixedUpdate();
+					continue;
+				}
+
 				bool insideNearGoalStallGrace = remaining <= DockingDistance && planarGoalError <= NearGoalStallGraceTolerance;
 				if (remaining < bestRemaining - 0.01f)
 				{
@@ -439,26 +473,32 @@ namespace RobotSimulation
 				if (planarGoalError <= HandoffTolerance
 					&& remaining <= DockingDistance)
 				{
-					controller.CompletePointGoal(finalGoal);
-					onComplete?.Invoke(true, "Base path tracking completed with a terminal stop.");
-					yield break;
+					BeginControllerGoalHandoff();
+					onControllerGoalStep?.Invoke();
+					elapsed += Time.fixedDeltaTime;
+					yield return new WaitForFixedUpdate();
+					continue;
 				}
 
-			if (planarGoalError <= NearGoalTimeoutAcceptanceTolerance
-				&& remaining <= DockingDistance
-				&& controller.CurrentPlanarSpeedMeasured <= RelaxedSpeedTolerance
-				&& controller.CurrentYawRateMeasured <= RelaxedYawRateTolerance)
-			{
-				controller.CompletePointGoal(finalGoal);
-					onComplete?.Invoke(true, "Base path tracking accepted near-goal settling and stopped.");
-					yield break;
+				if (planarGoalError <= NearGoalTimeoutAcceptanceTolerance
+					&& remaining <= DockingDistance
+					&& controller.CurrentPlanarSpeedMeasured <= RelaxedSpeedTolerance
+					&& controller.CurrentYawRateMeasured <= RelaxedYawRateTolerance)
+				{
+					BeginControllerGoalHandoff();
+					onControllerGoalStep?.Invoke();
+					elapsed += Time.fixedDeltaTime;
+					yield return new WaitForFixedUpdate();
+					continue;
 				}
 
 				if (planarGoalError <= PositionTolerance)
 				{
-					controller.CompletePointGoal(finalGoal);
-					onComplete?.Invoke(true, "Base path tracking reached the terminal docking zone and stopped.");
-					yield break;
+					BeginControllerGoalHandoff();
+					onControllerGoalStep?.Invoke();
+					elapsed += Time.fixedDeltaTime;
+					yield return new WaitForFixedUpdate();
+					continue;
 				}
 				else if (stallElapsed > StallTimeoutSeconds)
 				{
@@ -499,12 +539,12 @@ namespace RobotSimulation
 
 			controller.ClearVelocityCommand(true);
 			float finalError = Vector3.Distance(ProjectXZ(controller.rb.position), ProjectXZ(finalGoal));
-			if (finalError <= NearGoalTimeoutAcceptanceTolerance
+			if (!controller.hasTargetPoint
+				&& finalError <= Mathf.Max(controllerArrivalDistance, NearGoalTimeoutAcceptanceTolerance)
 				&& controller.CurrentPlanarSpeedMeasured <= RelaxedSpeedTolerance
 				&& controller.CurrentYawRateMeasured <= RelaxedYawRateTolerance)
 			{
-				controller.CompletePointGoal(finalGoal);
-				onComplete?.Invoke(true, $"Base path tracking accepted near-goal completion on timeout. Remaining planar distance={finalError:F3}m.");
+				onComplete?.Invoke(true, $"Base path tracking accepted controller-owned near-goal completion on timeout. Remaining planar distance={finalError:F3}m.");
 				yield break;
 			}
 

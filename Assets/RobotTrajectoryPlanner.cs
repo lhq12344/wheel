@@ -43,8 +43,8 @@ namespace RobotSimulation
 		private const float BaseLinearSpeedToleranceMetersPerSecond = 0.03f;
 		private const float BaseAngularSpeedToleranceRadPerSecond = 0.05f;
 		private const int BaseStableFixedFramesRequired = 3;
-		private const float ArmWorldTargetToleranceMeters = 0.03f;
-		private const float ArmPlanningFallbackToleranceMeters = 0.04f;
+		private const float ArmWorldTargetToleranceMeters = 0.10f;
+		private const float ArmPlanningFallbackToleranceMeters = 0.10f;
 		private const float ArmPlanningFallbackToleranceSlackMeters = 0.012f;
 		private const float ArmPlanningDockingRetryResidualThresholdMeters = 0.08f;
 		private const float ArmExecutionDurationPaddingSeconds = 4f;
@@ -319,7 +319,8 @@ namespace RobotSimulation
 				armIgnoreRoot = manager.arm6DOFFKController.BaseFrameTransform;
 			}
 
-			List<Collider> obstacles = _physicsQueries.CollectObstacleColliders(baseIgnoreRoot, armIgnoreRoot);
+			Transform shadowBaseIgnoreRoot = manager.GetShadowBaseTwinRoot();
+			List<Collider> obstacles = _physicsQueries.CollectObstacleColliders(baseIgnoreRoot, armIgnoreRoot, shadowBaseIgnoreRoot);
 			RemoveRobotOwnedObstacles(obstacles, baseIgnoreRoot, armIgnoreRoot);
 			float baseRadius = _physicsQueries.EstimateBaseRadius(manager.diffDriveController);
 			Vector3 currentBasePosition = manager.diffDriveController.rb.position;
@@ -525,7 +526,7 @@ namespace RobotSimulation
 					yield break;
 				}
 
-				manager.diffDriveController.CompletePointGoal(armStageState.ResolvedBaseGoal);
+				manager.CompleteShadowBaseSession(resetShadowToLivePose: false);
 				manager.SyncArmToCurrentBasePoseImmediate();
 				manager.arm6DOFFKController?.RefreshRuntimeState();
 				yield return new WaitForFixedUpdate();
@@ -1004,7 +1005,7 @@ namespace RobotSimulation
 					yield break;
 				}
 
-				manager.diffDriveController.CompletePointGoal(state.ResolvedBaseGoal);
+				manager.CompleteShadowBaseSession(resetShadowToLivePose: false);
 				manager.SyncArmToCurrentBasePoseImmediate();
 				manager.arm6DOFFKController?.RefreshRuntimeState();
 				yield return new WaitForFixedUpdate();
@@ -1098,6 +1099,20 @@ namespace RobotSimulation
 			}
 
 			EnterShadowBasePreview();
+			if (!manager.BeginShadowBasePlannerSession("CoordinatedBaseExecution", obstacles, baseRadius, out string shadowSessionError))
+			{
+				result.failedAtStage = RobotPlanningStage.BaseExecution;
+				result.failureReason = shadowSessionError;
+				yield break;
+			}
+
+			DiffDriveTwinController shadowController = manager.ShadowBaseTwin != null ? manager.ShadowBaseTwin.ShadowController : null;
+			if (shadowController == null || shadowController.rb == null)
+			{
+				result.failedAtStage = RobotPlanningStage.BaseExecution;
+				result.failureReason = L("影子底盘执行副本缺失。", "Shadow base execution twin is missing.");
+				yield break;
+			}
 
 			int replanCount = result.replanCount;
 			List<Vector3> currentWaypoints = result.baseWaypoints != null ? new List<Vector3>(result.baseWaypoints) : new List<Vector3>();
@@ -1123,6 +1138,24 @@ namespace RobotSimulation
 			bool gateBlockPending = false;
 			int gateBlockDecelFramesRemaining = 0;
 			string gateBlockReason = string.Empty;
+			bool TryQueueLiveReplicaVelocity(float linearVelocity, float angularVelocity, Vector3 trackingPoint, out string queueError)
+			{
+				return manager.TryQueueLiveShadowBaseVelocityReplica(linearVelocity, angularVelocity, trackingPoint, out queueError);
+			}
+
+			void BeginBaseShadowControllerGoalHandoff(Vector3 finalGoal)
+			{
+				if (!manager.TryQueueLiveShadowBaseTargetPointReplica(finalGoal, out string queueError))
+				{
+					manager.FailShadowBaseSession(queueError);
+					gateBlockPending = true;
+					gateBlockReason = queueError;
+				}
+			}
+
+			void StepBaseShadowControllerGoalHandoff()
+			{
+			}
 			while (true)
 			{
 				if (_stopRequested)
@@ -1139,8 +1172,15 @@ namespace RobotSimulation
 					yield break;
 				}
 
-				Vector3 currentPosition = manager.diffDriveController.rb.position;
-				if (!ValidateBasePathSegments(currentWaypoints, baseRadius, obstacles, out ShadowValidationResult segmentValidation))
+				if (manager.TryGetShadowBaseSessionFault(out string shadowFault))
+				{
+					result.failedAtStage = RobotPlanningStage.BaseExecution;
+					result.failureReason = shadowFault;
+					yield break;
+				}
+
+				Vector3 currentPosition = shadowController.rb.position;
+				if (!ValidateBasePathSegments(currentPosition, currentWaypoints, baseRadius, obstacles, out ShadowValidationResult segmentValidation))
 				{
 					lastShadowValidationResult = segmentValidation;
 					if (request.allowReplan && replanCount < maxLocalReplans)
@@ -1149,7 +1189,7 @@ namespace RobotSimulation
 						result.replanCount = replanCount;
 						currentStage = RobotPlanningStage.LocalReplan;
 						_distanceFieldSampler.Build(currentPosition, finalBaseGoal, obstacles, distanceFieldResolution, basePlanningMargin);
-						if (_localReplanner.TryReplanBase(_basePlanner, currentPosition, manager.diffDriveController.rb.rotation.eulerAngles.y, finalBaseGoal, finalBaseYaw, baseRadius, _distanceFieldSampler, _physicsQueries, obstacles, out List<Vector3> replannedWaypoints, out string replanFailure))
+						if (_localReplanner.TryReplanBase(_basePlanner, currentPosition, shadowController.rb.rotation.eulerAngles.y, finalBaseGoal, finalBaseYaw, baseRadius, _distanceFieldSampler, _physicsQueries, obstacles, out List<Vector3> replannedWaypoints, out string replanFailure))
 						{
 							currentWaypoints = replannedWaypoints;
 							result.baseWaypoints = replannedWaypoints;
@@ -1181,9 +1221,14 @@ namespace RobotSimulation
 					adjustedLinearVelocity = linearVelocity;
 					adjustedAngularVelocity = angularVelocity;
 					blockReason = string.Empty;
+					if (manager.TryGetShadowBaseSessionFault(out blockReason))
+					{
+						return false;
+					}
+
 					if (!gateContext.enabled)
 					{
-						return true;
+						return TryQueueLiveReplicaVelocity(adjustedLinearVelocity, adjustedAngularVelocity, trackingPoint, out blockReason);
 					}
 
 					if (gateBlockPending)
@@ -1193,10 +1238,10 @@ namespace RobotSimulation
 							gateBlockDecelFramesRemaining--;
 							adjustedLinearVelocity = linearVelocity * 0.2f;
 							adjustedAngularVelocity = angularVelocity * 0.2f;
-							return true;
+							return TryQueueLiveReplicaVelocity(adjustedLinearVelocity, adjustedAngularVelocity, trackingPoint, out blockReason);
 						}
 
-						manager.diffDriveController.HardStopAtGoal();
+						manager.AbortShadowBaseSession(resetShadowToLivePose: false);
 						blockReason = gateBlockReason;
 						return false;
 					}
@@ -1214,19 +1259,19 @@ namespace RobotSimulation
 
 						adjustedLinearVelocity = 0f;
 						adjustedAngularVelocity = 0f;
-						return true;
+						return TryQueueLiveReplicaVelocity(adjustedLinearVelocity, adjustedAngularVelocity, trackingPoint, out blockReason);
 					}
 
 					_loggedDynamicBaseLock = false;
 					BaseGateCommand pendingCommand = new BaseGateCommand
 					{
-						fromWorldPosition = manager.diffDriveController.rb.position,
+						fromWorldPosition = shadowController.rb.position,
 						toWorldPosition = trackingPoint,
 						targetYawDeg = finalBaseYaw
 					};
 
 					RefreshSafetyGateLoadFactor(gateContext);
-					MirrorSnapshot mirror = _mirrorStateProvider.Capture(manager.diffDriveController, manager.arm6DOFFKController);
+					MirrorSnapshot mirror = _mirrorStateProvider.Capture(shadowController, manager.arm6DOFFKController);
 					SafetyGateDecision decision = _shadowGate.EvaluateBaseCommand(mirror, pendingCommand, gateContext);
 					ApplySafetyGateDecisionTelemetry(result, RobotPlanningStage.BaseExecution, decision);
 					LogSafetyGateDecision(RobotPlanningStage.BaseExecution, decision);
@@ -1241,7 +1286,7 @@ namespace RobotSimulation
 						gateBlockReason = BuildSafetyGateFailureReason(RobotPlanningStage.BaseExecution, decision);
 						adjustedLinearVelocity = linearVelocity * 0.2f;
 						adjustedAngularVelocity = angularVelocity * 0.2f;
-						return true;
+						return TryQueueLiveReplicaVelocity(adjustedLinearVelocity, adjustedAngularVelocity, trackingPoint, out blockReason);
 					}
 
 					float commandThrottleRatio = decision.type == SafetyGateDecisionType.Throttle
@@ -1284,23 +1329,14 @@ namespace RobotSimulation
 							gateBlockReason = "SafetyGate timeline kind mismatch while executing base command.";
 							adjustedLinearVelocity = linearVelocity * 0.2f;
 							adjustedAngularVelocity = angularVelocity * 0.2f;
-							return true;
+							return TryQueueLiveReplicaVelocity(adjustedLinearVelocity, adjustedAngularVelocity, trackingPoint, out blockReason);
 						}
 
 						float executionRatio = Mathf.Clamp(executableCommand.throttleRatio, 0.2f, 1f);
 						adjustedLinearVelocity = linearVelocity * executionRatio;
 						adjustedAngularVelocity = angularVelocity * executionRatio;
-						SafetyGateTimelineCommand shadowPreviewCommand = new SafetyGateTimelineCommand
-						{
-							kind = SafetyGateTimelineCommandKind.Base,
-							baseCommand = pendingCommand,
-							baseLinearVelocity = adjustedLinearVelocity,
-							baseAngularVelocity = adjustedAngularVelocity,
-							predictedLeadSeconds = executableCommand.predictedLeadSeconds
-						};
-						manager.shadowRobotVisualizer?.ApplyShadowStep(shadowPreviewCommand);
 						LogTimelineQueueDequeuedIfNeeded(request, armQueue: false, executableCommand);
-						return true;
+						return TryQueueLiveReplicaVelocity(adjustedLinearVelocity, adjustedAngularVelocity, trackingPoint, out blockReason);
 					}
 
 					if (hasHeadCommand)
@@ -1310,22 +1346,24 @@ namespace RobotSimulation
 
 					adjustedLinearVelocity = 0f;
 					adjustedAngularVelocity = 0f;
-					return true;
+					return TryQueueLiveReplicaVelocity(adjustedLinearVelocity, adjustedAngularVelocity, trackingPoint, out blockReason);
 				}
 
 				yield return _basePathFollower.FollowWaypoints(
-					manager.diffDriveController,
+					shadowController,
 					currentWaypoints,
 					finalBaseYaw,
 					false,
-					() => _stopRequested || Time.realtimeSinceStartup > deadline,
+					() => _stopRequested || Time.realtimeSinceStartup > deadline || manager.TryGetShadowBaseSessionFault(out _),
 					(ok, text) =>
 					{
 						success = ok;
 						message = text;
 						done = true;
 					},
-					TryInterceptBaseCommand);
+					TryInterceptBaseCommand,
+					BeginBaseShadowControllerGoalHandoff,
+					StepBaseShadowControllerGoalHandoff);
 
 				while (!done)
 				{
@@ -1335,9 +1373,16 @@ namespace RobotSimulation
 				if (!success)
 				{
 					result.failedAtStage = RobotPlanningStage.BaseExecution;
-					result.failureReason = gateBlockPending && !string.IsNullOrEmpty(gateBlockReason)
-						? gateBlockReason
-						: message;
+					if (manager.TryGetShadowBaseSessionFault(out string shadowFaultAfterFollow))
+					{
+						result.failureReason = shadowFaultAfterFollow;
+					}
+					else
+					{
+						result.failureReason = gateBlockPending && !string.IsNullOrEmpty(gateBlockReason)
+							? gateBlockReason
+							: message;
+					}
 					yield break;
 				}
 
@@ -2630,11 +2675,11 @@ namespace RobotSimulation
 				yield break;
 			}
 
-			manager.diffDriveController.CompletePointGoal(state.ResolvedBaseGoal);
+			manager.CompleteShadowBaseSession(resetShadowToLivePose: false);
 			EnterShadowArmPreviewFromLiveBase();
 		}
 
-		private bool ValidateBasePathSegments(List<Vector3> waypoints, float baseRadius, List<Collider> obstacles, out ShadowValidationResult validation)
+		private bool ValidateBasePathSegments(Vector3 segmentStartWorldPosition, List<Vector3> waypoints, float baseRadius, List<Collider> obstacles, out ShadowValidationResult validation)
 		{
 			validation = new ShadowValidationResult();
 			if (manager == null || manager.diffDriveController == null || manager.diffDriveController.rb == null)
@@ -2644,7 +2689,7 @@ namespace RobotSimulation
 				return false;
 			}
 
-			Vector3 segmentStart = manager.diffDriveController.rb.position;
+			Vector3 segmentStart = segmentStartWorldPosition;
 			if (waypoints == null)
 			{
 				return true;
@@ -2673,10 +2718,16 @@ namespace RobotSimulation
 		private IEnumerator WaitForBaseSettled(RobotPlanResult result, Vector3 goalWorldPosition, float deadline)
 		{
 			int stableFrames = 0;
-			float effectiveNearGoalTolerance = BaseSettlingNearGoalAcceptanceMeters + BaseSettlingToleranceEpsilonMeters;
-			float effectiveStopTolerance = BaseStopAcceptanceMeters + BaseSettlingToleranceEpsilonMeters;
-			while (Time.realtimeSinceStartup <= deadline)
+			float effectiveDeadline = deadline + (manager != null ? manager.BaseShadowLeadSeconds : 0f);
+			while (Time.realtimeSinceStartup <= effectiveDeadline)
 			{
+				if (manager != null && manager.TryGetShadowBaseSessionFault(out string shadowFault))
+				{
+					result.failedAtStage = RobotPlanningStage.BaseSettling;
+					result.failureReason = shadowFault;
+					yield break;
+				}
+
 				if (_stopRequested)
 				{
 					result.failedAtStage = RobotPlanningStage.BaseSettling;
@@ -2692,18 +2743,30 @@ namespace RobotSimulation
 				}
 
 				DiffDriveTwinController controller = manager.diffDriveController;
-				float positionError = Vector3.Distance(ProjectXZ(controller.rb.position), ProjectXZ(goalWorldPosition));
-				if (positionError <= effectiveNearGoalTolerance)
+				bool liveReplicaQueueDrained = !manager.HasPendingShadowBaseLiveCommands();
+				if (!liveReplicaQueueDrained)
 				{
-					controller.CompletePointGoal(goalWorldPosition);
+					stableFrames = 0;
+					yield return new WaitForFixedUpdate();
+					continue;
 				}
 
+				float effectiveNearGoalTolerance = Mathf.Max(
+					Mathf.Max(controller.posTolerance, controller.arrivalSnapDistance),
+					BaseSettlingNearGoalAcceptanceMeters) + BaseSettlingToleranceEpsilonMeters;
+				float effectiveStopTolerance = Mathf.Min(
+					BaseStopAcceptanceMeters + BaseSettlingToleranceEpsilonMeters,
+					effectiveNearGoalTolerance);
+				float positionError = Vector3.Distance(ProjectXZ(controller.rb.position), ProjectXZ(goalWorldPosition));
 				float linearSpeed = controller.CurrentPlanarSpeedMeasured;
 				float angularSpeed = controller.CurrentYawRateMeasured;
-				bool strictSettled = positionError <= effectiveStopTolerance
+				bool controllerReleasedGoal = !controller.hasTargetPoint;
+				bool strictSettled = controllerReleasedGoal
+					&& positionError <= effectiveStopTolerance
 					&& linearSpeed <= BaseLinearSpeedToleranceMetersPerSecond
 					&& angularSpeed <= BaseAngularSpeedToleranceRadPerSecond;
-				bool nearGoalSettled = positionError <= effectiveNearGoalTolerance
+				bool nearGoalSettled = controllerReleasedGoal
+					&& positionError <= effectiveNearGoalTolerance
 					&& linearSpeed <= BaseLinearSpeedToleranceMetersPerSecond
 					&& angularSpeed <= BaseAngularSpeedToleranceRadPerSecond;
 				if (strictSettled || nearGoalSettled)
@@ -2725,14 +2788,21 @@ namespace RobotSimulation
 			result.failedAtStage = RobotPlanningStage.BaseSettling;
 			if (manager != null && manager.diffDriveController != null && manager.diffDriveController.rb != null)
 			{
-				float finalPositionError = Vector3.Distance(ProjectXZ(manager.diffDriveController.rb.position), ProjectXZ(goalWorldPosition));
-				float finalLinearSpeed = manager.diffDriveController.CurrentPlanarSpeedMeasured;
-				float finalAngularSpeed = manager.diffDriveController.CurrentYawRateMeasured;
-				if (finalPositionError <= effectiveNearGoalTolerance
+				DiffDriveTwinController controller = manager.diffDriveController;
+				float effectiveNearGoalTolerance = Mathf.Max(
+					Mathf.Max(controller.posTolerance, controller.arrivalSnapDistance),
+					BaseSettlingNearGoalAcceptanceMeters) + BaseSettlingToleranceEpsilonMeters;
+				float finalPositionError = Vector3.Distance(ProjectXZ(controller.rb.position), ProjectXZ(goalWorldPosition));
+				float finalLinearSpeed = controller.CurrentPlanarSpeedMeasured;
+				float finalAngularSpeed = controller.CurrentYawRateMeasured;
+				if (!controller.hasTargetPoint
+					&& !manager.HasPendingShadowBaseLiveCommands()
+					&& finalPositionError <= effectiveNearGoalTolerance
 					&& finalLinearSpeed <= BaseLinearSpeedToleranceMetersPerSecond
 					&& finalAngularSpeed <= BaseAngularSpeedToleranceRadPerSecond)
 				{
-					manager.diffDriveController.CompletePointGoal(goalWorldPosition);
+					result.failedAtStage = RobotPlanningStage.None;
+					result.failureReason = string.Empty;
 					yield break;
 				}
 
@@ -2832,6 +2902,7 @@ namespace RobotSimulation
 			Debug.LogWarning($"[RobotTrajectoryPlanner] Failed at {RobotSimulationLocalization.PlanningStage(stage)}: {reason}");
 			isPlanning = false;
 			_planningRoutine = null;
+			manager?.AbortShadowBaseSession(resetShadowToLivePose: true);
 			ReturnShadowToMirror();
 			onComplete?.Invoke(result);
 		}
@@ -3071,7 +3142,9 @@ namespace RobotSimulation
 				return ArmWorldTargetToleranceMeters;
 			}
 
-			return Mathf.Max(0.001f, request.eePositionToleranceMeters > 0f ? request.eePositionToleranceMeters : ArmWorldTargetToleranceMeters);
+			return Mathf.Max(
+				ArmWorldTargetToleranceMeters,
+				request.eePositionToleranceMeters > 0f ? request.eePositionToleranceMeters : ArmWorldTargetToleranceMeters);
 		}
 
 		private static float GetEffectiveEeTolerance(RobotPlanResult result, RobotPlanRequest request)

@@ -38,6 +38,7 @@ namespace RobotSimulation
 		[Header("Shadow Visualization")]
 		public ShadowRobotVisualizer shadowRobotVisualizer;
 		[SerializeField] private bool enableShadowRobotVisualization = true;
+		[SerializeField] private float baseShadowLeadSeconds = 0.35f;
 		[SerializeField] private float manualPreviewAutoExecuteDelaySeconds = 0.35f;
 		[SerializeField] private ManualPreviewSessionKind _manualPreviewKind = ManualPreviewSessionKind.None;
 		[SerializeField] private ManualPreviewSessionState _manualPreviewState = ManualPreviewSessionState.Idle;
@@ -108,8 +109,11 @@ namespace RobotSimulation
 		private bool _postBindCoordinatedDiagnosticsLogged;
 		private int _manualPreviewSessionVersion;
 		private ManualPreviewSession _manualPreviewSession;
+		private ShadowBaseTwinRuntime _shadowBaseTwinRuntime;
 
 		private bool UsesExplicitBootstrapContract => bootstrapMode == BootstrapMode.ExplicitContract;
+		internal ShadowBaseTwinRuntime ShadowBaseTwin => _shadowBaseTwinRuntime;
+		internal float BaseShadowLeadSeconds => Mathf.Max(0.05f, baseShadowLeadSeconds);
 
 		private sealed class ManualPreviewSession
 		{
@@ -200,6 +204,8 @@ namespace RobotSimulation
 		{
 			if (!enableSimulation || !_isInitialized) return;
 
+			_shadowBaseTwinRuntime?.Tick();
+
 			if (armCollisionMonitor != null)
 			{
 				bool collided = armCollisionMonitor.GetObservedCollisionState();
@@ -238,6 +244,23 @@ namespace RobotSimulation
 			}
 
 			TickManualPreviewSession();
+			HandleShadowBaseTwinFaultIfNeeded();
+		}
+
+		private void HandleShadowBaseTwinFaultIfNeeded()
+		{
+			if (!TryGetShadowBaseSessionFault(out string faultMessage))
+			{
+				return;
+			}
+
+			if (_manualPreviewSession != null
+				&& (_manualPreviewSession.kind == ManualPreviewSessionKind.BasePoint
+					|| _manualPreviewSession.kind == ManualPreviewSessionKind.BaseYaw))
+			{
+				Debug.LogError($"[RobotSimulation] {faultMessage}");
+				CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: false, reason: faultMessage);
+			}
 		}
 
 		/// <summary>
@@ -342,10 +365,158 @@ namespace RobotSimulation
 			onlineCalibration.Configure(residualTracker);
 			shadowRobotVisualizer.Configure(this);
 			shadowRobotVisualizer.SetVisualizationEnabled(enableShadowRobotVisualization);
+			bool shadowBaseTwinReady = EnsureShadowBaseTwinRuntime();
 			return trajectoryPlanner != null
 				&& residualTracker != null
 				&& onlineCalibration != null
-				&& shadowRobotVisualizer != null;
+				&& shadowRobotVisualizer != null
+				&& shadowBaseTwinReady;
+		}
+
+		internal bool EnsureShadowBaseTwinRuntime()
+		{
+			if (diffDriveController == null || diffDriveController.rb == null)
+			{
+				return false;
+			}
+
+			if (_shadowBaseTwinRuntime == null)
+			{
+				_shadowBaseTwinRuntime = new ShadowBaseTwinRuntime();
+			}
+
+			return _shadowBaseTwinRuntime.Configure(this, diffDriveController, BaseShadowLeadSeconds);
+		}
+
+		internal Transform GetArmIgnoreRootTransform()
+		{
+			if (armBinder != null && armBinder.armRoot != null)
+			{
+				return armBinder.armRoot.transform;
+			}
+
+			return arm6DOFFKController != null ? arm6DOFFKController.BaseFrameTransform : null;
+		}
+
+		internal bool TryGetShadowBaseTwinPose(out Vector3 worldPosition, out Quaternion worldRotation)
+		{
+			if (_shadowBaseTwinRuntime != null && _shadowBaseTwinRuntime.TryGetShadowPose(out worldPosition, out worldRotation))
+			{
+				return true;
+			}
+
+			worldPosition = default;
+			worldRotation = Quaternion.identity;
+			return false;
+		}
+
+		internal Transform GetShadowBaseTwinRoot()
+		{
+			return _shadowBaseTwinRuntime != null ? _shadowBaseTwinRuntime.ShadowRoot : null;
+		}
+
+		internal bool BeginShadowBasePlannerSession(string label, IReadOnlyList<Collider> obstacles, float baseRadius, out string error)
+		{
+			error = string.Empty;
+			if (!EnsureShadowBaseTwinRuntime() || _shadowBaseTwinRuntime == null)
+			{
+				error = "Shadow base twin runtime is unavailable.";
+				return false;
+			}
+
+			return _shadowBaseTwinRuntime.BeginPlannerSession(label, obstacles, baseRadius, out error);
+		}
+
+		internal void CompleteShadowBaseSession(bool resetShadowToLivePose = true)
+		{
+			_shadowBaseTwinRuntime?.CompleteSession(resetShadowToLivePose);
+		}
+
+		internal void AbortShadowBaseSession(bool resetShadowToLivePose = true)
+		{
+			_shadowBaseTwinRuntime?.StopAndReset(resetShadowToLivePose);
+		}
+
+		internal void FailShadowBaseSession(string reason)
+		{
+			_shadowBaseTwinRuntime?.FailSession(reason);
+		}
+
+		internal bool TryStartManualShadowBasePointLeadRun(Vector3 point, out string error)
+		{
+			error = string.Empty;
+			if (!EnsureShadowBaseTwinRuntime() || _shadowBaseTwinRuntime == null)
+			{
+				error = "Shadow base twin runtime is unavailable.";
+				return false;
+			}
+
+			return _shadowBaseTwinRuntime.StartManualPointLeadRun(point, GetArmIgnoreRootTransform(), out error);
+		}
+
+		internal bool TryStartManualShadowBaseYawLeadRun(float yawDeg, out string error)
+		{
+			error = string.Empty;
+			if (!EnsureShadowBaseTwinRuntime() || _shadowBaseTwinRuntime == null)
+			{
+				error = "Shadow base twin runtime is unavailable.";
+				return false;
+			}
+
+			return _shadowBaseTwinRuntime.StartManualYawLeadRun(yawDeg, GetArmIgnoreRootTransform(), out error);
+		}
+
+		internal bool TryQueueLiveShadowBaseVelocityReplica(float linearVelocity, float angularVelocity, Vector3 trackingPoint, out string error)
+		{
+			error = string.Empty;
+			if (_shadowBaseTwinRuntime == null)
+			{
+				error = "Shadow base twin runtime is unavailable.";
+				return false;
+			}
+
+			return _shadowBaseTwinRuntime.QueueLiveReplicaVelocity(linearVelocity, angularVelocity, trackingPoint, out error);
+		}
+
+		internal bool TryQueueLiveShadowBaseTargetPointReplica(Vector3 point, out string error)
+		{
+			error = string.Empty;
+			if (_shadowBaseTwinRuntime == null)
+			{
+				error = "Shadow base twin runtime is unavailable.";
+				return false;
+			}
+
+			return _shadowBaseTwinRuntime.QueueLiveReplicaTargetPoint(point, out error);
+		}
+
+		internal bool TryQueueLiveShadowBaseTargetYawReplica(float yawDeg, out string error)
+		{
+			error = string.Empty;
+			if (_shadowBaseTwinRuntime == null)
+			{
+				error = "Shadow base twin runtime is unavailable.";
+				return false;
+			}
+
+			return _shadowBaseTwinRuntime.QueueLiveReplicaTargetYaw(yawDeg, out error);
+		}
+
+		internal bool TryGetShadowBaseSessionFault(out string faultMessage)
+		{
+			if (_shadowBaseTwinRuntime != null && _shadowBaseTwinRuntime.HasFault)
+			{
+				faultMessage = _shadowBaseTwinRuntime.FaultMessage;
+				return true;
+			}
+
+			faultMessage = string.Empty;
+			return false;
+		}
+
+		internal bool HasPendingShadowBaseLiveCommands()
+		{
+			return _shadowBaseTwinRuntime != null && _shadowBaseTwinRuntime.HasPendingLiveCommands;
 		}
 
 		private bool EnsureArmCoordinateControllers()
@@ -880,6 +1051,12 @@ namespace RobotSimulation
 			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual base preview replaced by a new base point command.");
 
 			point.y = diffDriveController.rb.position.y;
+			if (!TryStartManualShadowBasePointLeadRun(point, out string shadowStartError))
+			{
+				Debug.LogError($"[RobotSimulation] {shadowStartError}");
+				return false;
+			}
+
 			int version = ++_manualPreviewSessionVersion;
 			_manualPreviewSession = new ManualPreviewSession
 			{
@@ -887,13 +1064,13 @@ namespace RobotSimulation
 				kind = ManualPreviewSessionKind.BasePoint,
 				state = ManualPreviewSessionState.PreviewPending,
 				previewStartRealtime = Time.realtimeSinceStartup,
-				executeAtRealtime = Time.realtimeSinceStartup + Mathf.Max(0.05f, manualPreviewAutoExecuteDelaySeconds),
+				executeAtRealtime = Time.realtimeSinceStartup + BaseShadowLeadSeconds,
 				baseTargetPointWorld = point,
 				basePreviewState = diffDriveController.CreateDrivePreviewStateForTargetPoint(point)
 			};
 			_manualPreviewKind = _manualPreviewSession.kind;
 			_manualPreviewState = _manualPreviewSession.state;
-			_manualPreviewSummary = $"Base target previewing toward ({point.x:F3}, {point.y:F3}, {point.z:F3}).";
+			_manualPreviewSummary = $"Shadow base started toward ({point.x:F3}, {point.y:F3}, {point.z:F3}); live base will follow after {BaseShadowLeadSeconds:F2}s.";
 			shadowRobotVisualizer?.EnterBasePreview();
 			return true;
 		}
@@ -913,6 +1090,11 @@ namespace RobotSimulation
 
 			EnsurePlanningSupportComponents();
 			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual base preview replaced by a new yaw command.");
+			if (!TryStartManualShadowBaseYawLeadRun(yawDeg, out string shadowStartError))
+			{
+				Debug.LogError($"[RobotSimulation] {shadowStartError}");
+				return false;
+			}
 
 			int version = ++_manualPreviewSessionVersion;
 			_manualPreviewSession = new ManualPreviewSession
@@ -921,13 +1103,13 @@ namespace RobotSimulation
 				kind = ManualPreviewSessionKind.BaseYaw,
 				state = ManualPreviewSessionState.PreviewPending,
 				previewStartRealtime = Time.realtimeSinceStartup,
-				executeAtRealtime = Time.realtimeSinceStartup + Mathf.Max(0.05f, manualPreviewAutoExecuteDelaySeconds),
+				executeAtRealtime = Time.realtimeSinceStartup + BaseShadowLeadSeconds,
 				baseTargetYawDeg = yawDeg,
 				basePreviewState = diffDriveController.CreateDrivePreviewStateForTargetYaw(yawDeg)
 			};
 			_manualPreviewKind = _manualPreviewSession.kind;
 			_manualPreviewState = _manualPreviewSession.state;
-			_manualPreviewSummary = $"Base yaw previewing toward {yawDeg:F1} deg.";
+			_manualPreviewSummary = $"Shadow base started yawing toward {yawDeg:F1} deg; live base will follow after {BaseShadowLeadSeconds:F2}s.";
 			shadowRobotVisualizer?.EnterBasePreview();
 			return true;
 		}
@@ -1146,44 +1328,31 @@ namespace RobotSimulation
 
 		private void TickManualBasePreviewSession(ManualPreviewSession session)
 		{
-			if (session == null || diffDriveController == null || diffDriveController.rb == null || shadowRobotVisualizer == null)
+			if (session == null
+				|| diffDriveController == null
+				|| diffDriveController.rb == null
+				|| shadowRobotVisualizer == null
+				|| _shadowBaseTwinRuntime == null
+				|| !_shadowBaseTwinRuntime.IsReady)
 			{
 				CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: false, reason: "Manual base preview cancelled because required references are missing.");
 				return;
 			}
 
-			if (!diffDriveController.TrySimulateDrivePredictionStep(ref session.basePreviewState, Time.fixedDeltaTime, out DiffDriveTwinController.DrivePredictionStep step))
+			if (TryGetShadowBaseSessionFault(out string faultMessage))
 			{
-				CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: false, reason: "Manual base preview cancelled because the predictor could not advance.");
+				CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: false, reason: faultMessage);
 				return;
 			}
-
-			SafetyGateTimelineCommand previewCommand = new SafetyGateTimelineCommand
-			{
-				kind = SafetyGateTimelineCommandKind.Base,
-				baseLinearVelocity = step.commandedLinearVelocity,
-				baseAngularVelocity = step.commandedAngularVelocity,
-				predictedLeadSeconds = manualPreviewAutoExecuteDelaySeconds
-			};
-			shadowRobotVisualizer.ApplyManualBasePreviewStep(previewCommand, step.predictedWorldPosition, step.predictedWorldRotation);
 
 			if (_manualPreviewState == ManualPreviewSessionState.PreviewPending
 				&& Time.realtimeSinceStartup + 1e-4f >= session.executeAtRealtime)
 			{
-				if (session.kind == ManualPreviewSessionKind.BasePoint)
-				{
-					diffDriveController.SetTargetPointGoal(session.baseTargetPointWorld);
-				}
-				else
-				{
-					diffDriveController.SetTargetYawGoal(session.baseTargetYawDeg);
-				}
-
 				session.state = ManualPreviewSessionState.Executing;
 				_manualPreviewState = session.state;
 				_manualPreviewSummary = session.kind == ManualPreviewSessionKind.BasePoint
-					? "Base target preview committed to the live robot."
-					: "Base yaw preview committed to the live robot.";
+					? "Live base started following the shadow base."
+					: "Live base started following the shadow yaw command.";
 			}
 
 			if (_manualPreviewState == ManualPreviewSessionState.Executing && IsBaseManualExecutionComplete(session))
@@ -1275,6 +1444,11 @@ namespace RobotSimulation
 				return true;
 			}
 
+			if (HasPendingShadowBaseLiveCommands())
+			{
+				return false;
+			}
+
 			if (session.kind == ManualPreviewSessionKind.BasePoint)
 			{
 				Vector3 livePosition = diffDriveController.rb.position;
@@ -1302,10 +1476,17 @@ namespace RobotSimulation
 
 			_manualPreviewSessionVersion++;
 			ManualPreviewSession previousSession = _manualPreviewSession;
+			bool previousBaseLeadRun = previousSession != null
+				&& (previousSession.kind == ManualPreviewSessionKind.BasePoint || previousSession.kind == ManualPreviewSessionKind.BaseYaw);
 			_manualPreviewSession = null;
 			_manualPreviewKind = ManualPreviewSessionKind.None;
 			_manualPreviewState = ManualPreviewSessionState.Cancelled;
 			_manualPreviewSummary = string.IsNullOrEmpty(reason) ? "Manual preview cancelled." : reason;
+
+			if (previousBaseLeadRun)
+			{
+				AbortShadowBaseSession(resetShadowToLivePose: true);
+			}
 
 			if (stopBaseMotion && diffDriveController != null)
 			{
@@ -1342,6 +1523,7 @@ namespace RobotSimulation
 
 		private void CompleteManualPreviewSession(string summary)
 		{
+			CompleteShadowBaseSession(resetShadowToLivePose: true);
 			_manualPreviewSession = null;
 			_manualPreviewKind = ManualPreviewSessionKind.None;
 			_manualPreviewState = ManualPreviewSessionState.Completed;
@@ -1722,6 +1904,7 @@ namespace RobotSimulation
 		public void ClearTarget()
 		{
 			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: true, reason: "Manual preview cancelled by clear-target request.");
+			AbortShadowBaseSession(resetShadowToLivePose: true);
 
 			if (diffDriveController != null)
 			{
@@ -1850,6 +2033,7 @@ namespace RobotSimulation
 		public void EmergencyStop()
 		{
 			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: false, reason: "Manual preview cancelled by emergency stop.");
+			AbortShadowBaseSession(resetShadowToLivePose: true);
 
 			if (diffDriveController != null)
 			{
@@ -1868,6 +2052,7 @@ namespace RobotSimulation
 		public void ResetRobot(Vector3 position, Quaternion rotation)
 		{
 			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual preview cancelled by robot reset.");
+			AbortShadowBaseSession(resetShadowToLivePose: true);
 
 			if (diffDriveController?.rb != null)
 			{

@@ -20,11 +20,11 @@ namespace RobotSimulation
 
 		[Header("Shadow Visual")]
 		[SerializeField] private bool visualizationEnabled = true;
-		[SerializeField] [Range(0.05f, 1f)] private float shadowAlpha = 0.35f;
+		[SerializeField][Range(0.05f, 1f)] private float shadowAlpha = 0.35f;
 		[SerializeField] private Color shadowTint = new Color(0.18f, 0.82f, 1f, 0.35f);
 		[SerializeField] private bool usePredictedBasePose = true;
-		[SerializeField] [Range(0.05f, 1f)] private float fallbackLeadSeconds = 0.20f;
-		[SerializeField] [Range(0.05f, 0.50f)] private float maxVisualizationLeadSeconds = 0.25f;
+		[SerializeField][Range(0.05f, 1f)] private float fallbackLeadSeconds = 0.20f;
+		[SerializeField][Range(0.05f, 0.50f)] private float maxVisualizationLeadSeconds = 0.25f;
 
 		[Header("Debug")]
 		[SerializeField] private int bindingCount;
@@ -50,10 +50,14 @@ namespace RobotSimulation
 		private Quaternion _predictedBaseRotation = Quaternion.identity;
 		private float _predictedBasePoseExpireRealtime;
 		private bool _hasPredictedBasePose;
+		private Vector3 _executionBasePosition;
+		private Quaternion _executionBaseRotation = Quaternion.identity;
+		private bool _hasExecutionBasePose;
 		private Vector3 _simulatedBasePosition;
 		private Quaternion _simulatedBaseRotation = Quaternion.identity;
 		private float _simulatedBaseLinearVelocity;
 		private float _simulatedBaseAngularVelocity;
+
 		private float _simulatedBaseCommandExpireRealtime;
 		private float _simulatedBaseLastUpdateRealtime;
 		private bool _hasSimulatedBasePose;
@@ -166,6 +170,18 @@ namespace RobotSimulation
 			_hasArmPreviewBaseReferencePose = false;
 			ClearPredictedBasePose();
 			ClearPredictedArmPose();
+			if (_manager != null && _manager.TryGetShadowBaseTwinPose(out Vector3 shadowBasePosition, out Quaternion shadowBaseRotation))
+			{
+				SetExecutionBasePose(shadowBasePosition, shadowBaseRotation);
+			}
+			else if (_cachedBaseRoot != null)
+			{
+				SetExecutionBasePose(_cachedBaseRoot.position, _cachedBaseRoot.rotation);
+			}
+			else
+			{
+				ClearExecutionBasePose();
+			}
 			EnsureSimulatedBasePose(Time.realtimeSinceStartup);
 		}
 
@@ -184,6 +200,7 @@ namespace RobotSimulation
 			_hasArmPreviewBaseReferencePose = true;
 			SetSimulatedBasePose(settledBaseWorldPos, settledBaseWorldRot);
 			ClearPredictedBasePose();
+			ClearExecutionBasePose();
 		}
 
 		public void ReturnToMirror()
@@ -198,6 +215,7 @@ namespace RobotSimulation
 			_hasArmPreviewBaseReferencePose = false;
 			ClearPredictedBasePose();
 			ClearPredictedArmPose();
+			ClearExecutionBasePose();
 			if (_baseReferenceTransform != null)
 			{
 				SetSimulatedBasePose(_baseReferenceTransform.position, _baseReferenceTransform.rotation);
@@ -222,6 +240,7 @@ namespace RobotSimulation
 			SetSimulatedBasePose(snapshot.baseWorldPosition, snapshot.baseWorldRotation);
 			ClearPredictedBasePose();
 			ClearPredictedArmPose();
+			ClearExecutionBasePose();
 		}
 
 		public void ApplyShadowStep(SafetyGateTimelineCommand command)
@@ -269,14 +288,11 @@ namespace RobotSimulation
 			}
 		}
 
-		public void ApplyManualBasePreviewStep(
-			SafetyGateTimelineCommand command,
-			Vector3 predictedBaseWorldPosition,
-			Quaternion predictedBaseWorldRotation)
+		public void ApplyBaseExecutionPreviewStep(DiffDriveTwinController.DrivePredictionStep step)
 		{
 			if (_activeInstance != null && _activeInstance != this)
 			{
-				_activeInstance.ApplyManualBasePreviewStep(command, predictedBaseWorldPosition, predictedBaseWorldRotation);
+				_activeInstance.ApplyBaseExecutionPreviewStep(step);
 				return;
 			}
 
@@ -285,10 +301,22 @@ namespace RobotSimulation
 				return;
 			}
 
-			float holdSeconds = GetVisualizationLeadSeconds(command.predictedLeadSeconds);
-			SetSimulatedBaseCommand(command.baseLinearVelocity, command.baseAngularVelocity, holdSeconds);
-			SetSimulatedBasePose(predictedBaseWorldPosition, predictedBaseWorldRotation);
-			PushPredictedBasePose(predictedBaseWorldPosition, predictedBaseWorldRotation, holdSeconds);
+			Vector3 worldPosition = DiffDriveTwinController.ResolveExecutionPreviewPosition(step);
+			Quaternion worldRotation = DiffDriveTwinController.ResolveExecutionPreviewRotation(step);
+			SetExecutionBasePose(worldPosition, worldRotation);
+			SetSimulatedBasePose(worldPosition, worldRotation);
+		}
+
+		public void ApplyManualBasePreviewStep(
+			DiffDriveTwinController.DrivePredictionStep step)
+		{
+			if (_activeInstance != null && _activeInstance != this)
+			{
+				_activeInstance.ApplyManualBasePreviewStep(step);
+				return;
+			}
+
+			ApplyBaseExecutionPreviewStep(step);
 		}
 
 		public void ApplyManualArmPreviewSample(RobotPlanJointSample sample, float holdSeconds = -1f)
@@ -1087,7 +1115,14 @@ namespace RobotSimulation
 			}
 
 			if (previewMode == PreviewMode.BasePreview
-				&& TryGetPredictedBasePose(out worldPosition, out worldRotation))
+				&& _manager != null
+				&& _manager.TryGetShadowBaseTwinPose(out worldPosition, out worldRotation))
+			{
+				return true;
+			}
+
+			if (previewMode == PreviewMode.BasePreview
+				&& TryGetExecutionBasePose(out worldPosition, out worldRotation))
 			{
 				return true;
 			}
@@ -1147,6 +1182,34 @@ namespace RobotSimulation
 			_hasPredictedBasePose = false;
 		}
 
+		private void SetExecutionBasePose(Vector3 worldPosition, Quaternion worldRotation)
+		{
+			_executionBasePosition = worldPosition;
+			_executionBaseRotation = worldRotation;
+			_hasExecutionBasePose = true;
+		}
+
+		private void ClearExecutionBasePose()
+		{
+			_hasExecutionBasePose = false;
+			_executionBasePosition = Vector3.zero;
+			_executionBaseRotation = Quaternion.identity;
+		}
+
+		private bool TryGetExecutionBasePose(out Vector3 worldPosition, out Quaternion worldRotation)
+		{
+			if (_hasExecutionBasePose)
+			{
+				worldPosition = _executionBasePosition;
+				worldRotation = _executionBaseRotation;
+				return true;
+			}
+
+			worldPosition = default;
+			worldRotation = Quaternion.identity;
+			return false;
+		}
+
 		private void ApplyPredictedArmPoseToShadow()
 		{
 			if (previewMode != PreviewMode.ArmPreview
@@ -1203,6 +1266,7 @@ namespace RobotSimulation
 			_bindings.Clear();
 			_sourceToShadowTransformMap.Clear();
 			_pendingSkinnedBindings.Clear();
+			ClearExecutionBasePose();
 			bindingCount = 0;
 			_isBuilt = false;
 

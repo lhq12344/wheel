@@ -48,7 +48,7 @@ namespace RobotSimulation
 		public float baseTargetYawDeg;
 		public Vector3 armTargetWorldPosition;
 		public bool autoResolveBaseDockingPose = true;
-		public float eePositionToleranceMeters = 0.03f;
+		public float eePositionToleranceMeters = 0.10f;
 		public bool requireBaseMove = true;
 		public bool requireArmMove = true;
 		public bool allowReplan = true;

@@ -844,7 +844,7 @@ namespace RobotSimulation.Editor
 			{
 				armTargetWorldPosition = _armTargetPosition,
 				autoResolveBaseDockingPose = true,
-				eePositionToleranceMeters = Mathf.Max(0.005f, _armPositionTolerance),
+				eePositionToleranceMeters = Mathf.Max(0.10f, _armPositionTolerance),
 				requireBaseMove = true,
 				requireArmMove = true,
 				allowReplan = _planAllowReplan,

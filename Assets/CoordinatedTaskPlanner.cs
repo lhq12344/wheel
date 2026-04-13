@@ -34,7 +34,7 @@ namespace RobotSimulation
 		private const float DefaultAnnularSamplingOuterRadiusMeters = 0f;
 		private const string AnnularSamplingLabel = "AnnularRandomSampling";
 		private const float BasePositionToleranceMeters = 0.02f;
-		private const float LoosePrecheckToleranceMeters = 0.05f;
+		private const float LoosePrecheckToleranceMeters = 0.10f;
 		private const float LoosePrecheckHardSingularityThreshold = 140f;
 		private const float LoosePrecheckSoftSingularityThreshold = 70f;
 		private const float DockingGeometryRadiusConsistencyToleranceMeters = 0.035f;
@@ -226,7 +226,7 @@ namespace RobotSimulation
 		public float residualDescentCoarseMaxStepMeters = 0.32f;
 		public float residualDescentFineMaxStepMeters = 0.08f;
 		public float residualDescentDynamicStepGain = 0.60f;
-		public float residualDescentAcceptResidualFloorMeters = 0.05f;
+		public float residualDescentAcceptResidualFloorMeters = 0.10f;
 		public int residualDescentMaxCoarseIterations = 8;
 		public int residualDescentMaxFineIterations = 16;
 		public bool enableNavMeshPoseFilter = true;
@@ -246,7 +246,7 @@ namespace RobotSimulation
 			_basePlanner.settings.goalThreshold = 0.55f;
 			_basePlanner.settings.rewireRadius = 1.2f;
 			_basePlanner.settings.goalBias = 0.25f;
-			_armMotionPlanner.settings.toleranceMeters = 0.02f;
+			_armMotionPlanner.settings.toleranceMeters = 0.10f;
 			_armMotionPlanner.settings.maxIterations = 180;
 		}
 
@@ -2841,7 +2841,9 @@ namespace RobotSimulation
 				return false;
 			}
 
-			float solveToleranceMeters = targetToleranceMeters > 0f ? Mathf.Max(0.001f, targetToleranceMeters) : _armMotionPlanner.settings.toleranceMeters;
+			float solveToleranceMeters = Mathf.Max(
+				targetToleranceMeters > 0f ? Mathf.Max(0.001f, targetToleranceMeters) : _armMotionPlanner.settings.toleranceMeters,
+				_armMotionPlanner.settings.toleranceMeters);
 
 			float[] startAngles = startAnglesOverrideDeg != null && startAnglesOverrideDeg.Length >= 6
 				? CloneAngles(startAnglesOverrideDeg)

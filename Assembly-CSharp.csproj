@@ -63,6 +63,7 @@
     <Compile Include="Assets\RobotTaskPlanningTypes.cs" />
     <Compile Include="Assets\CoordinatedTaskPlanner.cs" />
     <Compile Include="Assets\RobotSimulationBootstrapContract.cs" />
+    <Compile Include="Assets\ShadowBaseTwinRuntime.cs" />
     <Compile Include="Assets\Arm6DOFIKController.cs" />
     <Compile Include="Assets\RobotSimulationEditorWindow.cs" />
     <Compile Include="Assets\Arm6DOFKinematicsModel.cs" />

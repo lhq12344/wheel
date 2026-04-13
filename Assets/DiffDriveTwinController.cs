@@ -66,6 +66,9 @@ public class DiffDriveTwinController : MonoBehaviour
 	[Header("References")]
 	public Rigidbody rb;
 
+	[Header("Runtime Physics")]
+	public bool forceUseGravityOnStart = true;
+
 	[Header("Wheel Transforms (visual only)")]
 	public Transform wheelLF;
 	public Transform wheelLR;
@@ -220,8 +223,6 @@ public class DiffDriveTwinController : MonoBehaviour
 
 	private struct PoseCorrection
 	{
-		public bool applyPosition;
-		public Vector3 correctedWorldPosition;
 		public bool applyRotation;
 		public Quaternion correctedWorldRotation;
 	}
@@ -239,7 +240,7 @@ public class DiffDriveTwinController : MonoBehaviour
 		{
 			// This controller expects dynamic Rigidbody so gravity can work.
 			if (rb.isKinematic) rb.isKinematic = false;
-			if (!rb.useGravity) rb.useGravity = true;
+			if (forceUseGravityOnStart && !rb.useGravity) rb.useGravity = true;
 		}
 
 		if (autoDetectGeometryOnStart)
@@ -403,6 +404,39 @@ public class DiffDriveTwinController : MonoBehaviour
 		return state;
 	}
 
+	internal DrivePredictionState CreateVelocityOverridePreviewState(float linearVelocityTarget, float angularVelocityTarget, Vector3? trackingGoalPoint = null)
+	{
+		DrivePredictionState state = CaptureDrivePredictionState();
+		ApplyVelocityCommandToPreviewState(ref state, linearVelocityTarget, angularVelocityTarget, trackingGoalPoint);
+		return state;
+	}
+
+	internal void ApplyVelocityCommandToPreviewState(ref DrivePredictionState state, float linearVelocityTarget, float angularVelocityTarget, Vector3? trackingGoalPoint = null)
+	{
+		state.useVelocityCommandOverride = true;
+		state.overrideLinearVelocityTarget = Mathf.Clamp(linearVelocityTarget, -vMax, vMax);
+		state.overrideAngularVelocityTarget = Mathf.Clamp(angularVelocityTarget, -wMax, wMax);
+		state.goalReachedLatched = false;
+		state.finalYawAlignmentActive = false;
+		state.pointGoalPhase = PointGoalPhase.Idle;
+		state.mode = ControlMode.TargetPoint;
+		if (trackingGoalPoint.HasValue)
+		{
+			state.targetPointWorld = trackingGoalPoint.Value;
+			state.hasTargetPoint = true;
+		}
+	}
+
+	internal static Vector3 ResolveExecutionPreviewPosition(DrivePredictionStep step)
+	{
+		return step.applyPositionCorrection ? step.correctedWorldPosition : step.predictedWorldPosition;
+	}
+
+	internal static Quaternion ResolveExecutionPreviewRotation(DrivePredictionStep step)
+	{
+		return step.applyRotationCorrection ? step.correctedWorldRotation : step.predictedWorldRotation;
+	}
+
 	public bool TrySimulateDrivePredictionStep(ref DrivePredictionState state, float dt, out DrivePredictionStep step)
 	{
 		step = new DrivePredictionStep
@@ -441,7 +475,7 @@ public class DiffDriveTwinController : MonoBehaviour
 			step.rightAcceleration = (0f - previousRightVelocity) / Mathf.Max(1e-5f, dt);
 			step.predictedWorldPosition = state.worldPosition;
 			step.predictedWorldRotation = state.worldRotation;
-			step.applyPositionCorrection = correction.applyPosition;
+			step.applyPositionCorrection = false;
 			step.correctedWorldPosition = state.worldPosition;
 			step.applyRotationCorrection = correction.applyRotation;
 			step.correctedWorldRotation = state.worldRotation;
@@ -475,8 +509,8 @@ public class DiffDriveTwinController : MonoBehaviour
 		step.rightAcceleration = rightAcceleration;
 		step.predictedWorldPosition = state.worldPosition;
 		step.predictedWorldRotation = state.worldRotation;
-		step.applyPositionCorrection = correction.applyPosition;
-		step.correctedWorldPosition = correction.applyPosition ? correction.correctedWorldPosition : state.worldPosition;
+		step.applyPositionCorrection = false;
+		step.correctedWorldPosition = state.worldPosition;
 		step.applyRotationCorrection = correction.applyRotation;
 		step.correctedWorldRotation = correction.applyRotation ? correction.correctedWorldRotation : state.worldRotation;
 		step.hardStopped = false;
@@ -724,15 +758,6 @@ public class DiffDriveTwinController : MonoBehaviour
 			return;
 		}
 
-		if (snapPositionToGoalOnArrival)
-		{
-			Vector3 snappedPosition = state.worldPosition;
-			snappedPosition.x = state.targetPointWorld.x;
-			snappedPosition.z = state.targetPointWorld.z;
-			correction.applyPosition = true;
-			correction.correctedWorldPosition = snappedPosition;
-		}
-
 		vTarget = 0f;
 		wTarget = 0f;
 		hardStop = true;
@@ -922,11 +947,6 @@ public class DiffDriveTwinController : MonoBehaviour
 
 	private static void ApplyPoseCorrectionToState(ref DrivePredictionState state, PoseCorrection correction)
 	{
-		if (correction.applyPosition)
-		{
-			state.worldPosition = correction.correctedWorldPosition;
-		}
-
 		if (correction.applyRotation)
 		{
 			state.worldRotation = correction.correctedWorldRotation;

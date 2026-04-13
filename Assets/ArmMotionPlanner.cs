@@ -7,7 +7,7 @@ namespace RobotSimulation
 	public sealed class ArmMotionPlannerSettings
 	{
 		public int maxIterations = 180;
-		public float toleranceMeters = 0.02f;
+		public float toleranceMeters = 0.10f;
 		public float dlsLambda = 0.02f;
 		public float maxDeltaDegPerIteration = 6f;
 		public float compoundNudgeDeg = 10f;
