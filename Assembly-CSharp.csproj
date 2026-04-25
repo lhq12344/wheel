@@ -73,6 +73,7 @@
     <Compile Include="Assets\ConfigManager.cs" />
     <Compile Include="Assets\ShadowSimulationGate.cs" />
     <Compile Include="Assets\SquareObstacleTestSceneContractValidator.cs" />
+    <Compile Include="Assets\ShadowArmTwinRuntime.cs" />
     <Compile Include="Assets\InteractiveControlPanel.cs" />
     <Compile Include="Assets\OneJointTrapezoidController.cs" />
     <Compile Include="Assets\RobotTrajectoryPlanner.cs" />

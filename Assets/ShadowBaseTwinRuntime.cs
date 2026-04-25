@@ -556,7 +556,7 @@ namespace RobotSimulation
 			for (int i = 0; i < liveColliders.Length; i++)
 			{
 				Collider liveCollider = liveColliders[i];
-				if (liveCollider == null || !liveCollider.gameObject.activeInHierarchy)
+				if (liveCollider == null)
 				{
 					continue;
 				}
@@ -568,7 +568,7 @@ namespace RobotSimulation
 			for (int i = 0; i < colliders.Length; i++)
 			{
 				Collider collider = colliders[i];
-				if (collider == null || !collider.gameObject.activeInHierarchy)
+				if (collider == null)
 				{
 					continue;
 				}

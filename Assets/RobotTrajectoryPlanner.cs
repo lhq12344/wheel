@@ -24,6 +24,9 @@ namespace RobotSimulation
 		[SerializeField] private bool isPlanning;
 		[SerializeField] private string lastSummary = "规划器空闲 / Planner idle.";
 		[SerializeField] private ShadowValidationResult lastShadowValidationResult = new ShadowValidationResult();
+		[SerializeField][TextArea(3, 24)] private string lastArmCommandLineageTrace = string.Empty;
+		[SerializeField][TextArea(3, 24)] private string lastArmLiveApplyTrace = string.Empty;
+		[SerializeField] private int armTraceRecordCount;
 
 		private readonly PlannerPhysicsQueries _physicsQueries = new PlannerPhysicsQueries();
 		private readonly SceneDistanceFieldSampler _distanceFieldSampler = new SceneDistanceFieldSampler();
@@ -81,10 +84,14 @@ namespace RobotSimulation
 		private Vector3 _startupTraceBaseStartWorldPosition;
 		private float _startupTraceBaseTargetYawDeg;
 		private readonly List<Vector3> _startupTraceBaseWaypoints = new List<Vector3>();
+		private readonly List<string> _armTraceLines = new List<string>();
+		private readonly Dictionary<int, float[]> _plannedArmTraceAnglesBySample = new Dictionary<int, float[]>();
+		private readonly Dictionary<long, ArmTraceRegistration> _armTraceRegistrations = new Dictionary<long, ArmTraceRegistration>();
 		private long _lastBaseQueueWaitSequenceId;
 		private long _lastArmQueueWaitSequenceId;
 		private CancellationTokenSource _offlineComputeCts;
 		private readonly SemaphoreSlim _offlineComputeSemaphore = new SemaphoreSlim(2, 2);
+		private bool _armDiagnosticsEnabledForCurrentPlan;
 
 		private struct ArmTimingSnapshot
 		{
@@ -105,6 +112,13 @@ namespace RobotSimulation
 			public bool hasBaseCommands;
 			public bool hasArmCommands;
 			public List<SafetyGateStartupPreviewItem> previewItems;
+		}
+
+		private struct ArmTraceRegistration
+		{
+			public int sampleIndex;
+			public float[] plannedAngles;
+			public float[] pendingAngles;
 		}
 
 		public RobotPlanningStage CurrentStage => currentStage;
@@ -270,6 +284,7 @@ namespace RobotSimulation
 			}
 
 			isPlanning = false;
+			DisableArmDiagnosticsForCurrentPlan();
 			ReturnShadowToMirror();
 		}
 
@@ -303,6 +318,7 @@ namespace RobotSimulation
 			}
 
 			manager.EnsurePlanningSupportComponents();
+			ConfigureArmDiagnosticsForCurrentPlan(request);
 			MirrorSnapshot initialMirror = _mirrorStateProvider.Capture(manager.diffDriveController, manager.arm6DOFFKController);
 			if (manager.shadowRobotVisualizer != null)
 			{
@@ -705,6 +721,7 @@ namespace RobotSimulation
 
 						result.armTrajectorySamples = armSamples;
 						result.effectiveEePositionToleranceMeters = planningToleranceMeters;
+						CapturePlannedArmSamplesIfNeeded(armSamples);
 						currentStage = RobotPlanningStage.ArmShadowValidation;
 						Debug.Log($"[RobotTrajectoryPlanner] Arm shadow validation: samples={armSamples.Count}");
 						lastShadowValidationResult = _shadowGate.ValidateArmTrajectory(manager.arm6DOFFKController, armSamples);
@@ -1397,32 +1414,17 @@ namespace RobotSimulation
 			EnterShadowArmPreviewFromLiveBase();
 			int replanCount = result.replanCount;
 			List<RobotPlanJointSample> currentSamples = result.armTrajectorySamples != null ? new List<RobotPlanJointSample>(result.armTrajectorySamples) : new List<RobotPlanJointSample>();
+			CapturePlannedArmSamplesIfNeeded(currentSamples);
 			float[] previousAngles = manager.arm6DOFFKController.CaptureMeasuredJointAngles();
-			float previousSampleTimeSeconds = 0f;
-			float nextCommandTime = Time.realtimeSinceStartup;
-			float baseRadius = _physicsQueries.EstimateBaseRadius(manager.diffDriveController);
-			SafetyGateRuntimeContext gateContext = BuildSafetyGateRuntimeContext(request, obstacles, baseRadius);
-			_safetyGateTimelineBuffer.Clear();
-			yield return TraceStartupCommandBundleIfNeeded(
-				result,
-				request,
-				gateContext,
-				manager != null && manager.diffDriveController != null && manager.diffDriveController.rb != null
-					? manager.diffDriveController.rb.position
-					: Vector3.zero,
-				manager != null && manager.diffDriveController != null && manager.diffDriveController.rb != null
-					? manager.diffDriveController.rb.rotation.eulerAngles.y
-					: 0f,
-				result.baseWaypoints,
-				previousAngles,
-				currentSamples);
-			if (IsStartupCommandTraceEnabled(request))
-			{
-				Debug.Log($"[SafetyGate] Arm queue initialized: pending={_safetyGateTimelineBuffer.Count}");
-			}
+			float trajectoryStartTime = Time.realtimeSinceStartup;
 
-			int recoveryAttemptCount = result.safetyGateRecoveryAttemptCount;
-			int maxRecoveryAttempts = Mathf.Max(0, gateContext.maxRecoveryReplans);
+			if (currentSamples.Count > 0
+				&& !manager.BeginShadowArmPlannerSession("CoordinatedArmExecution", obstacles, out string shadowSessionError))
+			{
+				result.failedAtStage = RobotPlanningStage.ArmExecution;
+				result.failureReason = shadowSessionError;
+				yield break;
+			}
 
 			for (int sampleIndex = 0; sampleIndex < currentSamples.Count; sampleIndex++)
 			{
@@ -1454,10 +1456,8 @@ namespace RobotSimulation
 						{
 							currentSamples = replannedSamples;
 							result.armTrajectorySamples = replannedSamples;
+							CapturePlannedArmSamplesIfNeeded(replannedSamples);
 							previousAngles = manager.arm6DOFFKController.CaptureMeasuredJointAngles();
-							previousSampleTimeSeconds = 0f;
-							nextCommandTime = Time.realtimeSinceStartup;
-							_safetyGateTimelineBuffer.Clear();
 							sampleIndex = -1;
 							currentStage = RobotPlanningStage.ArmExecution;
 							continue;
@@ -1473,128 +1473,20 @@ namespace RobotSimulation
 					yield break;
 				}
 
-				ArmGateCommand pendingCommand = new ArmGateCommand
+				manager.shadowRobotVisualizer?.ApplyManualArmPreviewSample(
+					sample,
+					Mathf.Max(
+						manager.BaseShadowLeadSeconds,
+						ArmExecutionMinSegmentSeconds * Mathf.Max(1f, executionTimeScale)));
+				if (!manager.DispatchMirroredArmTarget(sample.jointAnglesDeg, manager.NextArmMirroredSequenceId(), out string dispatchError))
 				{
-					fromAnglesDeg = previousAngles != null ? (float[])previousAngles.Clone() : null,
-					toAnglesDeg = sample.jointAnglesDeg != null ? (float[])sample.jointAnglesDeg.Clone() : null
-				};
-				float commandThrottleRatio = 1f;
-				if (gateContext.enabled)
-				{
-					RefreshSafetyGateLoadFactor(gateContext);
-					MirrorSnapshot mirror = _mirrorStateProvider.Capture(manager.diffDriveController, manager.arm6DOFFKController);
-					SafetyGateDecision decision = _shadowGate.EvaluateArmCommand(mirror, pendingCommand, gateContext, manager.arm6DOFFKController);
-					ApplySafetyGateDecisionTelemetry(result, RobotPlanningStage.ArmExecution, decision);
-					LogSafetyGateDecision(RobotPlanningStage.ArmExecution, decision);
-					PushShadowPredictionPose(decision);
-					float leadSeconds = ComputeSafetyGateLeadSeconds(gateContext, mirror, armMode: true, result);
-					long sequenceId = NextSafetyGateSequenceId();
-
-					if (decision.type == SafetyGateDecisionType.Block)
-					{
-						RecordSafetyGateQueueFlush(result, sequenceId);
-						manager.arm6DOFFKController.HoldCurrentPose();
-						yield return new WaitForFixedUpdate();
-						float eeTolerance = GetEffectiveEeTolerance(result, request);
-						float eeError = Vector3.Distance(manager.arm6DOFFKController.EndEffectorWorldPosition, request.armTargetWorldPosition);
-						string gateFailureReason = BuildSafetyGateFailureReason(RobotPlanningStage.ArmExecution, decision);
-						if (recoveryAttemptCount < maxRecoveryAttempts && eeError > eeTolerance)
-						{
-							recoveryAttemptCount++;
-							result.safetyGateRecoveryAttemptCount = recoveryAttemptCount;
-							bool recovered = false;
-							string recoveryFailureReason = string.Empty;
-							ArmStagePreparationState recoveryState = new ArmStagePreparationState
-							{
-								ResolvedBaseGoal = manager.diffDriveController.rb.position,
-								ResolvedBaseYaw = manager.diffDriveController.rb.rotation.eulerAngles.y,
-								PreferredArmSolveSeed = null
-							};
-							List<string> recoverySummaryParts = new List<string>();
-							float remainingBudget = Mathf.Max(
-								SafetyGateRecoveryBudgetFloorSeconds,
-								Mathf.Min(
-									SafetyGateRecoveryBudgetCeilingSeconds,
-									Mathf.Max(0f, deadline - Time.realtimeSinceStartup)));
-							float recoveryDeadline = Time.realtimeSinceStartup + remainingBudget;
-							result.failureReason = string.Empty;
-							result.failedAtStage = RobotPlanningStage.None;
-							yield return RetryDockingSearchAndMoveBaseIfNeeded(
-								request,
-								result,
-								recoverySummaryParts,
-								obstacles,
-								baseRadius,
-								recoveryDeadline,
-								recoveryState);
-							recovered = string.IsNullOrEmpty(result.failureReason);
-							recoveryFailureReason = result.failureReason;
-							if (recovered)
-							{
-								_distanceFieldSampler.Build(
-									manager.arm6DOFFKController.EndEffectorWorldPosition,
-									request.armTargetWorldPosition,
-									obstacles,
-									Mathf.Max(0.2f, distanceFieldResolution),
-									2.5f);
-								if (_localReplanner.TryReplanArm(
-									_armMotionPlanner,
-									manager.arm6DOFFKController,
-									request.armTargetWorldPosition,
-									_distanceFieldSampler,
-									out List<RobotPlanJointSample> replannedAfterRecovery,
-									out _))
-								{
-									currentSamples = replannedAfterRecovery;
-									result.armTrajectorySamples = replannedAfterRecovery;
-								}
-
-								_safetyGateTimelineBuffer.Clear();
-								previousAngles = manager.arm6DOFFKController.CaptureMeasuredJointAngles();
-								previousSampleTimeSeconds = 0f;
-								nextCommandTime = Time.realtimeSinceStartup;
-								sampleIndex = -1;
-								currentStage = RobotPlanningStage.ArmExecution;
-								continue;
-							}
-
-							result.failedAtStage = RobotPlanningStage.ArmExecution;
-							result.failureReason = string.IsNullOrWhiteSpace(recoveryFailureReason)
-								? gateFailureReason
-								: $"{gateFailureReason} {recoveryFailureReason}";
-							yield break;
-						}
-
-						result.failedAtStage = RobotPlanningStage.ArmExecution;
-						result.failureReason = gateFailureReason;
-						yield break;
-					}
-
-					commandThrottleRatio = decision.type == SafetyGateDecisionType.Throttle
-						? Mathf.Clamp(decision.throttleRatio, 0.2f, 1f)
-						: 1f;
-					bool armExecutionPipelineWarmed = previousSampleTimeSeconds > 0f;
-					float commandReadyRealtime = armExecutionPipelineWarmed
-						? nextCommandTime
-						: Time.realtimeSinceStartup + Mathf.Max(SafetyGateMinLookaheadFloorSeconds, leadSeconds);
-					SafetyGateTimelineCommand timelineCommand = new SafetyGateTimelineCommand
-					{
-						sequenceId = sequenceId,
-						enqueueRealtime = Time.realtimeSinceStartup,
-						kind = SafetyGateTimelineCommandKind.Arm,
-						armCommand = pendingCommand,
-						throttleRatio = commandThrottleRatio,
-						predictedLeadSeconds = leadSeconds,
-						readyRealtime = commandReadyRealtime,
-						predictedRiskSummary = decision.reason
-					};
-					_safetyGateTimelineBuffer.Enqueue(timelineCommand);
-					LogTimelineQueueEnqueueIfNeeded(request, armQueue: true, timelineCommand);
-					manager.shadowRobotVisualizer?.ApplyShadowStep(timelineCommand);
+					result.failedAtStage = RobotPlanningStage.ArmExecution;
+					result.failureReason = dispatchError;
+					yield break;
 				}
 
-				bool commandExecuted = false;
-				while (!commandExecuted)
+				float targetCommandTime = trajectoryStartTime + Mathf.Max(ArmExecutionMinSegmentSeconds, sample.timeSeconds * Mathf.Max(1f, executionTimeScale));
+				while (Time.realtimeSinceStartup < targetCommandTime)
 				{
 					if (_stopRequested)
 					{
@@ -1619,75 +1511,19 @@ namespace RobotSimulation
 						yield break;
 					}
 
-					float requiredLeadSeconds = 0f;
-					bool hasHeadCommand = false;
-					SafetyGateTimelineCommand headCommand = default;
-					if (gateContext.enabled && _safetyGateTimelineBuffer.TryPeek(out headCommand))
+					if (manager.TryGetShadowArmSessionFault(out string shadowFault))
 					{
-						hasHeadCommand = true;
-						requiredLeadSeconds = Mathf.Max(SafetyGateMinLookaheadFloorSeconds, headCommand.predictedLeadSeconds);
-					}
-
-					if (!_safetyGateTimelineBuffer.TryDequeueReady(Time.realtimeSinceStartup, requiredLeadSeconds, out SafetyGateTimelineCommand executableCommand))
-					{
-						if (hasHeadCommand)
-						{
-							LogTimelineQueueWaitingIfNeeded(request, armQueue: true, headCommand, requiredLeadSeconds);
-						}
-
-						yield return new WaitForFixedUpdate();
-						continue;
-					}
-
-					if (executableCommand.kind != SafetyGateTimelineCommandKind.Arm)
-					{
-						RecordSafetyGateQueueFlush(result, executableCommand.sequenceId);
 						result.failedAtStage = RobotPlanningStage.ArmExecution;
-						result.failureReason = "SafetyGate timeline kind mismatch while executing arm command.";
+						result.failureReason = shadowFault;
 						yield break;
 					}
 
-					float segmentThrottleTimeScale = 1f / Mathf.Clamp(executableCommand.throttleRatio, 0.2f, 1f);
-					LogTimelineQueueDequeuedIfNeeded(request, armQueue: true, executableCommand);
-					manager.arm6DOFFKController.ApplyAllJointTargetsRaw(executableCommand.armCommand.toAnglesDeg);
-					float plannedSegmentSeconds = Mathf.Max(ArmExecutionMinSegmentSeconds, sample.timeSeconds - previousSampleTimeSeconds);
-					float targetCommandTime = nextCommandTime + (plannedSegmentSeconds * Mathf.Max(1f, executionTimeScale) * Mathf.Max(1f, segmentThrottleTimeScale));
-					previousSampleTimeSeconds = sample.timeSeconds;
-					nextCommandTime = targetCommandTime;
-
-					while (Time.realtimeSinceStartup < targetCommandTime)
-					{
-						if (_stopRequested)
-						{
-							result.failedAtStage = RobotPlanningStage.ArmExecution;
-							result.failureReason = L("规划已停止。", "Planning was stopped.");
-							yield break;
-						}
-
-						if (Time.realtimeSinceStartup > deadline)
-						{
-							result.failedAtStage = RobotPlanningStage.ArmExecution;
-							result.failureReason = L("机械臂执行阶段超时。", "Planning timed out during arm execution.");
-							yield break;
-						}
-
-						if (HasObservedArmCollision())
-						{
-							result.failedAtStage = RobotPlanningStage.ArmExecution;
-							result.failureReason = string.IsNullOrEmpty(manager.armCollisionMonitor.ActiveCollisionMessage)
-								? L("机械臂在轨迹执行过程中发生碰撞。", "Arm collided during trajectory execution.")
-								: manager.armCollisionMonitor.ActiveCollisionMessage;
-							yield break;
-						}
-
-						yield return new WaitForFixedUpdate();
-					}
-
-					previousAngles = executableCommand.armCommand.toAnglesDeg != null
-						? (float[])executableCommand.armCommand.toAnglesDeg.Clone()
-						: previousAngles;
-					commandExecuted = true;
+					yield return new WaitForFixedUpdate();
 				}
+
+				previousAngles = sample.jointAnglesDeg != null
+					? (float[])sample.jointAnglesDeg.Clone()
+					: previousAngles;
 			}
 
 			if (currentSamples.Count > 0)
@@ -1734,6 +1570,20 @@ namespace RobotSimulation
 					yield break;
 				}
 
+				if (manager.TryGetShadowArmSessionFault(out string shadowFault))
+				{
+					result.failedAtStage = RobotPlanningStage.ArmExecution;
+					result.failureReason = shadowFault;
+					yield break;
+				}
+
+				if (manager.HasPendingShadowArmLiveCommands())
+				{
+					stableFrames = 0;
+					yield return new WaitForFixedUpdate();
+					continue;
+				}
+
 				bool jointsSettled = manager.arm6DOFFKController.AreJointAnglesNear(finalTargetAnglesDeg, finalJointToleranceDeg);
 				float eeError = Vector3.Distance(manager.arm6DOFFKController.EndEffectorWorldPosition, request.armTargetWorldPosition);
 				if (jointsSettled && eeError <= finalPositionToleranceMeters)
@@ -1758,10 +1608,9 @@ namespace RobotSimulation
 					{
 						correctionAttempted = true;
 						finalPositionToleranceMeters = Mathf.Max(finalPositionToleranceMeters, ArmExecutionCorrectionToleranceMeters);
-						manager.arm6DOFFKController.ApplyAllJointTargetsRaw(finalTargetAnglesDeg);
 						LogArmSettleDiagnostics(request, finalTargetAnglesDeg);
 						Debug.LogWarning(
-							$"[RobotTrajectoryPlanner] Arm settle timeout reached, attempting terminal correction. residualDeg={correctionResidualDeg:F2}, residualMeters={correctionResidualMeters:F3}, tolerance={finalPositionToleranceMeters:F3}, extraWindow={ArmExecutionCorrectionGraceSeconds:F1}s");
+							$"[RobotTrajectoryPlanner] Arm settle timeout reached, extending settle window without re-dispatch. residualDeg={correctionResidualDeg:F2}, residualMeters={correctionResidualMeters:F3}, tolerance={finalPositionToleranceMeters:F3}, extraWindow={ArmExecutionCorrectionGraceSeconds:F1}s");
 						yield return new WaitForFixedUpdate();
 						continue;
 					}
@@ -1831,6 +1680,211 @@ namespace RobotSimulation
 			_startupTraceBaseWaypoints.Clear();
 			_lastBaseQueueWaitSequenceId = 0;
 			_lastArmQueueWaitSequenceId = 0;
+			_armDiagnosticsEnabledForCurrentPlan = false;
+			_armTraceLines.Clear();
+			_plannedArmTraceAnglesBySample.Clear();
+			_armTraceRegistrations.Clear();
+			armTraceRecordCount = 0;
+			lastArmCommandLineageTrace = string.Empty;
+			lastArmLiveApplyTrace = string.Empty;
+			manager?.shadowRobotVisualizer?.SetArmDiagnosticsEnabled(false);
+		}
+
+		private void ConfigureArmDiagnosticsForCurrentPlan(RobotPlanRequest request)
+		{
+			_armDiagnosticsEnabledForCurrentPlan = IsStartupCommandTraceEnabled(request);
+			_armTraceLines.Clear();
+			_plannedArmTraceAnglesBySample.Clear();
+			_armTraceRegistrations.Clear();
+			armTraceRecordCount = 0;
+			lastArmCommandLineageTrace = string.Empty;
+			lastArmLiveApplyTrace = string.Empty;
+			manager?.shadowRobotVisualizer?.SetArmDiagnosticsEnabled(_armDiagnosticsEnabledForCurrentPlan);
+		}
+
+		private void DisableArmDiagnosticsForCurrentPlan()
+		{
+			_armDiagnosticsEnabledForCurrentPlan = false;
+			manager?.shadowRobotVisualizer?.SetArmDiagnosticsEnabled(false);
+		}
+
+		private void CapturePlannedArmSamplesIfNeeded(IReadOnlyList<RobotPlanJointSample> armSamples)
+		{
+			if (!_armDiagnosticsEnabledForCurrentPlan)
+			{
+				return;
+			}
+
+			_plannedArmTraceAnglesBySample.Clear();
+			if (armSamples == null)
+			{
+				return;
+			}
+
+			for (int sampleIndex = 0; sampleIndex < armSamples.Count; sampleIndex++)
+			{
+				RobotPlanJointSample sample = armSamples[sampleIndex];
+				if (sample == null || sample.jointAnglesDeg == null || sample.jointAnglesDeg.Length < 6)
+				{
+					continue;
+				}
+
+				float[] clone = (float[])sample.jointAnglesDeg.Clone();
+				_plannedArmTraceAnglesBySample[sampleIndex] = clone;
+				AppendArmTraceLine(
+					$"[ArmTrace][PlannedSample] sample={sampleIndex}, t={sample.timeSeconds:F3}s, target={FormatArmTraceAngles(clone)}");
+			}
+		}
+
+		private void RegisterArmTraceSequence(long sequenceId, int sampleIndex, float[] plannedAngles, float[] pendingAngles)
+		{
+			if (!_armDiagnosticsEnabledForCurrentPlan || sequenceId <= 0)
+			{
+				return;
+			}
+
+			_armTraceRegistrations[sequenceId] = new ArmTraceRegistration
+			{
+				sampleIndex = sampleIndex,
+				plannedAngles = plannedAngles != null ? (float[])plannedAngles.Clone() : null,
+				pendingAngles = pendingAngles != null ? (float[])pendingAngles.Clone() : null
+			};
+		}
+
+		private int ResolveArmTraceSampleIndex(long sequenceId, int fallbackSampleIndex)
+		{
+			if (sequenceId > 0 && _armTraceRegistrations.TryGetValue(sequenceId, out ArmTraceRegistration registration))
+			{
+				return registration.sampleIndex;
+			}
+
+			return fallbackSampleIndex;
+		}
+
+		private void TraceArmCommandStageIfNeeded(
+			string stage,
+			int sampleIndex,
+			long sequenceId,
+			float[] anglesDeg,
+			float leadSeconds,
+			float throttleRatio,
+			string extra = null)
+		{
+			if (!_armDiagnosticsEnabledForCurrentPlan)
+			{
+				return;
+			}
+
+			float[] plannedAngles = null;
+			bool hasPlanned = sampleIndex >= 0 && _plannedArmTraceAnglesBySample.TryGetValue(sampleIndex, out plannedAngles);
+			float maxPlannedDeltaDeg = float.NaN;
+			bool matchPlanned = hasPlanned && AreArmTraceAnglesEquivalent(plannedAngles, anglesDeg, 0.0001f, out maxPlannedDeltaDeg);
+			ArmTraceRegistration registration = default;
+			bool hasPending = sequenceId > 0 && _armTraceRegistrations.TryGetValue(sequenceId, out registration);
+			float maxPendingDeltaDeg = float.NaN;
+			bool matchPending = hasPending && AreArmTraceAnglesEquivalent(registration.pendingAngles, anglesDeg, 0.0001f, out maxPendingDeltaDeg);
+			string line =
+				$"[ArmTrace][{stage}] sample={sampleIndex}, seq={sequenceId}, lead={leadSeconds:F3}s, throttle={throttleRatio:F2}, target={FormatArmTraceAngles(anglesDeg)}, matchPlanned={FormatTraceBool(matchPlanned)}, plannedDelta={FormatTraceDelta(maxPlannedDeltaDeg)}, matchPending={FormatTraceBool(matchPending)}, pendingDelta={FormatTraceDelta(maxPendingDeltaDeg)}";
+			if (!string.IsNullOrWhiteSpace(extra))
+			{
+				line = $"{line}, {extra}";
+			}
+
+			bool warning = (hasPlanned && !matchPlanned) || (hasPending && !matchPending);
+			AppendArmTraceLine(line, warning);
+		}
+
+		private void TraceLiveArmApplyIfNeeded(SafetyGateTimelineCommand command)
+		{
+			if (!_armDiagnosticsEnabledForCurrentPlan)
+			{
+				return;
+			}
+
+			int sampleIndex = ResolveArmTraceSampleIndex(command.sequenceId, -1);
+			string runtimeSummary = manager != null && manager.shadowRobotVisualizer != null
+				? manager.shadowRobotVisualizer.CaptureCurrentArmRuntimeStateSummary(command.armCommand.toAnglesDeg)
+				: "shadow visualizer unavailable";
+			lastArmLiveApplyTrace =
+				$"[ArmTrace][LiveApply] sample={sampleIndex}, seq={command.sequenceId}, lead={command.predictedLeadSeconds:F3}s, throttle={command.throttleRatio:F2}, target={FormatArmTraceAngles(command.armCommand.toAnglesDeg)}\n{runtimeSummary}";
+			AppendArmTraceLine(lastArmLiveApplyTrace);
+		}
+
+		private void AppendArmTraceLine(string line, bool warning = false)
+		{
+			if (string.IsNullOrWhiteSpace(line))
+			{
+				return;
+			}
+
+			_armTraceLines.Add(line);
+			const int maxTraceLines = 24;
+			while (_armTraceLines.Count > maxTraceLines)
+			{
+				_armTraceLines.RemoveAt(0);
+			}
+
+			armTraceRecordCount = _armTraceLines.Count;
+			lastArmCommandLineageTrace = string.Join("\n", _armTraceLines);
+			if (warning)
+			{
+				Debug.LogWarning(line);
+			}
+			else
+			{
+				Debug.Log(line);
+			}
+		}
+
+		private static string FormatTraceDelta(float value)
+		{
+			return float.IsNaN(value) || float.IsInfinity(value) ? "n/a" : value.ToString("F4");
+		}
+
+		private static string FormatTraceBool(bool value)
+		{
+			return value ? "Y" : "N";
+		}
+
+		private static bool AreArmTraceAnglesEquivalent(float[] expected, float[] actual, float toleranceDeg, out float maxDeltaDeg)
+		{
+			maxDeltaDeg = 0f;
+			if (ReferenceEquals(expected, actual))
+			{
+				return true;
+			}
+
+			if (expected == null || actual == null || expected.Length < 6 || actual.Length < 6)
+			{
+				maxDeltaDeg = float.PositiveInfinity;
+				return false;
+			}
+
+			for (int i = 0; i < 6; i++)
+			{
+				float delta = Mathf.Abs(expected[i] - actual[i]);
+				if (delta > maxDeltaDeg)
+				{
+					maxDeltaDeg = delta;
+				}
+
+				if (delta > toleranceDeg)
+				{
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		private static string FormatArmTraceAngles(float[] anglesDeg)
+		{
+			if (anglesDeg == null || anglesDeg.Length < 6)
+			{
+				return "j[n/a]";
+			}
+
+			return $"j[{anglesDeg[0]:F3},{anglesDeg[1]:F3},{anglesDeg[2]:F3},{anglesDeg[3]:F3},{anglesDeg[4]:F3},{anglesDeg[5]:F3}]";
 		}
 
 		private void StartOfflineComputeSession()
@@ -2881,6 +2935,9 @@ namespace RobotSimulation
 			lastSummary = result.summary;
 			isPlanning = false;
 			_planningRoutine = null;
+			manager?.CompleteShadowArmSession(resetShadowToLivePose: true);
+			manager?.CompleteShadowBaseSession(resetShadowToLivePose: true);
+			DisableArmDiagnosticsForCurrentPlan();
 			ReturnShadowToMirror();
 			onComplete?.Invoke(result);
 		}
@@ -2903,6 +2960,8 @@ namespace RobotSimulation
 			isPlanning = false;
 			_planningRoutine = null;
 			manager?.AbortShadowBaseSession(resetShadowToLivePose: true);
+			manager?.AbortShadowArmSession(resetShadowToLivePose: true);
+			DisableArmDiagnosticsForCurrentPlan();
 			ReturnShadowToMirror();
 			onComplete?.Invoke(result);
 		}
@@ -2931,6 +2990,11 @@ namespace RobotSimulation
 			manager.shadowRobotVisualizer.EnterArmPreview(
 				manager.diffDriveController.rb.position,
 				manager.diffDriveController.rb.rotation);
+			if (_armDiagnosticsEnabledForCurrentPlan)
+			{
+				manager.shadowRobotVisualizer.SetArmDiagnosticsEnabled(true);
+				manager.shadowRobotVisualizer.CaptureArmHierarchySnapshotReport();
+			}
 		}
 
 		private void ReturnShadowToMirror()

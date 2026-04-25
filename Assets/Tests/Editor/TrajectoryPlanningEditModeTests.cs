@@ -1,5 +1,7 @@
 using System.Collections.Generic;
+using System.Reflection;
 using NUnit.Framework;
+using UnityEditor.SceneManagement;
 using UnityEngine;
 
 namespace RobotSimulation.Tests.Editor
@@ -110,6 +112,120 @@ namespace RobotSimulation.Tests.Editor
 			{
 				Object.DestroyImmediate(obstacle);
 			}
+		}
+
+		[Test]
+		public void ShadowRobotVisualizer_HierarchySnapshot_ReportFlagsShadowAsVisualClone()
+		{
+			RobotSimulationManager manager = CreateAutoDiscoverManagerWithPlanningSupport();
+			try
+			{
+				ShadowRobotVisualizer visualizer = manager.shadowRobotVisualizer;
+				Assert.IsNotNull(visualizer, "Shadow visualizer should be available after planning support is initialized.");
+
+				typeof(ShadowRobotVisualizer)
+					.GetMethod("SetArmDiagnosticsEnabled", BindingFlags.Instance | BindingFlags.NonPublic)
+					.Invoke(visualizer, new object[] { true });
+				visualizer.EnterArmPreview(manager.diffDriveController.rb.position, manager.diffDriveController.rb.rotation);
+
+				string report = (string)typeof(ShadowRobotVisualizer)
+					.GetMethod("CaptureArmHierarchySnapshotReport", BindingFlags.Instance | BindingFlags.NonPublic)
+					.Invoke(visualizer, null);
+
+				Assert.IsTrue(report.Contains("shadow arm clones Transform/Mesh/SkinnedMeshRenderer/bone mapping only"));
+				Assert.IsTrue(report.Contains("shadowComponents=[ArticulationBody:N"));
+				Assert.IsTrue(report.Contains("BoundTrapCtrl:N"));
+			}
+			finally
+			{
+				Object.DestroyImmediate(manager.gameObject);
+			}
+		}
+
+		[Test]
+		public void ShadowRobotVisualizer_NoOpPreview_IsAlignedToLivePose()
+		{
+			RobotSimulationManager manager = CreateAutoDiscoverManagerWithPlanningSupport();
+			try
+			{
+				ShadowRobotVisualizer visualizer = manager.shadowRobotVisualizer;
+				float[] measuredAngles = manager.arm6DOFFKController.CaptureMeasuredJointAngles();
+
+				typeof(ShadowRobotVisualizer)
+					.GetMethod("SetArmDiagnosticsEnabled", BindingFlags.Instance | BindingFlags.NonPublic)
+					.Invoke(visualizer, new object[] { true });
+				visualizer.EnterArmPreview(manager.diffDriveController.rb.position, manager.diffDriveController.rb.rotation);
+				visualizer.ApplyManualArmPreviewAngles((float[])measuredAngles.Clone(), 0.2f);
+				typeof(ShadowRobotVisualizer)
+					.GetMethod("ApplyPredictedArmPoseToShadow", BindingFlags.Instance | BindingFlags.NonPublic)
+					.Invoke(visualizer, null);
+
+				string summary = (string)typeof(ShadowRobotVisualizer)
+					.GetMethod("CaptureCurrentArmRuntimeStateSummary", BindingFlags.Instance | BindingFlags.NonPublic)
+					.Invoke(visualizer, new object[] { measuredAngles });
+
+				Assert.IsTrue(summary.Contains("classification=NoOpAligned"), summary);
+				Assert.IsTrue(summary.Contains("noOpBaseline=Y"), summary);
+			}
+			finally
+			{
+				Object.DestroyImmediate(manager.gameObject);
+			}
+		}
+
+		[Test]
+		public void ArmCommandLineage_PreservesJointAnglesAcrossPendingQueueAndDequeue()
+		{
+			float[] plannedAngles = { 10f, -20f, 30f, -40f, 50f, -60f };
+			RobotPlanJointSample sample = new RobotPlanJointSample
+			{
+				timeSeconds = 0.25f,
+				jointAnglesDeg = (float[])plannedAngles.Clone()
+			};
+			ArmGateCommand pending = new ArmGateCommand
+			{
+				fromAnglesDeg = new float[6],
+				toAnglesDeg = (float[])sample.jointAnglesDeg.Clone()
+			};
+			SafetyGateTimelineCommand timelineCommand = new SafetyGateTimelineCommand
+			{
+				sequenceId = 7,
+				enqueueRealtime = 0f,
+				readyRealtime = 0f,
+				kind = SafetyGateTimelineCommandKind.Arm,
+				armCommand = pending,
+				throttleRatio = 1f,
+				predictedLeadSeconds = 0f
+			};
+			SafetyGateTimelineBuffer buffer = new SafetyGateTimelineBuffer();
+			buffer.Enqueue(timelineCommand);
+
+			bool ready = buffer.TryDequeueReady(0f, 0f, out SafetyGateTimelineCommand dequeued);
+
+			Assert.IsTrue(ready);
+			CollectionAssert.AreEqual(sample.jointAnglesDeg, pending.toAnglesDeg);
+			CollectionAssert.AreEqual(sample.jointAnglesDeg, timelineCommand.armCommand.toAnglesDeg);
+			CollectionAssert.AreEqual(sample.jointAnglesDeg, dequeued.armCommand.toAnglesDeg);
+		}
+
+		private static RobotSimulationManager CreateAutoDiscoverManagerWithPlanningSupport()
+		{
+			EditorSceneManager.OpenScene("Assets/Scenes/SampleScene.unity");
+			RobotSimulationManager existing = Object.FindObjectOfType<RobotSimulationManager>();
+			if (existing != null)
+			{
+				Object.DestroyImmediate(existing.gameObject);
+			}
+
+			GameObject managerGo = new GameObject("RobotSimulationManager");
+			RobotSimulationManager manager = managerGo.AddComponent<RobotSimulationManager>();
+			manager.bootstrapMode = RobotSimulationManager.BootstrapMode.AutoDiscover;
+			manager.InitializeRobot();
+			Assert.IsTrue(manager.EnsurePlanningSupportComponents(), "Planning support components should initialize in SampleScene.");
+			Assert.IsNotNull(manager.arm6DOFFKController);
+			Assert.IsTrue(manager.arm6DOFFKController.KinematicsReady);
+			Assert.IsNotNull(manager.diffDriveController);
+			return manager;
 		}
 	}
 }

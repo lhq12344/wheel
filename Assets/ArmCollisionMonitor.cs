@@ -233,7 +233,8 @@ namespace RobotSimulation
 						forbiddenCollider, forbiddenCollider.transform.position, forbiddenCollider.transform.rotation,
 						out direction, out distance);
 
-					if (!overlapping || distance <= penetrationEpsilon)
+					float effectivePenetrationThreshold = GetEffectivePenetrationThreshold(armEntry.collider, forbiddenCollider);
+					if (!overlapping || distance <= effectivePenetrationThreshold)
 					{
 						continue;
 					}
@@ -284,7 +285,8 @@ namespace RobotSimulation
 						forbiddenCollider, forbiddenCollider.transform.position, forbiddenCollider.transform.rotation,
 						out direction, out distance);
 
-					if (!overlapping || distance <= penetrationEpsilon)
+					float effectivePenetrationThreshold = GetEffectivePenetrationThreshold(armCollider, forbiddenCollider);
+					if (!overlapping || distance <= effectivePenetrationThreshold)
 					{
 						continue;
 					}
@@ -302,6 +304,18 @@ namespace RobotSimulation
 			return collider != null
 				&& collider.enabled
 				&& collider.gameObject.activeInHierarchy;
+		}
+
+		private float GetEffectivePenetrationThreshold(Collider primary, Collider secondary)
+		{
+			return Mathf.Max(
+				Mathf.Max(0.0001f, penetrationEpsilon),
+				GetSafeContactOffset(primary) + GetSafeContactOffset(secondary));
+		}
+
+		private static float GetSafeContactOffset(Collider collider)
+		{
+			return collider != null ? Mathf.Max(0f, collider.contactOffset) : 0f;
 		}
 
 		private bool IsIgnoredArmCollider(Collider collider)

@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -30,6 +31,9 @@ namespace RobotSimulation
 		[SerializeField] private int bindingCount;
 		[SerializeField] private string sourceSummary = "Shadow source is not configured.";
 		[SerializeField] private PreviewMode previewMode = PreviewMode.Mirror;
+		[SerializeField][TextArea(3, 24)] private string lastArmHierarchySnapshot = string.Empty;
+		[SerializeField][TextArea(3, 24)] private string lastArmRuntimeSnapshot = string.Empty;
+		[SerializeField][TextArea(3, 24)] private string lastArmNoOpAlignmentSnapshot = string.Empty;
 
 		private RobotSimulationManager _manager;
 		private Transform _shadowContainer;
@@ -67,6 +71,10 @@ namespace RobotSimulation
 		private Vector3 _armPreviewBaseReferencePosition;
 		private Quaternion _armPreviewBaseReferenceRotation = Quaternion.identity;
 		private bool _hasArmPreviewBaseReferencePose;
+		private bool _armDiagnosticsEnabled;
+		private bool _armHierarchySnapshotLogged;
+		private bool _hasPendingArmTrace;
+		private PendingArmTrace _pendingArmTrace;
 
 		private struct TransformBinding
 		{
@@ -81,6 +89,15 @@ namespace RobotSimulation
 		{
 			public SkinnedMeshRenderer sourceRenderer;
 			public SkinnedMeshRenderer shadowRenderer;
+		}
+
+		private struct PendingArmTrace
+		{
+			public long sequenceId;
+			public int sampleIndex;
+			public float leadSeconds;
+			public float throttleRatio;
+			public float[] targetAnglesDeg;
 		}
 
 		public static ShadowRobotVisualizer ActiveInstance => _activeInstance;
@@ -126,6 +143,66 @@ namespace RobotSimulation
 
 			_manager = manager;
 			RebuildIfNeeded(forceRebuild: false);
+		}
+
+		internal void SetArmDiagnosticsEnabled(bool enabled)
+		{
+			if (_activeInstance != null && _activeInstance != this)
+			{
+				_activeInstance.SetArmDiagnosticsEnabled(enabled);
+				return;
+			}
+
+			_armDiagnosticsEnabled = enabled;
+			_armHierarchySnapshotLogged = false;
+			_hasPendingArmTrace = false;
+		}
+
+		internal void StagePendingArmTrace(long sequenceId, int sampleIndex, float[] targetAnglesDeg, float leadSeconds, float throttleRatio)
+		{
+			if (_activeInstance != null && _activeInstance != this)
+			{
+				_activeInstance.StagePendingArmTrace(sequenceId, sampleIndex, targetAnglesDeg, leadSeconds, throttleRatio);
+				return;
+			}
+
+			if (!_armDiagnosticsEnabled)
+			{
+				return;
+			}
+
+			_pendingArmTrace = new PendingArmTrace
+			{
+				sequenceId = sequenceId,
+				sampleIndex = sampleIndex,
+				leadSeconds = leadSeconds,
+				throttleRatio = throttleRatio,
+				targetAnglesDeg = targetAnglesDeg != null ? (float[])targetAnglesDeg.Clone() : null
+			};
+			_hasPendingArmTrace = true;
+		}
+
+		internal string CaptureArmHierarchySnapshotReport()
+		{
+			if (_activeInstance != null && _activeInstance != this)
+			{
+				return _activeInstance.CaptureArmHierarchySnapshotReport();
+			}
+
+			RebuildIfNeeded(forceRebuild: false);
+			lastArmHierarchySnapshot = BuildArmHierarchySnapshotReport();
+			return lastArmHierarchySnapshot;
+		}
+
+		internal string CaptureCurrentArmRuntimeStateSummary(float[] targetAnglesDeg)
+		{
+			if (_activeInstance != null && _activeInstance != this)
+			{
+				return _activeInstance.CaptureCurrentArmRuntimeStateSummary(targetAnglesDeg);
+			}
+
+			lastArmRuntimeSnapshot = BuildArmRuntimeStateSummary(targetAnglesDeg);
+			return lastArmRuntimeSnapshot;
 		}
 
 		public void SetVisualizationEnabled(bool enabled)
@@ -201,6 +278,7 @@ namespace RobotSimulation
 			SetSimulatedBasePose(settledBaseWorldPos, settledBaseWorldRot);
 			ClearPredictedBasePose();
 			ClearExecutionBasePose();
+			TraceArmHierarchySnapshotIfNeeded();
 		}
 
 		public void ReturnToMirror()
@@ -216,6 +294,8 @@ namespace RobotSimulation
 			ClearPredictedBasePose();
 			ClearPredictedArmPose();
 			ClearExecutionBasePose();
+			_hasPendingArmTrace = false;
+			_armHierarchySnapshotLogged = false;
 			if (_baseReferenceTransform != null)
 			{
 				SetSimulatedBasePose(_baseReferenceTransform.position, _baseReferenceTransform.rotation);
@@ -241,6 +321,8 @@ namespace RobotSimulation
 			ClearPredictedBasePose();
 			ClearPredictedArmPose();
 			ClearExecutionBasePose();
+			_hasPendingArmTrace = false;
+			_armHierarchySnapshotLogged = false;
 		}
 
 		public void ApplyShadowStep(SafetyGateTimelineCommand command)
@@ -284,6 +366,15 @@ namespace RobotSimulation
 
 			if (previewMode == PreviewMode.ArmPreview)
 			{
+				if (!_hasPendingArmTrace)
+				{
+					StagePendingArmTrace(
+						command.sequenceId,
+						-1,
+						command.armCommand.toAnglesDeg,
+						command.predictedLeadSeconds,
+						command.throttleRatio);
+				}
 				SetPredictedArmAngles(command.armCommand.toAnglesDeg, GetVisualizationLeadSeconds(command.predictedLeadSeconds));
 			}
 		}
@@ -435,7 +526,11 @@ namespace RobotSimulation
 				baseRoot = ResolvePreferredBaseRoot(rbTransform, controllerTransform);
 			}
 
-			if (_manager.armBinder != null && _manager.armBinder.armRoot != null)
+			if (_manager.ShouldUseShadowArmTwinSource() && _manager.GetShadowArmTwinRoot() != null)
+			{
+				armRoot = _manager.GetShadowArmTwinRoot();
+			}
+			else if (_manager.armBinder != null && _manager.armBinder.armRoot != null)
 			{
 				armRoot = _manager.armBinder.armRoot.transform;
 			}
@@ -545,23 +640,29 @@ namespace RobotSimulation
 			EnsureShadowContainer();
 			ClearShadowNodes();
 			_shadowArmMountTransform = null;
+			Transform excludedBaseSubtreeRoot = GetExcludedBaseSubtreeRoot();
 
 			if (_cachedBaseRoot != null)
 			{
-				BuildShadowNodeRecursive(_cachedBaseRoot, _shadowContainer, true, null);
+				BuildShadowNodeRecursive(_cachedBaseRoot, _shadowContainer, true, null, excludedBaseSubtreeRoot);
 			}
 
 			if (_cachedArmRoot != null)
 			{
-				_shadowArmMountTransform = TryMapShadowTransform(_sourceArmMountTransform);
-				if (_shadowArmMountTransform == null)
+				bool useShadowArmTwinWorldPose = _manager != null && _manager.ShouldUseShadowArmTwinSource();
+				_shadowArmMountTransform = useShadowArmTwinWorldPose ? null : TryMapShadowTransform(_sourceArmMountTransform);
+				if (_shadowArmMountTransform == null && !useShadowArmTwinWorldPose)
 				{
 					_shadowArmMountTransform = TryMapShadowTransform(_cachedBaseRoot);
 				}
 
-				Transform armShadowParent = _shadowArmMountTransform != null ? _shadowArmMountTransform : _shadowContainer;
-				Transform armRootReference = _sourceArmMountTransform != null ? _sourceArmMountTransform : null;
-				BuildShadowNodeRecursive(_cachedArmRoot, armShadowParent, true, armRootReference);
+				Transform armShadowParent = useShadowArmTwinWorldPose
+					? _shadowContainer
+					: (_shadowArmMountTransform != null ? _shadowArmMountTransform : _shadowContainer);
+				Transform armRootReference = useShadowArmTwinWorldPose
+					? null
+					: (_sourceArmMountTransform != null ? _sourceArmMountTransform : null);
+				BuildShadowNodeRecursive(_cachedArmRoot, armShadowParent, true, armRootReference, null);
 			}
 
 			ResolvePendingSkinnedBindings();
@@ -620,9 +721,30 @@ namespace RobotSimulation
 			}
 		}
 
-		private void BuildShadowNodeRecursive(Transform source, Transform parent, bool isRoot, Transform rootReference)
+		private Transform GetExcludedBaseSubtreeRoot()
+		{
+			if (_manager == null
+				|| !_manager.ShouldUseShadowArmTwinSource()
+				|| _manager.armBinder == null
+				|| _manager.armBinder.armRoot == null)
+			{
+				return null;
+			}
+
+			Transform liveArmRoot = _manager.armBinder.armRoot.transform;
+			return liveArmRoot != null && _cachedBaseRoot != null && liveArmRoot.IsChildOf(_cachedBaseRoot)
+				? liveArmRoot
+				: null;
+		}
+
+		private void BuildShadowNodeRecursive(Transform source, Transform parent, bool isRoot, Transform rootReference, Transform excludedSubtreeRoot)
 		{
 			if (source == null || parent == null)
+			{
+				return;
+			}
+
+			if (excludedSubtreeRoot != null && source == excludedSubtreeRoot)
 			{
 				return;
 			}
@@ -672,7 +794,7 @@ namespace RobotSimulation
 
 			for (int i = 0; i < source.childCount; i++)
 			{
-				BuildShadowNodeRecursive(source.GetChild(i), shadowTransform, false, null);
+				BuildShadowNodeRecursive(source.GetChild(i), shadowTransform, false, null, excludedSubtreeRoot);
 			}
 		}
 
@@ -1210,6 +1332,339 @@ namespace RobotSimulation
 			return false;
 		}
 
+		private void TraceArmHierarchySnapshotIfNeeded()
+		{
+			if (!_armDiagnosticsEnabled || _armHierarchySnapshotLogged)
+			{
+				return;
+			}
+
+			lastArmHierarchySnapshot = BuildArmHierarchySnapshotReport();
+			_armHierarchySnapshotLogged = true;
+			if (!string.IsNullOrEmpty(lastArmHierarchySnapshot))
+			{
+				Debug.Log($"[ArmTrace][Hierarchy]\n{lastArmHierarchySnapshot}");
+			}
+		}
+
+		private string BuildArmHierarchySnapshotReport()
+		{
+			StringBuilder builder = new StringBuilder();
+			builder.AppendLine(
+				$"context: baseRoot={BuildTransformPath(_cachedBaseRoot)}, armRoot={BuildTransformPath(_cachedArmRoot)}, baseRef={BuildTransformPath(_baseReferenceTransform)}, armMount={BuildTransformPath(_sourceArmMountTransform)}, shadowArmMount={BuildTransformPath(_shadowArmMountTransform)}, sourceSummary={sourceSummary}");
+			builder.AppendLine(_manager != null && _manager.ShouldUseShadowArmTwinSource()
+				? "contract: active arm source is ShadowArmTwinRuntime; the visualizer mirrors the articulated shadow twin transforms instead of projecting FK angles."
+				: "contract: shadow arm clones Transform/Mesh/SkinnedMeshRenderer/bone mapping only; it does not add ArticulationBody, OneJointTrapezoidController, Collider, or Rigidbody.");
+
+			if (!TryGetArmJointDiagnosticInputs(out Transform[] armJoints, out _, out ArticulationBody[] articulationJoints, out OneJointTrapezoidController[] coordinatedControllers))
+			{
+				builder.Append("arm-diagnostics unavailable");
+				return builder.ToString();
+			}
+
+			for (int jointIndex = 0; jointIndex < 6; jointIndex++)
+			{
+				Transform sourceJoint = armJoints[jointIndex];
+				_sourceToShadowTransformMap.TryGetValue(sourceJoint, out Transform shadowJoint);
+				bool liveBoundController = coordinatedControllers != null
+					&& coordinatedControllers.Length > jointIndex
+					&& coordinatedControllers[jointIndex] != null;
+				bool shadowBoundController = false;
+				builder.Append("J").Append(jointIndex + 1).Append(": ");
+				builder.Append("src=").Append(BuildTransformPath(sourceJoint));
+				builder.Append(", shadow=").Append(BuildTransformPath(shadowJoint));
+				builder.Append(", srcParent=").Append(BuildTransformPath(sourceJoint != null ? sourceJoint.parent : null));
+				builder.Append(", shadowParent=").Append(BuildTransformPath(shadowJoint != null ? shadowJoint.parent : null));
+				builder.Append(", srcLocalPos=").Append(sourceJoint != null ? FormatVector3(sourceJoint.localPosition) : "null");
+				builder.Append(", shadowLocalPos=").Append(shadowJoint != null ? FormatVector3(shadowJoint.localPosition) : "null");
+				builder.Append(", srcLocalRot=").Append(sourceJoint != null ? FormatQuaternion(sourceJoint.localRotation) : "null");
+				builder.Append(", shadowLocalRot=").Append(shadowJoint != null ? FormatQuaternion(shadowJoint.localRotation) : "null");
+				builder.Append(", srcScale=").Append(sourceJoint != null ? FormatVector3(sourceJoint.localScale) : "null");
+				builder.Append(", shadowScale=").Append(shadowJoint != null ? FormatVector3(shadowJoint.localScale) : "null");
+				builder.Append(", srcComponents=[ArticulationBody:").Append(FormatBool(articulationJoints != null && articulationJoints.Length > jointIndex && articulationJoints[jointIndex] != null));
+				builder.Append(", BoundTrapCtrl:").Append(FormatBool(liveBoundController));
+				builder.Append(", DirectTrapCtrl:").Append(FormatBool(sourceJoint != null && sourceJoint.GetComponent<OneJointTrapezoidController>() != null));
+				builder.Append(", Collider:").Append(FormatBool(sourceJoint != null && sourceJoint.GetComponent<Collider>() != null));
+				builder.Append(", Rigidbody:").Append(FormatBool(sourceJoint != null && sourceJoint.GetComponent<Rigidbody>() != null));
+				builder.Append("], shadowComponents=[ArticulationBody:").Append(FormatBool(shadowJoint != null && shadowJoint.GetComponent<ArticulationBody>() != null));
+				builder.Append(", BoundTrapCtrl:").Append(FormatBool(shadowBoundController));
+				builder.Append(", DirectTrapCtrl:").Append(FormatBool(shadowJoint != null && shadowJoint.GetComponent<OneJointTrapezoidController>() != null));
+				builder.Append(", Collider:").Append(FormatBool(shadowJoint != null && shadowJoint.GetComponent<Collider>() != null));
+				builder.Append(", Rigidbody:").Append(FormatBool(shadowJoint != null && shadowJoint.GetComponent<Rigidbody>() != null));
+				builder.AppendLine("]");
+			}
+
+			return builder.ToString();
+		}
+
+		private string BuildArmRuntimeStateSummary(float[] targetAnglesDeg)
+		{
+			StringBuilder builder = new StringBuilder();
+			if (!TryGetArmJointDiagnosticInputs(out Transform[] armJoints, out float[] measuredAngles, out ArticulationBody[] articulationJoints, out OneJointTrapezoidController[] coordinatedControllers))
+			{
+				builder.Append("arm-runtime unavailable");
+				return builder.ToString();
+			}
+
+			bool hasTargetAngles = targetAnglesDeg != null && targetAnglesDeg.Length >= 6;
+			bool noOpBaseline = hasTargetAngles && AreAnglesEquivalent(measuredAngles, targetAnglesDeg, 0.001f, out _);
+			float maxRotationDeltaDeg = 0f;
+			float maxLiveTargetErrorDeg = 0f;
+			float maxShadowTargetErrorDeg = 0f;
+			for (int jointIndex = 0; jointIndex < 6; jointIndex++)
+			{
+				Transform sourceJoint = armJoints[jointIndex];
+				_sourceToShadowTransformMap.TryGetValue(sourceJoint, out Transform shadowJoint);
+				float measuredDeg = measuredAngles != null && measuredAngles.Length > jointIndex ? measuredAngles[jointIndex] : 0f;
+				float targetDeg = hasTargetAngles ? targetAnglesDeg[jointIndex] : measuredDeg;
+				float liveDriveTargetDeg = articulationJoints != null && articulationJoints.Length > jointIndex && articulationJoints[jointIndex] != null
+					? articulationJoints[jointIndex].xDrive.target
+					: float.NaN;
+				float trapGoalDeg = coordinatedControllers != null && coordinatedControllers.Length > jointIndex && coordinatedControllers[jointIndex] != null
+					? coordinatedControllers[jointIndex].goalDeg
+					: float.NaN;
+				float liveTargetErrorDeg = Mathf.Abs(measuredDeg - targetDeg);
+				if (liveTargetErrorDeg > maxLiveTargetErrorDeg)
+				{
+					maxLiveTargetErrorDeg = liveTargetErrorDeg;
+				}
+
+				float rotationDeltaDeg = sourceJoint != null && shadowJoint != null
+					? Quaternion.Angle(sourceJoint.localRotation, shadowJoint.localRotation)
+					: float.PositiveInfinity;
+				if (!float.IsInfinity(rotationDeltaDeg) && rotationDeltaDeg > maxRotationDeltaDeg)
+				{
+					maxRotationDeltaDeg = rotationDeltaDeg;
+				}
+
+				float shadowDerivedDeg = float.NaN;
+				float shadowAxisDotX = float.NaN;
+				float shadowTargetErrorDeg = float.NaN;
+				if (sourceJoint != null && shadowJoint != null)
+				{
+					Quaternion zeroLocalRotation = sourceJoint.localRotation * Quaternion.AngleAxis(-measuredDeg, Vector3.right);
+					if (TryComputeSignedAngleAboutLocalXAxis(zeroLocalRotation, shadowJoint.localRotation, out shadowDerivedDeg, out shadowAxisDotX))
+					{
+						shadowTargetErrorDeg = Mathf.Abs(shadowDerivedDeg - targetDeg);
+						if (shadowTargetErrorDeg > maxShadowTargetErrorDeg)
+						{
+							maxShadowTargetErrorDeg = shadowTargetErrorDeg;
+						}
+					}
+				}
+
+				builder.Append("J").Append(jointIndex + 1).Append(": ");
+				builder.Append("measured=").Append(measuredDeg.ToString("F3"));
+				builder.Append(", target=").Append(targetDeg.ToString("F3"));
+				builder.Append(", shadowDerived=").Append(FormatOptionalFloat(shadowDerivedDeg));
+				builder.Append(", shadowAxisDotX=").Append(FormatOptionalFloat(shadowAxisDotX));
+				builder.Append(", liveXDriveTarget=").Append(FormatOptionalFloat(liveDriveTargetDeg));
+				builder.Append(", liveTrapGoal=").Append(FormatOptionalFloat(trapGoalDeg));
+				builder.Append(", liveTargetError=").Append(liveTargetErrorDeg.ToString("F3"));
+				builder.Append(", shadowTargetError=").Append(FormatOptionalFloat(shadowTargetErrorDeg));
+				builder.Append(", liveVsShadowRotDelta=").Append(FormatOptionalFloat(rotationDeltaDeg));
+				builder.Append(", srcLocalRot=").Append(sourceJoint != null ? FormatQuaternion(sourceJoint.localRotation) : "null");
+				builder.Append(", shadowLocalRot=").Append(shadowJoint != null ? FormatQuaternion(shadowJoint.localRotation) : "null");
+				if (jointIndex < 5)
+				{
+					builder.AppendLine();
+				}
+			}
+
+			string classification;
+			if (noOpBaseline)
+			{
+				classification = maxRotationDeltaDeg <= 0.05f ? "NoOpAligned" : "Hierarchy/BasisMismatch";
+				lastArmNoOpAlignmentSnapshot = $"classification={classification}, maxRotationDeltaDeg={maxRotationDeltaDeg:F4}\n{builder}";
+			}
+			else if (maxShadowTargetErrorDeg <= 0.25f && maxLiveTargetErrorDeg >= 0.5f)
+			{
+				classification = "ActuationMismatchCandidate";
+			}
+			else
+			{
+				classification = "RuntimeTrace";
+			}
+
+			return $"classification={classification}, noOpBaseline={FormatBool(noOpBaseline)}, maxRotationDeltaDeg={maxRotationDeltaDeg:F4}, maxLiveTargetErrorDeg={maxLiveTargetErrorDeg:F4}, maxShadowTargetErrorDeg={maxShadowTargetErrorDeg:F4}\n{builder}";
+		}
+
+		private bool TryGetArmJointDiagnosticInputs(
+			out Transform[] armJoints,
+			out float[] measuredAngles,
+			out ArticulationBody[] articulationJoints,
+			out OneJointTrapezoidController[] coordinatedControllers)
+		{
+			armJoints = null;
+			measuredAngles = null;
+			articulationJoints = null;
+			coordinatedControllers = null;
+			if (_manager == null || _manager.arm6DOFFKController == null)
+			{
+				return false;
+			}
+
+			armJoints = _manager.arm6DOFFKController.jointTransforms;
+			if (armJoints == null || armJoints.Length < 6)
+			{
+				return false;
+			}
+
+			measuredAngles = _manager.arm6DOFFKController.CaptureMeasuredJointAngles();
+			articulationJoints = _manager.arm6DOFFKController.joints;
+			coordinatedControllers = _manager.arm6DOFFKController.coordinatedJointControllers;
+			return true;
+		}
+
+		private static bool AreAnglesEquivalent(float[] expected, float[] actual, float toleranceDeg, out float maxDeltaDeg)
+		{
+			maxDeltaDeg = 0f;
+			if (ReferenceEquals(expected, actual))
+			{
+				return true;
+			}
+
+			if (expected == null || actual == null || expected.Length < 6 || actual.Length < 6)
+			{
+				maxDeltaDeg = float.PositiveInfinity;
+				return false;
+			}
+
+			for (int i = 0; i < 6; i++)
+			{
+				float delta = Mathf.Abs(expected[i] - actual[i]);
+				if (delta > maxDeltaDeg)
+				{
+					maxDeltaDeg = delta;
+				}
+
+				if (delta > toleranceDeg)
+				{
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		private static bool AreAnglesEquivalent(float[] expected, float[] actual, float toleranceDeg = 0.001f)
+		{
+			return AreAnglesEquivalent(expected, actual, toleranceDeg, out _);
+		}
+
+		private static string FormatAngles(float[] anglesDeg)
+		{
+			if (anglesDeg == null || anglesDeg.Length < 6)
+			{
+				return "j[n/a]";
+			}
+
+			StringBuilder builder = new StringBuilder("j[");
+			for (int i = 0; i < 6; i++)
+			{
+				if (i > 0)
+				{
+					builder.Append(',');
+				}
+
+				builder.Append(anglesDeg[i].ToString("F3"));
+			}
+
+			builder.Append(']');
+			return builder.ToString();
+		}
+
+		private static string BuildTransformPath(Transform transform)
+		{
+			if (transform == null)
+			{
+				return "null";
+			}
+
+			StringBuilder builder = new StringBuilder(transform.name);
+			Transform current = transform.parent;
+			while (current != null)
+			{
+				builder.Insert(0, '/');
+				builder.Insert(0, current.name);
+				current = current.parent;
+			}
+
+			return builder.ToString();
+		}
+
+		private static string FormatVector3(Vector3 value)
+		{
+			return $"({value.x:F4},{value.y:F4},{value.z:F4})";
+		}
+
+		private static string FormatQuaternion(Quaternion value)
+		{
+			return $"({value.x:F4},{value.y:F4},{value.z:F4},{value.w:F4})";
+		}
+
+		private static string FormatBool(bool value)
+		{
+			return value ? "Y" : "N";
+		}
+
+		private static bool TryComputeSignedAngleAboutLocalXAxis(
+			Quaternion zeroLocalRotation,
+			Quaternion currentLocalRotation,
+			out float signedAngleDeg,
+			out float axisAlignment)
+		{
+			Quaternion relative = Quaternion.Inverse(zeroLocalRotation) * currentLocalRotation;
+			relative.ToAngleAxis(out float rawAngleDeg, out Vector3 rawAxis);
+			if (rawAxis.sqrMagnitude <= 1e-8f)
+			{
+				signedAngleDeg = 0f;
+				axisAlignment = 1f;
+				return true;
+			}
+
+			Vector3 axis = rawAxis.normalized;
+			float angleDeg = rawAngleDeg > 180f ? rawAngleDeg - 360f : rawAngleDeg;
+			axisAlignment = Vector3.Dot(axis, Vector3.right);
+			if (axisAlignment < 0f)
+			{
+				angleDeg = -angleDeg;
+				axisAlignment = -axisAlignment;
+			}
+
+			signedAngleDeg = angleDeg;
+			return true;
+		}
+
+		private static string FormatOptionalFloat(float value)
+		{
+			return float.IsNaN(value) || float.IsInfinity(value) ? "n/a" : value.ToString("F4");
+		}
+
+		private void EmitPendingArmRuntimeTraceIfNeeded(float[] measuredAngles)
+		{
+			if (!_armDiagnosticsEnabled || !_hasPendingArmTrace)
+			{
+				return;
+			}
+
+			lastArmRuntimeSnapshot = BuildArmRuntimeStateSummary(_pendingArmTrace.targetAnglesDeg);
+			Debug.Log(
+				$"[ArmTrace][ShadowApplied] seq={_pendingArmTrace.sequenceId}, sample={_pendingArmTrace.sampleIndex}, lead={_pendingArmTrace.leadSeconds:F3}s, throttle={_pendingArmTrace.throttleRatio:F2}, target={FormatAngles(_pendingArmTrace.targetAnglesDeg)}\n{lastArmRuntimeSnapshot}");
+			if (AreAnglesEquivalent(measuredAngles, _pendingArmTrace.targetAnglesDeg, 0.001f))
+			{
+				Debug.Log($"[ArmTrace][NoOpBaseline]\n{lastArmNoOpAlignmentSnapshot}");
+			}
+
+			_hasPendingArmTrace = false;
+		}
+
+		private static Quaternion ComposeAbsoluteArmJointLocalRotation(Quaternion measuredLocalRotation, float measuredDeg, float targetDeg)
+		{
+			Quaternion zeroLocalRotation = measuredLocalRotation * Quaternion.AngleAxis(-measuredDeg, Vector3.right);
+			return zeroLocalRotation * Quaternion.AngleAxis(targetDeg, Vector3.right);
+		}
+
 		private void ApplyPredictedArmPoseToShadow()
 		{
 			if (previewMode != PreviewMode.ArmPreview
@@ -1217,6 +1672,11 @@ namespace RobotSimulation
 				|| _manager == null
 				|| _manager.arm6DOFFKController == null
 				|| _manager.arm6DOFFKController.jointTransforms == null)
+			{
+				return;
+			}
+
+			if (_manager.ShouldUseShadowArmTwinSource())
 			{
 				return;
 			}
@@ -1243,9 +1703,13 @@ namespace RobotSimulation
 
 				float measuredDeg = measuredAngles != null && measuredAngles.Length > jointIndex ? measuredAngles[jointIndex] : _predictedArmAnglesDeg[jointIndex];
 				float predictedDeg = _predictedArmAnglesDeg[jointIndex];
-				float deltaDeg = Mathf.DeltaAngle(measuredDeg, predictedDeg);
-				shadowJoint.localRotation = armJoints[jointIndex].localRotation * Quaternion.AngleAxis(deltaDeg, Vector3.right);
+				shadowJoint.localRotation = ComposeAbsoluteArmJointLocalRotation(
+					armJoints[jointIndex].localRotation,
+					measuredDeg,
+					predictedDeg);
 			}
+
+			EmitPendingArmRuntimeTraceIfNeeded(measuredAngles);
 		}
 
 		private void ClearShadowHierarchy()
@@ -1267,6 +1731,7 @@ namespace RobotSimulation
 			_sourceToShadowTransformMap.Clear();
 			_pendingSkinnedBindings.Clear();
 			ClearExecutionBasePose();
+			_hasPendingArmTrace = false;
 			bindingCount = 0;
 			_isBuilt = false;
 

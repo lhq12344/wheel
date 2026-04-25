@@ -5343,7 +5343,8 @@ MonoBehaviour:
   ignoreArmBaseColliders: 1
   ignoredArmColliderNameContains:
   - Link_00
-  ignoredForbiddenColliderNameContains: []
+  ignoredForbiddenColliderNameContains:
+  - Cube
   previewStepDegrees: 5
   maxPreviewSamples: 48
   _hasCollision: 0
