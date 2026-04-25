@@ -114,10 +114,6 @@ namespace RobotSimulation
 		private Coroutine _armDirectLeadRunWatcher;
 		private long _nextArmMirroredSequenceId = 1L;
 		private readonly Queue<DelayedArmCommand> _armDelayedCommandQueue = new Queue<DelayedArmCommand>();
-		private bool _armDelayedSessionActive;
-		private ArmDelayQueueSessionKind _armDelayedSessionKind = ArmDelayQueueSessionKind.None;
-		private string _armDelayedSessionLabel = string.Empty;
-		private string _armDelayedFaultMessage = string.Empty;
 
 		private bool UsesExplicitBootstrapContract => bootstrapMode == BootstrapMode.ExplicitContract;
 		internal ShadowBaseTwinRuntime ShadowBaseTwin => _shadowBaseTwinRuntime;
@@ -139,14 +135,6 @@ namespace RobotSimulation
 			public int armPreviewSampleIndex;
 			public bool holdToRun;
 			public System.Action<ArmMoveResult> armOnComplete;
-		}
-
-		private enum ArmDelayQueueSessionKind
-		{
-			None,
-			Direct,
-			Manual,
-			Planner
 		}
 
 		private struct DelayedArmCommand
@@ -239,13 +227,14 @@ namespace RobotSimulation
 			if (!enableSimulation || !_isInitialized) return;
 
 			_shadowBaseTwinRuntime?.Tick();
-			TickArmDelayedCommandQueue();
+			_shadowArmTwinRuntime?.Tick();
 
 			if (armCollisionMonitor != null)
 			{
 				bool collided = armCollisionMonitor.GetObservedCollisionState();
 				if (collided && !_armCollisionResponseLatched)
 				{
+					ClearArmDelayedCommandQueue("Live arm collision response.", holdLivePose: true);
 					CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: true, stopArmMotion: true, reason: "Manual preview cancelled after collision.");
 
 					if (arm6DOFIKController != null)
@@ -281,12 +270,19 @@ namespace RobotSimulation
 			TickManualPreviewSession();
 			HandleShadowBaseTwinFaultIfNeeded();
 			HandleShadowArmTwinFaultIfNeeded();
+			TickArmDelayedCommandQueue();
 		}
 
 		private void TickArmDelayedCommandQueue()
 		{
 			if (arm6DOFFKController == null || _armDelayedCommandQueue.Count == 0)
 			{
+				return;
+			}
+
+			if (TryGetShadowArmSessionFault(out string faultMessage))
+			{
+				ClearArmDelayedCommandQueue($"Shadow arm fault before live apply: {faultMessage}", holdLivePose: true);
 				return;
 			}
 
@@ -306,124 +302,10 @@ namespace RobotSimulation
 				}
 
 				arm6DOFFKController.ApplyAllJointTargetsRaw(nextCommand.targetAnglesDeg);
+				Debug.Log(
+					$"[ArmDebug][ArmLeadQueueApply] seq={nextCommand.sequenceId}, now={nowRealtime:F3}, scheduled={nextCommand.executeRealtime:F3}, " +
+					$"lateness={(nowRealtime - nextCommand.executeRealtime):F3}s, target={FormatArmAnglesForLog(nextCommand.targetAnglesDeg)}, pending={_armDelayedCommandQueue.Count}");
 			}
-		}
-
-		private bool BeginArmDelayedSession(
-			ArmDelayQueueSessionKind sessionKind,
-			string sessionLabel,
-			bool preservePendingDirectQueue,
-			out string error)
-		{
-			error = string.Empty;
-			if (!EnsureArmCoordinateControllers() || arm6DOFFKController == null)
-			{
-				error = "Arm delayed queue is unavailable because the FK controller is missing.";
-				return false;
-			}
-
-			bool keepPendingCommands = preservePendingDirectQueue
-				&& _armDelayedSessionActive
-				&& _armDelayedSessionKind == ArmDelayQueueSessionKind.Direct
-				&& sessionKind == ArmDelayQueueSessionKind.Direct
-				&& string.IsNullOrEmpty(_armDelayedFaultMessage);
-			if (!keepPendingCommands)
-			{
-				_armDelayedCommandQueue.Clear();
-				_armDelayedFaultMessage = string.Empty;
-			}
-
-			_armDelayedSessionActive = true;
-			_armDelayedSessionKind = sessionKind;
-			_armDelayedSessionLabel = string.IsNullOrWhiteSpace(sessionLabel) ? sessionKind.ToString() : sessionLabel;
-			return true;
-		}
-
-		private void CompleteArmDelayedSession()
-		{
-			_armDelayedCommandQueue.Clear();
-			_armDelayedSessionActive = false;
-			_armDelayedSessionKind = ArmDelayQueueSessionKind.None;
-			_armDelayedSessionLabel = string.Empty;
-			_armDelayedFaultMessage = string.Empty;
-		}
-
-		private void AbortArmDelayedSession(bool holdCurrentPose)
-		{
-			_armDelayedCommandQueue.Clear();
-			_armDelayedSessionActive = false;
-			_armDelayedSessionKind = ArmDelayQueueSessionKind.None;
-			_armDelayedSessionLabel = string.Empty;
-			_armDelayedFaultMessage = string.Empty;
-			if (holdCurrentPose && arm6DOFFKController != null)
-			{
-				arm6DOFFKController.HoldCurrentPose();
-			}
-		}
-
-		private void FailArmDelayedSession(string reason)
-		{
-			_armDelayedCommandQueue.Clear();
-			_armDelayedSessionActive = false;
-			_armDelayedSessionKind = ArmDelayQueueSessionKind.None;
-			_armDelayedFaultMessage = string.IsNullOrWhiteSpace(reason)
-				? "Delayed arm execution failed."
-				: reason;
-			if (arm6DOFFKController != null)
-			{
-				arm6DOFFKController.HoldCurrentPose();
-			}
-		}
-
-		private bool TryQueueDelayedArmTarget(float[] targetAnglesDeg, long sequenceId, out string error)
-		{
-			error = string.Empty;
-			if (!_armDelayedSessionActive)
-			{
-				error = "Delayed arm queue has no active session.";
-				return false;
-			}
-
-			if (!string.IsNullOrEmpty(_armDelayedFaultMessage))
-			{
-				error = _armDelayedFaultMessage;
-				return false;
-			}
-
-			float[] safeAngles = CloneAndClampArmTargets(targetAnglesDeg);
-			if (safeAngles == null)
-			{
-				error = "Delayed arm queue received invalid joint targets.";
-				return false;
-			}
-
-			_armDelayedCommandQueue.Enqueue(DelayedArmCommand.Create(
-				sequenceId,
-				Time.realtimeSinceStartup + BaseShadowLeadSeconds,
-				safeAngles));
-			return true;
-		}
-
-		private float[] CloneAndClampArmTargets(float[] targetAnglesDeg)
-		{
-			if (targetAnglesDeg == null || targetAnglesDeg.Length < 6 || arm6DOFFKController == null)
-			{
-				return null;
-			}
-
-			float[] safeAngles = (float[])targetAnglesDeg.Clone();
-			if (arm6DOFFKController.jointLimits == null)
-			{
-				return safeAngles;
-			}
-
-			for (int jointIndex = 0; jointIndex < Mathf.Min(6, arm6DOFFKController.jointLimits.Length); jointIndex++)
-			{
-				Vector2 limits = arm6DOFFKController.jointLimits[jointIndex];
-				safeAngles[jointIndex] = Mathf.Clamp(safeAngles[jointIndex], limits.x, limits.y);
-			}
-
-			return safeAngles;
 		}
 
 		private void EnterArmPreviewAtCurrentBasePose()
@@ -465,16 +347,15 @@ namespace RobotSimulation
 				return;
 			}
 
-			if (_manualPreviewSession != null && _manualPreviewSession.kind == ManualPreviewSessionKind.ArmWorldMove)
+			Debug.LogError($"[RobotSimulation] Shadow arm fault triggered emergency stop: {faultMessage}");
+			ClearArmDelayedCommandQueue(faultMessage, holdLivePose: true);
+			if (trajectoryPlanner != null)
 			{
-				Debug.LogError($"[RobotSimulation] {faultMessage}");
-				CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: true, reason: faultMessage);
-				return;
+				trajectoryPlanner.StopPlanning(emergencyStop: true);
 			}
-
-			if (_isArmMoveInProgress)
+			else
 			{
-				Debug.LogError($"[RobotSimulation] {faultMessage}");
+				EmergencyStop();
 			}
 		}
 
@@ -513,6 +394,7 @@ namespace RobotSimulation
 			}
 
 			SyncArmToCurrentBasePoseImmediate();
+			ApplyConfiguredHomeAsInitialArmState();
 			LogStartupCoordinatedDiagnosticsIfNeeded();
 			StartCoroutine(LogPostBindCoordinatedDiagnosticsAfterFirstFixedUpdate());
 
@@ -578,14 +460,16 @@ namespace RobotSimulation
 			trajectoryPlanner.Configure(this);
 			residualTracker.Configure(this);
 			onlineCalibration.Configure(residualTracker);
+			bool shadowBaseTwinReady = EnsureShadowBaseTwinRuntime();
+			bool shadowArmTwinReady = EnsureShadowArmTwinRuntime();
 			shadowRobotVisualizer.Configure(this);
 			shadowRobotVisualizer.SetVisualizationEnabled(enableShadowRobotVisualization);
-			bool shadowBaseTwinReady = EnsureShadowBaseTwinRuntime();
 			return trajectoryPlanner != null
 				&& residualTracker != null
 				&& onlineCalibration != null
 				&& shadowRobotVisualizer != null
-				&& shadowBaseTwinReady;
+				&& shadowBaseTwinReady
+				&& shadowArmTwinReady;
 		}
 
 		internal bool EnsureShadowBaseTwinRuntime()
@@ -625,6 +509,10 @@ namespace RobotSimulation
 			if (configured)
 			{
 				RefreshShadowRobotCollisionIgnores();
+			}
+			else if (!string.IsNullOrWhiteSpace(_shadowArmTwinRuntime.LastBindingReport))
+			{
+				Debug.LogError($"[RobotSimulation] {_shadowArmTwinRuntime.LastBindingReport}");
 			}
 
 			return configured;
@@ -721,6 +609,13 @@ namespace RobotSimulation
 			return _shadowBaseTwinRuntime != null ? _shadowBaseTwinRuntime.ShadowRoot : null;
 		}
 
+		internal Transform GetShadowBaseTwinMappedTransform(Transform liveTransform)
+		{
+			return _shadowBaseTwinRuntime != null
+				? _shadowBaseTwinRuntime.TryMapLiveTransformToShadow(liveTransform)
+				: null;
+		}
+
 		internal Transform GetShadowArmTwinRoot()
 		{
 			return _shadowArmTwinRuntime != null ? _shadowArmTwinRuntime.ShadowRoot : null;
@@ -728,7 +623,31 @@ namespace RobotSimulation
 
 		internal bool ShouldUseShadowArmTwinSource()
 		{
-			return false;
+			return _shadowArmTwinRuntime != null
+				&& _shadowArmTwinRuntime.ShouldDriveVisibleShadow
+				&& _shadowArmTwinRuntime.ShadowRoot != null;
+		}
+
+		internal void SyncShadowArmToLivePose()
+		{
+			if (!EnsureShadowArmTwinRuntime() || _shadowArmTwinRuntime == null)
+			{
+				return;
+			}
+
+			_shadowArmTwinRuntime.SyncToLivePose();
+			RefreshShadowRobotCollisionIgnores();
+		}
+
+		internal void ForceShadowArmToJointAngles(float[] anglesDeg, string reason)
+		{
+			if (!EnsureShadowArmTwinRuntime() || _shadowArmTwinRuntime == null)
+			{
+				return;
+			}
+
+			_shadowArmTwinRuntime.ForceToJointAngles(anglesDeg, reason);
+			RefreshShadowRobotCollisionIgnores();
 		}
 
 		internal bool BeginShadowBasePlannerSession(string label, IReadOnlyList<Collider> obstacles, float baseRadius, out string error)
@@ -745,17 +664,74 @@ namespace RobotSimulation
 
 		internal bool BeginShadowArmPlannerSession(string label, IReadOnlyList<Collider> obstacles, out string error)
 		{
-			return BeginArmDelayedSession(ArmDelayQueueSessionKind.Planner, label, false, out error);
+			return BeginShadowArmPlannerSession(label, obstacles, null, out error);
+		}
+
+		internal bool BeginShadowArmPlannerSession(string label, IReadOnlyList<Collider> obstacles, float[] initialAnglesDeg, out string error)
+		{
+			error = string.Empty;
+			EnsureShadowBaseTwinRuntime();
+			if (!EnsureShadowArmTwinRuntime() || _shadowArmTwinRuntime == null)
+			{
+				error = "Shadow arm twin runtime is unavailable.";
+				return false;
+			}
+
+			ClearArmDelayedCommandQueue($"Starting shadow arm planner session '{label}'.", holdLivePose: false);
+			bool started = _shadowArmTwinRuntime.BeginPlannerSession(label, obstacles, initialAnglesDeg, out error);
+			if (started)
+			{
+				RefreshShadowRobotCollisionIgnores();
+				EnterArmPreviewAtCurrentBasePose();
+			}
+
+			return started;
 		}
 
 		internal bool BeginManualShadowArmSession(string label, out string error)
 		{
-			return BeginArmDelayedSession(ArmDelayQueueSessionKind.Manual, label, false, out error);
+			return BeginManualShadowArmSession(label, null, out error);
+		}
+
+		internal bool BeginManualShadowArmSession(string label, float[] initialAnglesDeg, out string error)
+		{
+			error = string.Empty;
+			EnsureShadowBaseTwinRuntime();
+			if (!EnsureShadowArmTwinRuntime() || _shadowArmTwinRuntime == null)
+			{
+				error = "Shadow arm twin runtime is unavailable.";
+				return false;
+			}
+
+			ClearArmDelayedCommandQueue($"Starting manual shadow arm session '{label}'.", holdLivePose: false);
+			bool started = _shadowArmTwinRuntime.BeginManualSession(label, initialAnglesDeg, out error);
+			if (started)
+			{
+				RefreshShadowRobotCollisionIgnores();
+				EnterArmPreviewAtCurrentBasePose();
+			}
+
+			return started;
 		}
 
 		internal bool EnsureDirectShadowArmSession(out string error)
 		{
-			return BeginArmDelayedSession(ArmDelayQueueSessionKind.Direct, "DirectArmCommand", true, out error);
+			error = string.Empty;
+			EnsureShadowBaseTwinRuntime();
+			if (!EnsureShadowArmTwinRuntime() || _shadowArmTwinRuntime == null)
+			{
+				error = "Shadow arm twin runtime is unavailable.";
+				return false;
+			}
+
+			bool started = _shadowArmTwinRuntime.EnsureDirectCommandSession(out error);
+			if (started)
+			{
+				RefreshShadowRobotCollisionIgnores();
+				EnterArmPreviewAtCurrentBasePose();
+			}
+
+			return started;
 		}
 
 		internal void CompleteShadowBaseSession(bool resetShadowToLivePose = true)
@@ -765,7 +741,7 @@ namespace RobotSimulation
 
 		internal void CompleteShadowArmSession(bool resetShadowToLivePose = true)
 		{
-			CompleteArmDelayedSession();
+			_shadowArmTwinRuntime?.CompleteSession(resetShadowToLivePose);
 		}
 
 		internal void AbortShadowBaseSession(bool resetShadowToLivePose = true)
@@ -775,7 +751,8 @@ namespace RobotSimulation
 
 		internal void AbortShadowArmSession(bool resetShadowToLivePose = true)
 		{
-			AbortArmDelayedSession(holdCurrentPose: true);
+			ClearArmDelayedCommandQueue("Shadow arm session aborted.", holdLivePose: true);
+			_shadowArmTwinRuntime?.StopAndReset(resetShadowToLivePose);
 		}
 
 		internal void FailShadowBaseSession(string reason)
@@ -785,7 +762,8 @@ namespace RobotSimulation
 
 		internal void FailShadowArmSession(string reason)
 		{
-			FailArmDelayedSession(reason);
+			ClearArmDelayedCommandQueue(string.IsNullOrWhiteSpace(reason) ? "Shadow arm session failed." : reason, holdLivePose: true);
+			_shadowArmTwinRuntime?.FailSession(reason);
 		}
 
 		internal bool TryStartManualShadowBasePointLeadRun(Vector3 point, out string error)
@@ -850,12 +828,102 @@ namespace RobotSimulation
 
 		internal bool TryDispatchShadowArmTarget(float[] targetAnglesDeg, out string error)
 		{
-			return DispatchMirroredArmTarget(targetAnglesDeg, NextArmMirroredSequenceId(), out error);
+			long sequenceId = NextArmMirroredSequenceId();
+			if (!DispatchMirroredArmTarget(targetAnglesDeg, sequenceId, out error))
+			{
+				return false;
+			}
+
+			if (!QueueLiveShadowArmTargetReplica(targetAnglesDeg, sequenceId, out error))
+			{
+				FailShadowArmSession(error);
+				return false;
+			}
+
+			return true;
 		}
 
 		internal bool DispatchMirroredArmTarget(float[] targetAnglesDeg, long sequenceId, out string error)
 		{
-			return TryQueueDelayedArmTarget(targetAnglesDeg, sequenceId, out error);
+			error = string.Empty;
+			if (!EnsureShadowArmTwinRuntime() || _shadowArmTwinRuntime == null)
+			{
+				error = "Shadow arm twin runtime is unavailable.";
+				return false;
+			}
+
+			return _shadowArmTwinRuntime.DispatchTarget(targetAnglesDeg, sequenceId, out error);
+		}
+
+		internal bool QueueLiveShadowArmTargetReplica(float[] targetAnglesDeg, long sequenceId, out string error)
+		{
+			error = string.Empty;
+			if (!EnsureArmCoordinateControllers() || arm6DOFFKController == null)
+			{
+				error = "Live arm delayed replica queue is unavailable because the FK controller is missing.";
+				return false;
+			}
+
+			float[] safeAngles = CloneAndClampArmTargets(targetAnglesDeg);
+			if (safeAngles == null)
+			{
+				error = "Live arm delayed replica queue received invalid joint targets.";
+				return false;
+			}
+
+			float executeRealtime = Time.realtimeSinceStartup + BaseShadowLeadSeconds;
+			_armDelayedCommandQueue.Enqueue(DelayedArmCommand.Create(sequenceId, executeRealtime, safeAngles));
+			Debug.Log(
+				$"[ArmDebug][ArmLeadQueueEnqueue] seq={sequenceId}, lead={BaseShadowLeadSeconds:F3}s, executeAt={executeRealtime:F3}, " +
+				$"target={FormatArmAnglesForLog(safeAngles)}, pending={_armDelayedCommandQueue.Count}");
+			return true;
+		}
+
+		private void ClearArmDelayedCommandQueue(string reason, bool holdLivePose)
+		{
+			int droppedCount = _armDelayedCommandQueue.Count;
+			_armDelayedCommandQueue.Clear();
+			if (holdLivePose && arm6DOFFKController != null)
+			{
+				arm6DOFFKController.HoldCurrentPose();
+			}
+
+			if (droppedCount > 0)
+			{
+				Debug.LogWarning($"[ArmDebug][ArmLeadQueueClear] dropped={droppedCount}, holdLivePose={holdLivePose}, reason='{reason}'");
+			}
+		}
+
+		private float[] CloneAndClampArmTargets(float[] targetAnglesDeg)
+		{
+			if (targetAnglesDeg == null || targetAnglesDeg.Length < 6 || arm6DOFFKController == null)
+			{
+				return null;
+			}
+
+			float[] safeAngles = (float[])targetAnglesDeg.Clone();
+			if (arm6DOFFKController.jointLimits == null)
+			{
+				return safeAngles;
+			}
+
+			for (int jointIndex = 0; jointIndex < Mathf.Min(6, arm6DOFFKController.jointLimits.Length); jointIndex++)
+			{
+				Vector2 limits = arm6DOFFKController.jointLimits[jointIndex];
+				safeAngles[jointIndex] = Mathf.Clamp(safeAngles[jointIndex], limits.x, limits.y);
+			}
+
+			return safeAngles;
+		}
+
+		private static string FormatArmAnglesForLog(float[] anglesDeg)
+		{
+			if (anglesDeg == null || anglesDeg.Length < 6)
+			{
+				return "j[n/a]";
+			}
+
+			return $"j[{anglesDeg[0]:F3},{anglesDeg[1]:F3},{anglesDeg[2]:F3},{anglesDeg[3]:F3},{anglesDeg[4]:F3},{anglesDeg[5]:F3}]";
 		}
 
 		internal bool TryGetShadowBaseSessionFault(out string faultMessage)
@@ -872,9 +940,9 @@ namespace RobotSimulation
 
 		internal bool TryGetShadowArmSessionFault(out string faultMessage)
 		{
-			if (!string.IsNullOrEmpty(_armDelayedFaultMessage))
+			if (_shadowArmTwinRuntime != null && _shadowArmTwinRuntime.HasFault)
 			{
-				faultMessage = _armDelayedFaultMessage;
+				faultMessage = _shadowArmTwinRuntime.FaultMessage;
 				return true;
 			}
 
@@ -889,11 +957,17 @@ namespace RobotSimulation
 
 		internal bool HasPendingShadowArmLiveCommands()
 		{
-			return _armDelayedCommandQueue.Count > 0;
+			return _armDelayedCommandQueue.Count > 0
+				|| (_shadowArmTwinRuntime != null && _shadowArmTwinRuntime.HasPendingLiveCommands);
 		}
 
 		internal bool IsShadowArmNearTarget(float[] targetAnglesDeg, float toleranceDeg = 1f)
 		{
+			if (_shadowArmTwinRuntime != null && _shadowArmTwinRuntime.IsReady)
+			{
+				return _shadowArmTwinRuntime.AreShadowJointAnglesNear(targetAnglesDeg, toleranceDeg);
+			}
+
 			return !HasPendingShadowArmLiveCommands();
 		}
 
@@ -936,6 +1010,128 @@ namespace RobotSimulation
 			return true;
 		}
 
+		private bool TryBuildMirroredJointPreviewPlan(
+			float[] targetAnglesDeg,
+			out ArmTrajectoryPreviewPlan previewPlan,
+			out string error)
+		{
+			previewPlan = null;
+			error = string.Empty;
+			if (arm6DOFFKController == null || targetAnglesDeg == null || targetAnglesDeg.Length < 6)
+			{
+				error = "Cannot build joint preview plan because the FK controller or target angles are missing.";
+				return false;
+			}
+
+			float[] startAnglesDeg = arm6DOFFKController.CaptureMeasuredJointAngles();
+			if (arm6DOFFKController.EvaluateMotionCollision(startAnglesDeg, targetAnglesDeg, out ArmCollisionGuardResult guardResult))
+			{
+				_lastArmCollisionGuardResult = guardResult;
+				error = string.IsNullOrEmpty(guardResult.message)
+					? "Joint preview plan was blocked by the collision guard."
+					: guardResult.message;
+				return false;
+			}
+
+			float maxDeltaDeg = 0f;
+			for (int jointIndex = 0; jointIndex < 6; jointIndex++)
+			{
+				maxDeltaDeg = Mathf.Max(maxDeltaDeg, Mathf.Abs(Mathf.DeltaAngle(startAnglesDeg[jointIndex], targetAnglesDeg[jointIndex])));
+			}
+
+			int sampleCount = Mathf.Clamp(Mathf.CeilToInt(maxDeltaDeg / 4f), 1, 64);
+			List<RobotPlanJointSample> samples = new List<RobotPlanJointSample>(sampleCount);
+			float previousTimeSeconds = 0f;
+			float[] previousAngles = (float[])startAnglesDeg.Clone();
+			for (int sampleIndex = 1; sampleIndex <= sampleCount; sampleIndex++)
+			{
+				float t = sampleIndex / (float)sampleCount;
+				float[] sampleAngles = new float[6];
+				for (int jointIndex = 0; jointIndex < 6; jointIndex++)
+				{
+					sampleAngles[jointIndex] = Mathf.LerpAngle(startAnglesDeg[jointIndex], targetAnglesDeg[jointIndex], t);
+				}
+
+				if (arm6DOFFKController.EvaluateMotionCollision(previousAngles, sampleAngles, out guardResult))
+				{
+					_lastArmCollisionGuardResult = guardResult;
+					error = string.IsNullOrEmpty(guardResult.message)
+						? "Joint preview sample was blocked by the collision guard."
+						: guardResult.message;
+					return false;
+				}
+
+				previousTimeSeconds += EstimateArmJointSegmentSeconds(previousAngles, sampleAngles);
+				samples.Add(new RobotPlanJointSample
+				{
+					timeSeconds = previousTimeSeconds,
+					jointAnglesDeg = sampleAngles,
+					clearance = 1f,
+					singularityPenalty = 0f
+				});
+				previousAngles = sampleAngles;
+			}
+
+			Vector3 finalWorldPosition = ComputeWorldEndEffectorPosition(targetAnglesDeg);
+			previewPlan = new ArmTrajectoryPreviewPlan
+			{
+				request = new ArmMoveRequest
+				{
+					worldPosition = finalWorldPosition,
+					positionToleranceMeters = 0.05f,
+					stableFixedFrames = 2,
+					timeoutSeconds = Mathf.Max(2f, previousTimeSeconds + BaseShadowLeadSeconds + 2f),
+					speedScale = 1f
+				},
+				samples = samples,
+				planningResult = new ArmMoveResult
+				{
+					accepted = true,
+					success = false,
+					targetWorldPosition = finalWorldPosition,
+					iterations = samples.Count,
+					summary = "Joint target preview plan generated."
+				},
+				totalDurationSeconds = previousTimeSeconds
+			};
+			return true;
+		}
+
+		private float EstimateArmJointSegmentSeconds(float[] startAnglesDeg, float[] targetAnglesDeg)
+		{
+			float worstSeconds = 0.02f;
+			for (int jointIndex = 0; jointIndex < 6; jointIndex++)
+			{
+				float maxSpeedDegPerSecond = 60f;
+				if (arm6DOFFKController != null
+					&& arm6DOFFKController.coordinatedJointControllers != null
+					&& jointIndex < arm6DOFFKController.coordinatedJointControllers.Length
+					&& arm6DOFFKController.coordinatedJointControllers[jointIndex] != null)
+				{
+					maxSpeedDegPerSecond = Mathf.Max(1f, arm6DOFFKController.coordinatedJointControllers[jointIndex].vMaxDeg);
+				}
+
+				float startDeg = startAnglesDeg != null && startAnglesDeg.Length > jointIndex ? startAnglesDeg[jointIndex] : 0f;
+				float targetDeg = targetAnglesDeg != null && targetAnglesDeg.Length > jointIndex ? targetAnglesDeg[jointIndex] : startDeg;
+				float jointDeltaDeg = Mathf.Abs(Mathf.DeltaAngle(startDeg, targetDeg));
+				worstSeconds = Mathf.Max(worstSeconds, (jointDeltaDeg / maxSpeedDegPerSecond) * 1.2f);
+			}
+
+			return Mathf.Max(0.02f, worstSeconds);
+		}
+
+		private Vector3 ComputeWorldEndEffectorPosition(float[] jointAnglesDeg)
+		{
+			if (arm6DOFFKController == null || jointAnglesDeg == null || jointAnglesDeg.Length < 6)
+			{
+				return Vector3.zero;
+			}
+
+			Pose poseBase = arm6DOFFKController.ForwardPoe(jointAnglesDeg);
+			Transform baseFrame = arm6DOFFKController.BaseFrameTransform;
+			return baseFrame != null ? baseFrame.TransformPoint(poseBase.position) : poseBase.position;
+		}
+
 		private Coroutine StartMirroredArmPlanExecution(
 			string sessionLabel,
 			ArmTrajectoryPreviewPlan previewPlan,
@@ -961,12 +1157,12 @@ namespace RobotSimulation
 			{
 				if (arm6DOFFKController == null)
 				{
-					arm6DOFFKController = FindObjectOfType<Arm6DOFFKController>();
+					arm6DOFFKController = FindLiveSceneComponent<Arm6DOFFKController>();
 				}
 
 				if (arm6DOFIKController == null)
 				{
-					arm6DOFIKController = FindObjectOfType<Arm6DOFIKController>();
+					arm6DOFIKController = FindLiveSceneComponent<Arm6DOFIKController>();
 				}
 
 				if (arm6DOFFKController == null || arm6DOFIKController == null)
@@ -1199,12 +1395,12 @@ namespace RobotSimulation
 
 			if (arm6DOFFKController == null)
 			{
-				arm6DOFFKController = FindObjectOfType<Arm6DOFFKController>();
+				arm6DOFFKController = FindLiveSceneComponent<Arm6DOFFKController>();
 			}
 
 			if (arm6DOFIKController == null)
 			{
-				arm6DOFIKController = FindObjectOfType<Arm6DOFIKController>();
+				arm6DOFIKController = FindLiveSceneComponent<Arm6DOFIKController>();
 			}
 
 			if (armCollisionMonitor == null)
@@ -1262,6 +1458,7 @@ namespace RobotSimulation
 			}
 
 			List<KeyValuePair<int, OneJointTrapezoidController>> mapped = new List<KeyValuePair<int, OneJointTrapezoidController>>();
+			List<OneJointTrapezoidController> liveCandidates = new List<OneJointTrapezoidController>();
 			for (int i = 0; i < controllers.Length; i++)
 			{
 				OneJointTrapezoidController ctrl = controllers[i];
@@ -1270,6 +1467,12 @@ namespace RobotSimulation
 					continue;
 				}
 
+				if (!IsLiveArmJointController(ctrl))
+				{
+					continue;
+				}
+
+				liveCandidates.Add(ctrl);
 				int ordinal = ExtractTrailingNumber(ctrl.joint.name);
 				if (ordinal <= 0)
 				{
@@ -1304,8 +1507,93 @@ namespace RobotSimulation
 				return ordered.ToArray();
 			}
 
-			Debug.LogWarning("[RobotSimulation] No valid OneJointTrapezoidController with assigned DOF joint was found after filtering.");
-			return controllers;
+			if (liveCandidates.Count > 0)
+			{
+				Debug.LogWarning("[RobotSimulation] Arm joint controllers were filtered to live-arm controllers, but could not be ordered by joint suffix.");
+				return liveCandidates.ToArray();
+			}
+
+			Debug.LogWarning("[RobotSimulation] No valid live-arm OneJointTrapezoidController with assigned DOF joint was found after filtering.");
+			return liveCandidates.ToArray();
+		}
+
+		private T FindLiveSceneComponent<T>() where T : Component
+		{
+			T[] components = FindObjectsOfType<T>();
+			for (int i = 0; i < components.Length; i++)
+			{
+				T component = components[i];
+				if (component != null && !IsRuntimeShadowTransform(component.transform))
+				{
+					return component;
+				}
+			}
+
+			return null;
+		}
+
+		private bool IsLiveArmJointController(OneJointTrapezoidController controller)
+		{
+			if (controller == null)
+			{
+				return false;
+			}
+
+			Transform controllerTransform = controller.transform;
+			Transform jointTransform = controller.joint != null ? controller.joint.transform : null;
+			if (IsRuntimeShadowTransform(controllerTransform) || IsRuntimeShadowTransform(jointTransform))
+			{
+				return false;
+			}
+
+			Transform liveArmRoot = armBinder != null && armBinder.armRoot != null
+				? armBinder.armRoot.transform
+				: null;
+			if (liveArmRoot == null && arm6DOFFKController != null && arm6DOFFKController.armHierarchyRoot != null)
+			{
+				liveArmRoot = arm6DOFFKController.armHierarchyRoot;
+			}
+
+			if (liveArmRoot == null)
+			{
+				return true;
+			}
+
+			bool controllerUnderLiveArm = controllerTransform != null && controllerTransform.IsChildOf(liveArmRoot);
+			bool jointUnderLiveArm = jointTransform != null && jointTransform.IsChildOf(liveArmRoot);
+			return controllerUnderLiveArm || jointUnderLiveArm;
+		}
+
+		private bool IsRuntimeShadowTransform(Transform transform)
+		{
+			if (transform == null)
+			{
+				return false;
+			}
+
+			Transform shadowArmRoot = GetShadowArmTwinRoot();
+			if (shadowArmRoot != null && transform.IsChildOf(shadowArmRoot))
+			{
+				return true;
+			}
+
+			Transform shadowBaseRoot = GetShadowBaseTwinRoot();
+			if (shadowBaseRoot != null && transform.IsChildOf(shadowBaseRoot))
+			{
+				return true;
+			}
+
+			for (Transform current = transform; current != null; current = current.parent)
+			{
+				if (current.name.StartsWith("Preview_ShadowArmTwin_", System.StringComparison.Ordinal)
+					|| current.name.StartsWith("Preview_ShadowBaseTwin_", System.StringComparison.Ordinal)
+					|| current.name == "ShadowRobotVisual")
+				{
+					return true;
+				}
+			}
+
+			return false;
 		}
 
 		private int ExtractTrailingNumber(string value)
@@ -1528,7 +1816,7 @@ namespace RobotSimulation
 
 			StopDirectArmLeadRunWatcher();
 			arm6DOFIKController?.StopCurrentMove(false);
-			AbortShadowArmSession(resetShadowToLivePose: true);
+			AbortShadowArmSession(resetShadowToLivePose: false);
 
 			point.y = diffDriveController.rb.position.y;
 			if (!TryStartManualShadowBasePointLeadRun(point, out string shadowStartError))
@@ -1578,7 +1866,7 @@ namespace RobotSimulation
 
 			StopDirectArmLeadRunWatcher();
 			arm6DOFIKController?.StopCurrentMove(false);
-			AbortShadowArmSession(resetShadowToLivePose: true);
+			AbortShadowArmSession(resetShadowToLivePose: false);
 			if (!TryStartManualShadowBaseYawLeadRun(yawDeg, out string shadowStartError))
 			{
 				Debug.LogError($"[RobotSimulation] {shadowStartError}");
@@ -1632,9 +1920,9 @@ namespace RobotSimulation
 
 			StopDirectArmLeadRunWatcher();
 			arm6DOFIKController.StopCurrentMove(false);
-			AbortShadowArmSession(resetShadowToLivePose: true);
+			AbortShadowArmSession(resetShadowToLivePose: false);
 
-			if (!arm6DOFIKController.TryBuildPreviewPlan(request, out ArmTrajectoryPreviewPlan previewPlan))
+			if (!TryBuildCoordinatedArmPreviewPlan(request, out ArmTrajectoryPreviewPlan previewPlan))
 			{
 				_lastArmMoveResult = previewPlan != null ? previewPlan.planningResult : new ArmMoveResult();
 				_lastArmCollisionGuardResult = arm6DOFIKController.LastCollisionGuardResult;
@@ -1668,6 +1956,48 @@ namespace RobotSimulation
 				diffDriveController != null && diffDriveController.rb != null ? diffDriveController.rb.position : Vector3.zero,
 				diffDriveController != null && diffDriveController.rb != null ? diffDriveController.rb.rotation : Quaternion.identity);
 			return true;
+		}
+
+		private bool TryBuildCoordinatedArmPreviewPlan(ArmMoveRequest request, out ArmTrajectoryPreviewPlan previewPlan)
+		{
+			previewPlan = null;
+			if (!EnsurePlanningSupportComponents() || trajectoryPlanner == null)
+			{
+				previewPlan = new ArmTrajectoryPreviewPlan
+				{
+					request = request ?? new ArmMoveRequest(),
+					planningResult = new ArmMoveResult
+					{
+						accepted = false,
+						success = false,
+						targetWorldPosition = request != null ? request.worldPosition : Vector3.zero,
+						summary = RobotSimulationLocalization.Text(
+							"协同机械臂规划器不可用。",
+							"Coordinated arm planner is not available.")
+					}
+				};
+				return false;
+			}
+
+			bool planned = trajectoryPlanner.TryBuildCoordinatedArmPreviewPlan(
+				request,
+				out previewPlan,
+				out ShadowValidationResult validationResult);
+			_lastShadowValidationResult = validationResult ?? new ShadowValidationResult();
+			if (!planned)
+			{
+				_lastPlanningSummary = previewPlan != null && previewPlan.planningResult != null
+					? previewPlan.planningResult.summary
+					: RobotSimulationLocalization.Text("协同机械臂规划失败。", "Coordinated arm planning failed.");
+			}
+			else
+			{
+				_lastPlanningSummary = previewPlan != null && previewPlan.planningResult != null
+					? previewPlan.planningResult.summary
+					: RobotSimulationLocalization.Text("协同机械臂规划完成。", "Coordinated arm planning completed.");
+			}
+
+			return planned;
 		}
 
 		public void SetTargetPoint(Vector3 point)
@@ -1713,17 +2043,11 @@ namespace RobotSimulation
 			arm6DOFIKController?.StopCurrentMove(false);
 			if (hadArmExecutionRoutine)
 			{
-				AbortShadowArmSession(resetShadowToLivePose: true);
+				AbortShadowArmSession(resetShadowToLivePose: false);
 			}
 
 			if (!EnsureArmCoordinateControllers() || arm6DOFFKController == null)
 			{
-				return false;
-			}
-
-			if (!EnsureDirectShadowArmSession(out string sessionError))
-			{
-				Debug.LogError($"[RobotSimulation] {sessionError}");
 				return false;
 			}
 
@@ -1743,17 +2067,25 @@ namespace RobotSimulation
 
 			_lastArmCollisionGuardResult = guardResult;
 			EnterArmPreviewAtCurrentBasePose();
-			shadowRobotVisualizer?.ApplyManualArmPreviewAngles(targetAnglesDeg, BaseShadowLeadSeconds);
-			if (!DispatchMirroredArmTarget(targetAnglesDeg, NextArmMirroredSequenceId(), out string dispatchError))
+			if (!TryBuildMirroredJointPreviewPlan(targetAnglesDeg, out ArmTrajectoryPreviewPlan previewPlan, out string planError))
 			{
-				Debug.LogError($"[RobotSimulation] {dispatchError}");
-				AbortShadowArmSession(resetShadowToLivePose: true);
+				Debug.LogError($"[RobotSimulation] {planError}");
 				shadowRobotVisualizer?.ReturnToMirror();
 				return false;
 			}
 
-			RestartDirectArmLeadRunWatcher(targetAnglesDeg);
-			return true;
+			_lastArmMoveResult = previewPlan.planningResult;
+			_isArmMoveInProgress = true;
+			return StartMirroredArmPlanExecution("DirectJointMove", previewPlan, result =>
+			{
+				_lastArmMoveResult = result;
+				_lastArmCollisionGuardResult = result != null
+					? result.collisionGuardResult ?? _lastArmCollisionGuardResult
+					: _lastArmCollisionGuardResult;
+				_isArmMoveInProgress = false;
+				_armMoveRoutine = null;
+				shadowRobotVisualizer?.ReturnToMirror();
+			}) != null;
 		}
 
 		/// <summary>
@@ -1805,8 +2137,8 @@ namespace RobotSimulation
 			}
 
 			StopDirectArmLeadRunWatcher();
-			AbortShadowArmSession(resetShadowToLivePose: true);
-			if (!arm6DOFIKController.TryBuildPreviewPlan(request, out ArmTrajectoryPreviewPlan previewPlan))
+			AbortShadowArmSession(resetShadowToLivePose: false);
+			if (!TryBuildCoordinatedArmPreviewPlan(request, out ArmTrajectoryPreviewPlan previewPlan))
 			{
 				_lastArmMoveResult = previewPlan != null ? previewPlan.planningResult : new ArmMoveResult
 				{
@@ -1864,7 +2196,7 @@ namespace RobotSimulation
 			}
 
 			StopDirectArmLeadRunWatcher();
-			AbortShadowArmSession(resetShadowToLivePose: true);
+			AbortShadowArmSession(resetShadowToLivePose: false);
 			if (arm6DOFIKController != null)
 			{
 				arm6DOFIKController.StopCurrentMove(emergencyStopArm);
@@ -1982,7 +2314,7 @@ namespace RobotSimulation
 			_armWorldCoordinateCommandIssuedSinceUnlock = true;
 			session.state = ManualPreviewSessionState.Executing;
 			_manualPreviewState = session.state;
-			_manualPreviewSummary = $"Shadow arm started; live arm will follow after {BaseShadowLeadSeconds:F2}s.";
+			_manualPreviewSummary = "Shadow arm and live arm are executing independent copies of the same arm plan; shadow collision will emergency-stop all motion.";
 			StartMirroredArmPlanExecution("ManualArmPreview", session.armPreviewPlan, result =>
 			{
 				if (_manualPreviewSession == null || _manualPreviewSession.version != version)
@@ -2028,7 +2360,10 @@ namespace RobotSimulation
 				targetWorldPosition = safeRequest.worldPosition
 			};
 
-			if (!BeginManualShadowArmSession(string.IsNullOrWhiteSpace(sessionLabel) ? "ManualArmLeadRun" : sessionLabel, out string sessionError))
+			float[] sessionInitialAngles = arm6DOFFKController != null
+				? arm6DOFFKController.CaptureMeasuredJointAngles()
+				: null;
+			if (!BeginManualShadowArmSession(string.IsNullOrWhiteSpace(sessionLabel) ? "ManualArmLeadRun" : sessionLabel, sessionInitialAngles, out string sessionError))
 			{
 				result.success = false;
 				result.summary = sessionError;
@@ -2043,7 +2378,7 @@ namespace RobotSimulation
 			{
 				result.success = false;
 				result.summary = "Arm preview plan is empty.";
-				CompleteShadowArmSession(resetShadowToLivePose: true);
+				CompleteShadowArmSession(resetShadowToLivePose: false);
 				_lastArmMoveResult = result;
 				_isArmMoveInProgress = false;
 				_armMoveRoutine = null;
@@ -2080,6 +2415,15 @@ namespace RobotSimulation
 					break;
 				}
 
+				if (TryGetShadowArmSessionFault(out string shadowFaultMessage))
+				{
+					result.collided = true;
+					result.success = false;
+					result.collisionMessage = shadowFaultMessage;
+					result.summary = shadowFaultMessage;
+					break;
+				}
+
 				while (sampleIndex < plannedSamples.Count && trajectoryElapsed + 1e-4f >= plannedSamples[sampleIndex].timeSeconds)
 				{
 					RobotPlanJointSample sample = plannedSamples[sampleIndex];
@@ -2099,7 +2443,8 @@ namespace RobotSimulation
 					}
 
 					shadowRobotVisualizer?.ApplyManualArmPreviewSample(sample, BaseShadowLeadSeconds);
-					if (!DispatchMirroredArmTarget(nextAngles, NextArmMirroredSequenceId(), out string dispatchError))
+					long armSequenceId = NextArmMirroredSequenceId();
+					if (!DispatchMirroredArmTarget(nextAngles, armSequenceId, out string dispatchError))
 					{
 						result.success = false;
 						result.summary = dispatchError;
@@ -2107,6 +2452,13 @@ namespace RobotSimulation
 						break;
 					}
 
+					if (!QueueLiveShadowArmTargetReplica(nextAngles, armSequenceId, out string queueError))
+					{
+						result.success = false;
+						result.summary = queueError;
+						FailShadowArmSession(queueError);
+						break;
+					}
 					lastCommandedAngles = nextAngles != null ? (float[])nextAngles.Clone() : lastCommandedAngles;
 					sampleIndex++;
 				}
@@ -2162,7 +2514,7 @@ namespace RobotSimulation
 				}
 			}
 
-			CompleteShadowArmSession(resetShadowToLivePose: true);
+			CompleteShadowArmSession(resetShadowToLivePose: false);
 			_lastArmMoveResult = result;
 			_isArmMoveInProgress = false;
 			_armMoveRoutine = null;
@@ -2208,14 +2560,14 @@ namespace RobotSimulation
 				bool liveSettled = arm6DOFFKController != null && arm6DOFFKController.AreJointAnglesNear(targetAnglesDeg, 1.5f);
 				if (liveSettled)
 				{
-					CompleteShadowArmSession(resetShadowToLivePose: true);
+					CompleteShadowArmSession(resetShadowToLivePose: false);
 					shadowRobotVisualizer?.ReturnToMirror();
 					_armDirectLeadRunWatcher = null;
 					yield break;
 				}
 			}
 
-			CompleteShadowArmSession(resetShadowToLivePose: true);
+			CompleteShadowArmSession(resetShadowToLivePose: false);
 			shadowRobotVisualizer?.ReturnToMirror();
 			_armDirectLeadRunWatcher = null;
 		}
@@ -2274,7 +2626,7 @@ namespace RobotSimulation
 
 			if (previousArmLeadRun)
 			{
-				AbortShadowArmSession(resetShadowToLivePose: true);
+				AbortShadowArmSession(resetShadowToLivePose: false);
 			}
 
 			if (stopBaseMotion && diffDriveController != null)
@@ -2319,7 +2671,7 @@ namespace RobotSimulation
 		private void CompleteManualPreviewSession(string summary)
 		{
 			CompleteShadowBaseSession(resetShadowToLivePose: true);
-			CompleteShadowArmSession(resetShadowToLivePose: true);
+			CompleteShadowArmSession(resetShadowToLivePose: false);
 			_manualPreviewSession = null;
 			_manualPreviewKind = ManualPreviewSessionKind.None;
 			_manualPreviewState = ManualPreviewSessionState.Completed;
@@ -2339,7 +2691,7 @@ namespace RobotSimulation
 
 			StopDirectArmLeadRunWatcher();
 			arm6DOFIKController?.StopCurrentMove(false);
-			AbortShadowArmSession(resetShadowToLivePose: true);
+			AbortShadowArmSession(resetShadowToLivePose: false);
 
 			if (!Application.isPlaying)
 			{
@@ -2386,7 +2738,7 @@ namespace RobotSimulation
 
 			StopDirectArmLeadRunWatcher();
 			arm6DOFIKController?.StopCurrentMove(false);
-			AbortShadowArmSession(resetShadowToLivePose: true);
+			AbortShadowArmSession(resetShadowToLivePose: false);
 
 			if (!Application.isPlaying)
 			{
@@ -2547,6 +2899,25 @@ namespace RobotSimulation
 		public bool IsArmPositionReachable(Vector3 position)
 		{
 			EnsureArmCoordinateControllers();
+			if (Application.isPlaying
+				&& EnsurePlanningSupportComponents()
+				&& trajectoryPlanner != null)
+			{
+				bool reachable = trajectoryPlanner.TryBuildCoordinatedArmPreviewPlan(
+					new ArmMoveRequest
+					{
+						worldPosition = position,
+						positionToleranceMeters = arm6DOFIKController != null ? Mathf.Max(0.001f, arm6DOFIKController.tolerance) : 0.01f,
+						stableFixedFrames = 1,
+						timeoutSeconds = 5f,
+						speedScale = 1f
+					},
+					out _,
+					out ShadowValidationResult validationResult);
+				_lastShadowValidationResult = validationResult;
+				return reachable;
+			}
+
 			if (arm6DOFIKController != null)
 			{
 				return arm6DOFIKController.IsPositionReachable(position);
@@ -2560,6 +2931,30 @@ namespace RobotSimulation
 		public string GetArmReachabilityInfo(Vector3 position)
 		{
 			EnsureArmCoordinateControllers();
+			if (Application.isPlaying && EnsurePlanningSupportComponents() && trajectoryPlanner != null)
+			{
+				bool reachable = trajectoryPlanner.TryBuildCoordinatedArmPreviewPlan(
+					new ArmMoveRequest
+					{
+						worldPosition = position,
+						positionToleranceMeters = arm6DOFIKController != null ? Mathf.Max(0.001f, arm6DOFIKController.tolerance) : 0.01f,
+						stableFixedFrames = 1,
+						timeoutSeconds = 5f,
+						speedScale = 1f
+					},
+					out ArmTrajectoryPreviewPlan previewPlan,
+					out ShadowValidationResult validationResult);
+				_lastShadowValidationResult = validationResult;
+				string summary = previewPlan != null && previewPlan.planningResult != null
+					? previewPlan.planningResult.summary
+					: validationResult != null
+						? validationResult.message
+						: string.Empty;
+				return reachable
+					? $"Coordinated planner reachability: REACHABLE. {summary}"
+					: $"Coordinated planner reachability: OUT OF REACH. {summary}";
+			}
+
 			if (arm6DOFIKController != null)
 			{
 				return arm6DOFIKController.GetReachabilityInfo(position);
@@ -2578,6 +2973,8 @@ namespace RobotSimulation
 		public bool TryMoveArmHome()
 		{
 			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: true, reason: "Manual preview cancelled by Go Home.");
+			StopDirectArmLeadRunWatcher();
+			AbortShadowArmSession(resetShadowToLivePose: false);
 
 			if (!EnsureArmCoordinateControllers() || arm6DOFFKController == null)
 			{
@@ -2588,6 +2985,7 @@ namespace RobotSimulation
 			_lastArmCollisionGuardResult = arm6DOFFKController.LastCollisionGuardResult;
 			if (success)
 			{
+				ForceShadowArmToJointAngles(arm6DOFFKController.configuredHomeJointAnglesDeg, "GoHome target");
 				if (_armHomeUnlockRoutine != null)
 				{
 					StopCoroutine(_armHomeUnlockRoutine);
@@ -2809,6 +3207,7 @@ namespace RobotSimulation
 					if (stableFrames >= requiredStableFrames)
 					{
 						ClearArmWorldCoordinateMotionLock("Unlocked after returning to Home.");
+						SyncShadowArmToLivePose();
 						_armHomeUnlockRoutine = null;
 						yield break;
 					}
@@ -2820,6 +3219,7 @@ namespace RobotSimulation
 			}
 
 			_armHomeUnlockRoutine = null;
+			SyncShadowArmToLivePose();
 		}
 
 		private bool IsArmNearConfiguredHome(float toleranceDeg)
@@ -2855,7 +3255,7 @@ namespace RobotSimulation
 
 			StopDirectArmLeadRunWatcher();
 			AbortShadowBaseSession(resetShadowToLivePose: true);
-			AbortShadowArmSession(resetShadowToLivePose: true);
+			AbortShadowArmSession(resetShadowToLivePose: false);
 
 			if (diffDriveController != null)
 			{
@@ -2882,7 +3282,7 @@ namespace RobotSimulation
 
 			StopDirectArmLeadRunWatcher();
 			AbortShadowBaseSession(resetShadowToLivePose: true);
-			AbortShadowArmSession(resetShadowToLivePose: true);
+			AbortShadowArmSession(resetShadowToLivePose: false);
 
 			if (diffDriveController?.rb != null)
 			{
@@ -2898,6 +3298,7 @@ namespace RobotSimulation
 			RebindArmToCarMountImmediately();
 
 			ClearTarget();
+			ApplyConfiguredHomeAsInitialArmState();
 			_simulationTime = 0f;
 		}
 
@@ -2948,6 +3349,30 @@ namespace RobotSimulation
 			{
 				arm6DOFFKController.RefreshRuntimeState();
 			}
+		}
+
+		private void ApplyConfiguredHomeAsInitialArmState()
+		{
+			if (arm6DOFFKController == null
+				|| arm6DOFFKController.configuredHomeJointAnglesDeg == null
+				|| arm6DOFFKController.configuredHomeJointAnglesDeg.Length < 6)
+			{
+				return;
+			}
+
+			arm6DOFFKController.ApplyAllJointTargetsRaw(arm6DOFFKController.configuredHomeJointAnglesDeg);
+			arm6DOFFKController.RefreshRuntimeState();
+			ForceShadowArmToJointAngles(arm6DOFFKController.configuredHomeJointAnglesDeg, "Initial configured Home target");
+			_lastArmCollisionGuardResult = arm6DOFFKController.LastCollisionGuardResult;
+			_lastArmMoveResult = new ArmMoveResult
+			{
+				accepted = true,
+				success = true,
+				targetWorldPosition = arm6DOFFKController.EndEffectorWorldPosition,
+				finalWorldPosition = arm6DOFFKController.EndEffectorWorldPosition,
+				finalPositionError = 0f,
+				summary = "Initial arm state set to configured Home."
+			};
 		}
 
 		private void LogStartupCoordinatedDiagnosticsIfNeeded()

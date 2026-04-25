@@ -13,6 +13,7 @@ namespace RobotSimulation
 		public static readonly float[] DefaultConfiguredHomeJointAnglesDeg = { 0f, 0f, 150f, -30f, 90f, 0f };
 
 		public static Arm6DOFFKController Instance { get; private set; }
+		internal static bool SuppressInstanceRegistrationForShadowClone { get; set; }
 
 		[Header("Joint Configuration")]
 		public ArticulationBody[] joints = new ArticulationBody[6];
@@ -86,6 +87,11 @@ namespace RobotSimulation
 
 		private void Awake()
 		{
+			if (SuppressInstanceRegistrationForShadowClone)
+			{
+				return;
+			}
+
 			if (Instance == null)
 			{
 				Instance = this;

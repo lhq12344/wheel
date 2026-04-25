@@ -328,8 +328,8 @@ namespace RobotSimulation.Editor
 						_armStableFrames = EditorGUILayout.IntField(T("稳定帧数", "Stable Frames"), _armStableFrames);
 						_armTimeoutSeconds = EditorGUILayout.FloatField(T("超时时间", "Timeout Seconds"), _armTimeoutSeconds);
 						_armMoveSpeedScale = EditorGUILayout.Slider(T("Move And Wait 速度", "Move And Wait Speed"), _armMoveSpeedScale, 0.1f, 3f);
-						EditorGUILayout.LabelField(T("Move To World Position：只发起一次 IK，不等待是否真正到位。", "Move To World Position: only starts IK once, does not wait for arrival."));
-						EditorGUILayout.LabelField(T("Move And Wait：持续驱动末端到目标，并监控到位/碰撞/超时。", "Move And Wait: keeps driving toward the target and monitors arrival/collision/timeout."));
+						EditorGUILayout.LabelField(T("Move To World Position：使用整机协同规划中的机械臂轨迹方案进行影子预演后执行。", "Move To World Position: uses the coordinated planner arm-trajectory scheme, then executes after shadow preview."));
+						EditorGUILayout.LabelField(T("Move And Wait：使用同一协同机械臂方案，并监控到位/碰撞/超时。", "Move And Wait: uses the same coordinated arm scheme and monitors arrival/collision/timeout."));
 						if (_manager.arm6DOFFKController != null && _manager.arm6DOFFKController.KinematicsReady)
 						{
 							Vector3 targetBase = _manager.arm6DOFFKController.WorldToBasePosition(_armTargetPosition);
@@ -386,8 +386,9 @@ namespace RobotSimulation.Editor
 						{
 							if (_manager != null)
 							{
-								bool reachable = _manager.IsArmPositionReachable(_armTargetPosition);
-								Debug.Log(T($"位置 {_armTargetPosition} {(reachable ? "可达" : "不可达")}", $"Position {_armTargetPosition} is {(reachable ? "REACHABLE" : "OUT OF REACH")}"));
+								string reachabilityInfo = _manager.GetArmReachabilityInfo(_armTargetPosition);
+								_armMoveSummary = reachabilityInfo;
+								Debug.Log(reachabilityInfo);
 							}
 						}
 						EditorGUILayout.EndHorizontal();

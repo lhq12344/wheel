@@ -660,17 +660,17 @@ public class DiffDriveTwinController : MonoBehaviour
 				break;
 
 			case PointGoalPhase.Brake:
-			{
-				float remainingForBrake = Mathf.Max(0f, dist - arrivalDistance);
-				float brakeEnvelope = Mathf.Sqrt(Mathf.Max(0f, 2f * aMax * remainingForBrake));
-				float headingScale = Mathf.Max(brakeHeadingFloor, Mathf.Clamp01(Mathf.Cos(yawError)));
-				vTarget = Mathf.Min(vMax, brakeEnvelope) * headingScale;
-				if (remainingForBrake > 0.15f && headingScale > 0.25f)
 				{
-					vTarget = Mathf.Max(vTarget, brakeMinSpeed);
+					float remainingForBrake = Mathf.Max(0f, dist - arrivalDistance);
+					float brakeEnvelope = Mathf.Sqrt(Mathf.Max(0f, 2f * aMax * remainingForBrake));
+					float headingScale = Mathf.Max(brakeHeadingFloor, Mathf.Clamp01(Mathf.Cos(yawError)));
+					vTarget = Mathf.Min(vMax, brakeEnvelope) * headingScale;
+					if (remainingForBrake > 0.15f && headingScale > 0.25f)
+					{
+						vTarget = Mathf.Max(vTarget, brakeMinSpeed);
+					}
+					break;
 				}
-				break;
-			}
 
 			case PointGoalPhase.Arrived:
 				FinishPredictionPointGoal(ref state, out vTarget, out wTarget, out correction, out hardStop);
@@ -805,24 +805,24 @@ public class DiffDriveTwinController : MonoBehaviour
 				break;
 
 			case PointGoalPhase.Cruise:
-			{
-				float headingScale = Mathf.Max(cruiseHeadingFloor, Mathf.Clamp01(Mathf.Cos(eYaw)));
-				vTarget = vMax * headingScale;
-				break;
-			}
+				{
+					float headingScale = Mathf.Max(cruiseHeadingFloor, Mathf.Clamp01(Mathf.Cos(eYaw)));
+					vTarget = vMax * headingScale;
+					break;
+				}
 
 			case PointGoalPhase.Brake:
-			{
-				float remainingForBrake = Mathf.Max(0f, dist - arrivalDistance);
-				float brakeEnvelope = Mathf.Sqrt(Mathf.Max(0f, 2f * aMax * remainingForBrake));
-				float headingScale = Mathf.Max(brakeHeadingFloor, Mathf.Clamp01(Mathf.Cos(eYaw)));
-				vTarget = Mathf.Min(vMax, brakeEnvelope) * headingScale;
-				if (remainingForBrake > 0.15f && headingScale > 0.25f)
 				{
-					vTarget = Mathf.Max(vTarget, brakeMinSpeed);
+					float remainingForBrake = Mathf.Max(0f, dist - arrivalDistance);
+					float brakeEnvelope = Mathf.Sqrt(Mathf.Max(0f, 2f * aMax * remainingForBrake));
+					float headingScale = Mathf.Max(brakeHeadingFloor, Mathf.Clamp01(Mathf.Cos(eYaw)));
+					vTarget = Mathf.Min(vMax, brakeEnvelope) * headingScale;
+					if (remainingForBrake > 0.15f && headingScale > 0.25f)
+					{
+						vTarget = Mathf.Max(vTarget, brakeMinSpeed);
+					}
+					break;
 				}
-				break;
-			}
 
 			case PointGoalPhase.Arrived:
 				FinishPointGoal(out vTarget, out wTarget);

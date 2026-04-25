@@ -37,16 +37,20 @@ public class OneJointTrapezoidController : MonoBehaviour
 	private float lastGoalDeg;
 	private JointResolveStatus _resolveStatus = JointResolveStatus.Resolved;
 
+	internal static bool SuppressAutoBindOnAwakeForShadowClone { get; set; }
+
 	void Awake()
 	{
+		if (SuppressAutoBindOnAwakeForShadowClone)
+		{
+			enabled = false;
+			return;
+		}
+
 		joint = ResolveJointWithDof(joint);
 		if (joint == null)
 		{
-			if (_resolveStatus == JointResolveStatus.AmbiguousChildren)
-			{
-				Debug.LogWarning($"[OneJointTrapezoidController] Disabled '{gameObject.name}' because it is attached above multiple DOF child joints and no explicit binding was provided.");
-			}
-			else
+			if (_resolveStatus != JointResolveStatus.AmbiguousChildren)
 			{
 				Debug.LogWarning("[OneJointTrapezoidController] No ArticulationBody with DOF found. Disabling this controller.");
 			}
@@ -136,6 +140,29 @@ public class OneJointTrapezoidController : MonoBehaviour
 		if (wakeUpEachStep) joint.WakeUp();
 	}
 
+	public void ResetRuntimeStateToCurrentJoint(float goalOverrideDeg)
+	{
+		joint = ResolveJointWithDof(joint);
+		if (joint == null || joint.jointPosition.dofCount <= 0)
+		{
+			return;
+		}
+
+		qCmdDeg = joint.jointPosition[0] * Mathf.Rad2Deg;
+		vCmdDeg = 0f;
+		goalDeg = goalOverrideDeg;
+		lastGoalDeg = goalDeg;
+
+		var d = joint.xDrive;
+		d.stiffness = stiffness;
+		d.damping = damping;
+		d.forceLimit = forceLimit;
+		d.target = goalDeg;
+		d.targetVelocity = 0f;
+		joint.xDrive = d;
+		joint.WakeUp();
+	}
+
 	ArticulationBody ResolveJointWithDof(ArticulationBody preferred)
 	{
 		_resolveStatus = JointResolveStatus.Resolved;
@@ -199,14 +226,7 @@ public class OneJointTrapezoidController : MonoBehaviour
 
 		if (candidates.Count > 1)
 		{
-			string candidateNames = "";
-			for (int i = 0; i < candidates.Count; i++)
-			{
-				candidateNames += i == 0 ? candidates[i].name : ", " + candidates[i].name;
-			}
-
 			_resolveStatus = JointResolveStatus.AmbiguousChildren;
-			Debug.LogWarning($"[OneJointTrapezoidController] Ambiguous auto-bind on '{gameObject.name}'. Found {candidates.Count} DOF joints under this object: {candidateNames}. This controller will be disabled unless an explicit joint or expectedJointName is assigned.");
 			return null;
 		}
 

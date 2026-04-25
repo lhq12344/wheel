@@ -301,6 +301,29 @@ namespace RobotSimulation
 			return true;
 		}
 
+		internal Transform TryMapLiveTransformToShadow(Transform liveTransform)
+		{
+			if (!IsReady || liveTransform == null || _liveSourceRoot == null || _shadowRootObject == null)
+			{
+				return null;
+			}
+
+			if (liveTransform == _liveSourceRoot)
+			{
+				return _shadowRootObject.transform;
+			}
+
+			if (!liveTransform.IsChildOf(_liveSourceRoot))
+			{
+				return null;
+			}
+
+			string relativePath = GetRelativePath(_liveSourceRoot, liveTransform);
+			return string.IsNullOrEmpty(relativePath)
+				? _shadowRootObject.transform
+				: _shadowRootObject.transform.Find(relativePath);
+		}
+
 		private bool PrepareSession(string label, IReadOnlyList<Collider> obstacles, float baseRadius)
 		{
 			_faultMessage = string.Empty;

@@ -155,10 +155,7 @@ namespace RobotSimulation.Tests.Editor
 					.GetMethod("SetArmDiagnosticsEnabled", BindingFlags.Instance | BindingFlags.NonPublic)
 					.Invoke(visualizer, new object[] { true });
 				visualizer.EnterArmPreview(manager.diffDriveController.rb.position, manager.diffDriveController.rb.rotation);
-				visualizer.ApplyManualArmPreviewAngles((float[])measuredAngles.Clone(), 0.2f);
-				typeof(ShadowRobotVisualizer)
-					.GetMethod("ApplyPredictedArmPoseToShadow", BindingFlags.Instance | BindingFlags.NonPublic)
-					.Invoke(visualizer, null);
+				visualizer.RebuildIfNeeded(forceRebuild: true);
 
 				string summary = (string)typeof(ShadowRobotVisualizer)
 					.GetMethod("CaptureCurrentArmRuntimeStateSummary", BindingFlags.Instance | BindingFlags.NonPublic)

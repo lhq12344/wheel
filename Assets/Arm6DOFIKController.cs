@@ -11,6 +11,7 @@ namespace RobotSimulation
 	public class Arm6DOFIKController : MonoBehaviour
 	{
 		public static Arm6DOFIKController Instance { get; private set; }
+		internal static bool SuppressInstanceRegistrationForShadowClone { get; set; }
 
 		[Header("References")]
 		public Arm6DOFFKController armController;
@@ -58,6 +59,11 @@ namespace RobotSimulation
 
 		private void Awake()
 		{
+			if (SuppressInstanceRegistrationForShadowClone)
+			{
+				return;
+			}
+
 			if (Instance == null)
 			{
 				Instance = this;
@@ -116,6 +122,18 @@ namespace RobotSimulation
 				}
 			};
 
+			if (TryBuildCoordinatedPreviewPlanFromManager(safeRequest, out ArmTrajectoryPreviewPlan coordinatedPreviewPlan, out bool handledByCoordinatedPlanner))
+			{
+				previewPlan = coordinatedPreviewPlan;
+				return true;
+			}
+
+			if (handledByCoordinatedPlanner)
+			{
+				previewPlan = coordinatedPreviewPlan;
+				return false;
+			}
+
 			if (!TryBeginPlannedMove(safeRequest.worldPosition, out ArmMoveResult startResult, out List<RobotPlanJointSample> plannedSamples))
 			{
 				startResult.timedOut = false;
@@ -132,6 +150,29 @@ namespace RobotSimulation
 				? previewPlan.samples[previewPlan.samples.Count - 1].timeSeconds
 				: 0f;
 			return true;
+		}
+
+		private bool TryBuildCoordinatedPreviewPlanFromManager(
+			ArmMoveRequest request,
+			out ArmTrajectoryPreviewPlan previewPlan,
+			out bool handledByCoordinatedPlanner)
+		{
+			previewPlan = null;
+			handledByCoordinatedPlanner = false;
+			RobotSimulationManager manager = RobotSimulationManager.Instance;
+			if (manager == null
+				|| manager.trajectoryPlanner == null
+				|| manager.arm6DOFIKController != this
+				|| manager.arm6DOFFKController != armController)
+			{
+				return false;
+			}
+
+			handledByCoordinatedPlanner = true;
+			return manager.trajectoryPlanner.TryBuildCoordinatedArmPreviewPlan(
+				request,
+				out previewPlan,
+				out _);
 		}
 
 		public Coroutine ExecutePreviewPlan(ArmTrajectoryPreviewPlan previewPlan, Action<ArmMoveResult> onComplete = null)
@@ -834,8 +875,32 @@ namespace RobotSimulation
 
 			if (armController == null)
 			{
-				armController = FindObjectOfType<Arm6DOFFKController>();
+				Arm6DOFFKController[] candidates = FindObjectsOfType<Arm6DOFFKController>();
+				for (int i = 0; i < candidates.Length; i++)
+				{
+					Arm6DOFFKController candidate = candidates[i];
+					if (candidate != null && !IsRuntimeShadowTransform(candidate.transform))
+					{
+						armController = candidate;
+						break;
+					}
+				}
 			}
+		}
+
+		private static bool IsRuntimeShadowTransform(Transform transform)
+		{
+			for (Transform current = transform; current != null; current = current.parent)
+			{
+				if (current.name.StartsWith("Preview_ShadowArmTwin_", StringComparison.Ordinal)
+					|| current.name.StartsWith("Preview_ShadowBaseTwin_", StringComparison.Ordinal)
+					|| current.name == "ShadowRobotVisual")
+				{
+					return true;
+				}
+			}
+
+			return false;
 		}
 
 		private void RefreshCollisionMonitor()
