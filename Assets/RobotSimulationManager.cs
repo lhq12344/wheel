@@ -331,12 +331,14 @@ namespace RobotSimulation
 				return;
 			}
 
-			if (_manualPreviewSession != null
-				&& (_manualPreviewSession.kind == ManualPreviewSessionKind.BasePoint
-					|| _manualPreviewSession.kind == ManualPreviewSessionKind.BaseYaw))
+			Debug.LogError($"[RobotSimulation] Shadow base fault triggered emergency stop: {faultMessage}");
+			if (trajectoryPlanner != null)
 			{
-				Debug.LogError($"[RobotSimulation] {faultMessage}");
-				CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: false, reason: faultMessage);
+				trajectoryPlanner.StopPlanning(emergencyStop: true);
+			}
+			else
+			{
+				EmergencyStop();
 			}
 		}
 
@@ -2981,7 +2983,7 @@ namespace RobotSimulation
 				return false;
 			}
 
-			bool success = arm6DOFFKController.TryGoHome();
+			bool success = arm6DOFFKController.TryGoHome(bypassCollisionGuard: true);
 			_lastArmCollisionGuardResult = arm6DOFFKController.LastCollisionGuardResult;
 			if (success)
 			{
@@ -3117,7 +3119,11 @@ namespace RobotSimulation
 		{
 			CancelManualPreviewSession(returnShadowToMirror: true, stopBaseMotion: false, stopArmMotion: true, reason: "Manual preview cancelled by clear-target request.");
 			AbortShadowBaseSession(resetShadowToLivePose: true);
+			HardStopBaseMotion();
+		}
 
+		private void HardStopBaseMotion()
+		{
 			if (diffDriveController != null)
 			{
 				diffDriveController.hasTargetPoint = false;
@@ -3259,7 +3265,7 @@ namespace RobotSimulation
 
 			if (diffDriveController != null)
 			{
-				diffDriveController.HardStopAtGoal();
+				HardStopBaseMotion();
 			}
 
 			if (arm6DOFFKController != null)

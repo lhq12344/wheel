@@ -1,7 +1,9 @@
 using System.Collections.Generic;
+using System.Reflection;
 using NUnit.Framework;
 using UnityEditor.SceneManagement;
 using UnityEngine;
+using UnityEngine.TestTools;
 
 namespace RobotSimulation.Tests.Editor
 {
@@ -185,6 +187,82 @@ namespace RobotSimulation.Tests.Editor
 			}
 		}
 
+		[Test]
+		public void ShadowBaseFaultHandler_EmergencyStopsBaseOutsideManualPreview()
+		{
+			GameObject managerGo = new GameObject("RobotSimulationManager");
+			GameObject baseGo = new GameObject("DiffDriveBase");
+			try
+			{
+				RobotSimulationManager manager = managerGo.AddComponent<RobotSimulationManager>();
+				Rigidbody rb = baseGo.AddComponent<Rigidbody>();
+				DiffDriveTwinController diffDrive = baseGo.AddComponent<DiffDriveTwinController>();
+				diffDrive.rb = rb;
+				diffDrive.hasTargetPoint = true;
+				diffDrive.targetPointWorld = new Vector3(5f, 0f, 0f);
+				rb.velocity = new Vector3(1f, 0f, 2f);
+				rb.angularVelocity = new Vector3(0f, 1f, 0f);
+				manager.diffDriveController = diffDrive;
+
+				System.Type shadowBaseType = LoadRuntimeType("RobotSimulation.ShadowBaseTwinRuntime");
+				object shadowBaseRuntime = System.Activator.CreateInstance(shadowBaseType);
+				const string faultMessage = "Synthetic shadow base collision.";
+				LogAssert.Expect(LogType.Error, $"[ShadowBaseTwinRuntime] {faultMessage}");
+				shadowBaseType.GetMethod("FailSession").Invoke(shadowBaseRuntime, new object[] { faultMessage });
+
+				typeof(RobotSimulationManager)
+					.GetField("_shadowBaseTwinRuntime", BindingFlags.Instance | BindingFlags.NonPublic)
+					.SetValue(manager, shadowBaseRuntime);
+
+				LogAssert.Expect(LogType.Error, $"[RobotSimulation] Shadow base fault triggered emergency stop: {faultMessage}");
+				typeof(RobotSimulationManager)
+					.GetMethod("HandleShadowBaseTwinFaultIfNeeded", BindingFlags.Instance | BindingFlags.NonPublic)
+					.Invoke(manager, null);
+
+				Assert.IsFalse(diffDrive.hasTargetPoint, "Shadow base faults must clear the live base target so the base cannot resume on the next physics tick.");
+				Assert.AreEqual(rb.position, diffDrive.targetPointWorld);
+				Assert.AreEqual(0f, rb.velocity.x, 1e-5f);
+				Assert.AreEqual(0f, rb.velocity.z, 1e-5f);
+				Assert.AreEqual(0f, rb.angularVelocity.y, 1e-5f);
+			}
+			finally
+			{
+				Object.DestroyImmediate(managerGo);
+				Object.DestroyImmediate(baseGo);
+			}
+		}
+
+		[Test]
+		public void GoHome_BypassesCollisionGuardForRecovery()
+		{
+			RobotSimulationManager manager = CreateAutoDiscoverManager();
+			GameObject forbiddenRoot = new GameObject("HomeRecoveryForbiddenRoot");
+			GameObject blocker = GameObject.CreatePrimitive(PrimitiveType.Cube);
+			try
+			{
+				float[] homeAngles = manager.arm6DOFFKController.configuredHomeJointAnglesDeg;
+				Pose[] homeLinkPoses = manager.arm6DOFFKController.ComputeLinkPosesWorld(homeAngles);
+				Assert.IsNotNull(homeLinkPoses);
+				Assert.IsNotEmpty(homeLinkPoses);
+
+				blocker.name = "HomeRecoveryBlocker";
+				blocker.transform.SetParent(forbiddenRoot.transform, false);
+				blocker.transform.position = homeLinkPoses[homeLinkPoses.Length - 1].position;
+				blocker.transform.localScale = Vector3.one * 0.25f;
+				manager.armCollisionMonitor.Configure(manager.armBinder.armRoot.transform, forbiddenRoot.transform);
+
+				LogAssert.Expect(LogType.Warning, new System.Text.RegularExpressions.Regex(@"\[Arm6DOF\].*"));
+				Assert.IsFalse(manager.arm6DOFFKController.TryGoHome(), "Normal arm targeting should still honor the collision guard.");
+				Assert.IsTrue(manager.arm6DOFFKController.TryGoHome(bypassCollisionGuard: true), "Go Home recovery must be able to command Home even while the guard still sees the collision.");
+			}
+			finally
+			{
+				Object.DestroyImmediate(blocker);
+				Object.DestroyImmediate(forbiddenRoot);
+				Object.DestroyImmediate(manager.gameObject);
+			}
+		}
+
 		private static RobotSimulationManager CreateAutoDiscoverManager()
 		{
 			EditorSceneManager.OpenScene("Assets/Scenes/SampleScene.unity");
@@ -201,6 +279,13 @@ namespace RobotSimulation.Tests.Editor
 			Assert.IsNotNull(manager.arm6DOFFKController, "FK controller should be discoverable in SampleScene.");
 			Assert.IsTrue(manager.arm6DOFFKController.KinematicsReady, "FK controller should be initialized for SafetyGate tests.");
 			return manager;
+		}
+
+		private static System.Type LoadRuntimeType(string fullName)
+		{
+			System.Type type = System.Type.GetType($"{fullName}, Assembly-CSharp");
+			Assert.IsNotNull(type, $"Runtime type '{fullName}' could not be loaded from Assembly-CSharp.");
+			return type;
 		}
 	}
 }

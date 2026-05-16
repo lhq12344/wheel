@@ -441,6 +441,11 @@ namespace RobotSimulation
 
 		public bool TrySetAllJointTargets(float[] angles)
 		{
+			return TrySetAllJointTargets(angles, false);
+		}
+
+		public bool TrySetAllJointTargets(float[] angles, bool bypassCollisionGuard)
+		{
 			if (angles == null || angles.Length < 6)
 			{
 				Debug.LogError("[Arm6DOF] Invalid angles array");
@@ -454,7 +459,7 @@ namespace RobotSimulation
 			}
 
 			float[] startAngles = CaptureMeasuredJointAngles();
-			if (EvaluateMotionCollision(startAngles, targetAngles, out ArmCollisionGuardResult guardResult))
+			if (!bypassCollisionGuard && EvaluateMotionCollision(startAngles, targetAngles, out ArmCollisionGuardResult guardResult))
 			{
 				Debug.LogWarning($"[Arm6DOF] {guardResult.message}");
 				return false;
@@ -466,7 +471,12 @@ namespace RobotSimulation
 
 		public bool TryGoHome()
 		{
-			return TrySetAllJointTargets(configuredHomeJointAnglesDeg);
+			return TryGoHome(false);
+		}
+
+		public bool TryGoHome(bool bypassCollisionGuard)
+		{
+			return TrySetAllJointTargets(configuredHomeJointAnglesDeg, bypassCollisionGuard);
 		}
 
 		public void SetJointTarget(int jointIndex, float angleDeg)
